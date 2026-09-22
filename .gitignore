@@ -1,0 +1,28 @@
+# Dependencies
+node_modules/
+
+# Runtime state and credentials
+.local/
+secrets/
+.env
+.env.*
+*.bin
+*.sqlite
+*.sqlite-*
+*.db
+*.jsonl
+
+# Logs and generated verification output
+logs/
+*.log
+npm-debug.log*
+coverage/
+
+# OS and editor files
+.DS_Store
+Thumbs.db
+*.swp
+*.tmp
+
+# Local Pi runtime state
+.atl/

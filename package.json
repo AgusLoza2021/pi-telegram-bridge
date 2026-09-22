@@ -1,0 +1,28 @@
+{
+  "name": "pi-telegram-bridge",
+  "version": "0.2.0",
+  "private": true,
+  "license": "MIT",
+  "description": "Control explicitly linked Pi sessions from an authorized Telegram chat, with local-only setup and final-output-only delivery.",
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "dependencies": {
+    "qrcode-terminal": "0.12.0"
+  },
+  "scripts": {
+    "test": "node --test tests/*.test.mjs",
+    "setup": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/setup.ps1",
+    "setup:prepare": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/setup.ps1 -PrepareOnly",
+    "setup:legacy": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/setup.ps1 -LegacyHeadless",
+    "extension:install": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/install-selective-extension.ps1",
+    "extension:status": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/status-selective-extension.ps1",
+    "extension:uninstall": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/uninstall-selective-extension.ps1",
+    "service:install": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/install-broker-service.ps1",
+    "service:start": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/start-broker-service.ps1",
+    "service:status": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/status-broker-service.ps1",
+    "service:stop": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/stop-broker-service.ps1",
+    "service:uninstall": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/uninstall-broker-service.ps1"
+  }
+}

@@ -1,0 +1,57 @@
+name: Bug report
+description: Report a sanitized, reproducible defect
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Before you continue
+      options:
+        - label: I read the README "Fix problems" section.
+          required: true
+        - label: This is not a security vulnerability or authorization bypass; those must use GitHub's private vulnerability-reporting flow.
+          required: true
+        - label: I removed bot tokens, Telegram IDs, QR/pairing data, private prompts and outputs, real user paths, databases, manifests, and raw logs.
+          required: true
+  - type: textarea
+    id: summary
+    attributes:
+      label: What happened?
+      description: Describe the defect without private data.
+      placeholder: A short, sanitized description.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction steps
+      description: List the smallest safe steps. Do not run or paste commands that expose credentials or local state.
+      placeholder: |
+        1. Open Pi on Windows 11
+        2. Type /tg
+        3. ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: Paraphrase any sensitive output instead of pasting it.
+    validations:
+      required: true
+  - type: input
+    id: versions
+    attributes:
+      label: Versions
+      description: Provide sanitized Windows, Node.js, Pi, and pi-telegram-bridge versions only.
+      placeholder: Windows 11; Node 24.x; Pi x.y; bridge x.y
+    validations:
+      required: true
