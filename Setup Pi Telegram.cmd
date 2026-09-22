@@ -15,6 +15,12 @@ if errorlevel 1 goto missing-tools
 if not exist "package.json" goto missing-tools
 if not exist "package-lock.json" goto missing-tools
 
+rem Node.js version gate: this setup needs Node.js 24 or newer. It runs
+rem before the dependency comparison so an old Node never reaches the
+rem dependency install step.
+node -e "if(!(parseInt(process.versions.node.split('.')[0],10)>=24)){process.exit(1)}"
+if errorlevel 1 goto node-too-old
+
 rem Compare the expected qrcode-terminal version in package.json against the
 rem locally installed copy; when they agree there is no network access.
 node -e "const fs=require('fs');const expected=JSON.parse(fs.readFileSync('package.json','utf8')).dependencies['qrcode-terminal'];let installed=null;try{installed=JSON.parse(fs.readFileSync('node_modules/qrcode-terminal/package.json','utf8')).version}catch(e){}if(expected&&installed===expected){process.exit(0)}process.exit(1)"
@@ -32,6 +38,14 @@ goto launch-setup
 :missing-tools
 echo This setup needs Node.js on this computer.
 echo Install Node.js from nodejs.org, then try this setup again.
+echo.
+echo Press any key to close this window.
+pause >nul
+exit /b 1
+
+:node-too-old
+echo This setup needs a newer Node.js on this computer.
+echo Get the current version from nodejs.org, install it, then try this setup again.
 echo.
 echo Press any key to close this window.
 pause >nul

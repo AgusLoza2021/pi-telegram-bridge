@@ -129,10 +129,14 @@ describe('launcher: dependency preflight before the setup path', () => {
       'probe must exist and run before the setup.ps1 invocation');
   });
 
-  test('the probe is exactly one local node -e version comparison, offline', () => {
+  test('the dependency probe is exactly one local node -e version comparison, offline', () => {
+    // Two node -e lines exist by design: the Node.js major-version gate first,
+    // then the qrcode-terminal dependency probe. This test pins the dependency
+    // probe (the second); the gate is pinned in its own test below.
     const probes = LINES.filter((l) => l.trim().startsWith('node -e '));
-    assert.equal(probes.length, 1, 'exactly one probe');
-    const probe = probes[0];
+    assert.equal(probes.length, 2,
+      'exactly two node -e lines: the Node.js version gate and the dependency probe');
+    const probe = probes[1];
     assert.ok(probe.includes("fs.readFileSync('package.json','utf8')"),
       'reads the expected version from module package.json');
     assert.ok(probe.includes("dependencies['qrcode-terminal']"),
@@ -143,6 +147,23 @@ describe('launcher: dependency preflight before the setup path', () => {
     assert.ok(probe.includes('process.exit(0)') && probe.includes('process.exit(1)'),
       'exit codes decide the branch');
     assert.doesNotMatch(probe, /https?:\/\/|curl|wget|fetch/i, 'probe never touches the network');
+  });
+
+  test('the Node.js major-version gate runs before the dependency comparison and fails closed', () => {
+    const probes = LINES.map((l, i) => [l.trim(), i]).filter(([l]) => l.startsWith('node -e '));
+    assert.equal(probes.length, 2,
+      'exactly two node -e lines: the Node.js version gate and the dependency probe');
+    const [gate, gateIndex] = probes[0];
+    assert.match(gate, /process\.versions\.node/, 'reads the running Node.js version from node itself');
+    assert.match(gate, />=\s*24/, 'requires Node.js major version 24 or newer');
+    assert.match(gate, /process\.exit\(1\)/, 'exits nonzero when Node.js is too old or unreadable');
+    assert.doesNotMatch(gate, /https?:\/\/|curl|wget|fetch/i, 'gate never touches the network');
+    const depProbeIndex = probes[1][1];
+    assert.ok(gateIndex < depProbeIndex,
+      'the version gate must run before the qrcode-terminal dependency comparison');
+    const guard = (LINES[gateIndex + 1] ?? '').trim();
+    assert.equal(guard, 'if errorlevel 1 goto node-too-old',
+      'an old Node.js must branch to the friendly node-too-old failure, never reach npm ci');
   });
 });
 
@@ -166,7 +187,8 @@ describe('launcher: deterministic local dependency install', () => {
       /https?:\/\//,
     ];
     const probeCount = (commands.match(/\bnode\s+-e\b/g) ?? []).length;
-    assert.equal(probeCount, 1, 'the version probe is the only node -e');
+    assert.equal(probeCount, 2,
+      'the only node -e lines are the Node.js version gate and the dependency probe');
     for (const pattern of FORBIDDEN) {
       assert.doesNotMatch(commands, pattern, `forbidden command pattern ${pattern} in launcher`);
     }
@@ -208,16 +230,17 @@ describe('launcher: failure branches never reach the setup path', () => {
   const byLabel = (label) => sections.find((s) => s.label === label);
   const setupSectionIndex = sections.findIndex((s) => s.label === 'launch-setup');
 
-  test('missing-tools and dependencies-failed exist and precede launch-setup', () => {
+  test('node-too-old, missing-tools and dependencies-failed exist and precede launch-setup', () => {
+    const tooOldIdx = sections.findIndex((s) => s.label === 'node-too-old');
     const missingIdx = sections.findIndex((s) => s.label === 'missing-tools');
     const depsIdx = sections.findIndex((s) => s.label === 'dependencies-failed');
-    assert.ok(missingIdx >= 0 && depsIdx >= 0 && setupSectionIndex >= 0);
-    assert.ok(missingIdx < setupSectionIndex && depsIdx < setupSectionIndex,
+    assert.ok(tooOldIdx >= 0 && missingIdx >= 0 && depsIdx >= 0 && setupSectionIndex >= 0);
+    assert.ok(tooOldIdx < setupSectionIndex && missingIdx < setupSectionIndex && depsIdx < setupSectionIndex,
       'failure sections must be ordered before the setup section');
   });
 
   test('each failure branch exits nonzero without any PowerShell reference', () => {
-    for (const label of ['missing-tools', 'dependencies-failed']) {
+    for (const label of ['node-too-old', 'missing-tools', 'dependencies-failed']) {
       const section = byLabel(label);
       assert.ok(section, `branch :${label} exists`);
       assert.equal(section.lines.filter((l) => /powershell/i.test(l)).length, 0,
@@ -226,10 +249,30 @@ describe('launcher: failure branches never reach the setup path', () => {
       assert.equal(exits.length, 1, `:${label} exits exactly once`);
       assert.doesNotMatch(exits[0], /^exit \/b 0$/, `:${label} propagates nonzero`);
     }
+    const tooOldExits = byLabel('node-too-old').lines.filter((l) => /^exit \/b /.test(l));
+    assert.equal(tooOldExits[0], 'exit /b 1', 'node-too-old exits 1, npm/setup codes are unrelated');
     const missingExits = byLabel('missing-tools').lines.filter((l) => /^exit \/b /.test(l));
     assert.equal(missingExits[0], 'exit /b 1');
     const depsExits = byLabel('dependencies-failed').lines.filter((l) => /^exit \/b /.test(l));
     assert.equal(depsExits[0], 'exit /b %NPM_EXIT%', 'npm failure propagates the npm code');
+  });
+
+  test('node-too-old failure copy names the fix and pauses before propagating its exit code', () => {
+    const section = byLabel('node-too-old');
+    assert.ok(section, 'branch :node-too-old exists');
+    const copy = section.lines.filter((l) => /^echo /i.test(l.trim()))
+      .map((l) => l.trim().replace(/^echo /i, ''))
+      .join('\n');
+    assert.ok(copy.includes('This setup needs a newer Node.js on this computer.'),
+      'exact beginner copy line 1');
+    assert.ok(copy.includes('Get the current version from nodejs.org, install it, then try this setup again.'),
+      'exact beginner copy line 2 with the next action');
+    assert.doesNotMatch(copy, /\bnpm\b|\bci\b|\bversion \d/i, 'no version-number or package-manager jargon');
+    assert.ok(copy.includes(PAUSE_COPY), 'failure branch pauses');
+    const pauseIdx = section.lines.findIndex((l) => /^pause >nul$/.test(l));
+    const exitIdx = section.lines.findIndex((l) => /^exit \/b /.test(l));
+    assert.ok(pauseIdx >= 0 && exitIdx > pauseIdx,
+      ':node-too-old pauses before propagating its exit code');
   });
 
   test('npm failure shows the exact beginner copy, the README pointer and a pause', () => {
@@ -349,9 +392,10 @@ describe('launcher: exit-code capture and propagation order', () => {
 
   test('every exit path pauses with the beginner line before propagating its code', () => {
     const pauses = LINES.filter((l) => /^pause >nul$/.test(l.trim()));
-    assert.equal(pauses.length, 3, 'one pause per exit path (missing tools, npm failure, setup)');
+    assert.equal(pauses.length, 4,
+      'one pause per exit path (node too old, missing tools, npm failure, setup)');
     const sections = parseSections(CONTENT);
-    for (const label of ['missing-tools', 'dependencies-failed']) {
+    for (const label of ['node-too-old', 'missing-tools', 'dependencies-failed']) {
       const section = sections.find((s) => s.label === label);
       const pauseIdx = section.lines.findIndex((l) => /^pause >nul$/.test(l));
       const exitIdx = section.lines.findIndex((l) => /^exit \/b /.test(l));

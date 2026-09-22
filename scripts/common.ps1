@@ -293,6 +293,32 @@ function Invoke-BridgeNode {
     }
 }
 
+<#
+.SYNOPSIS
+Parses the leading major version from a 'node --version' output line
+(e.g. "v24.13.1" -> 24). Returns $null when the output is empty or
+malformed, so every caller can fail closed. The single copy of the
+version-comparison logic for the whole module lives here.
+#>
+function Get-BridgeNodeMajorVersion {
+    param([string]$VersionOutput)
+    $text = "$VersionOutput"
+    if ($text -notmatch '^v(\d+)\.') { return $null }
+    return [int]$Matches[1]
+}
+
+<#
+.SYNOPSIS
+Fail-closed Node.js major-version gate: $true only when the given
+'node --version' output names Node.js 24 or newer. Empty, malformed or
+older output is rejected.
+#>
+function Test-BridgeNodeVersionGate {
+    param([string]$VersionOutput)
+    $major = Get-BridgeNodeMajorVersion -VersionOutput $VersionOutput
+    return ($null -ne $major -and $major -ge 24)
+}
+
 function Test-BridgePrerequisites {
     param([switch]$RequireCredentials, [string]$StateRoot)
     $node = Get-Command node -ErrorAction SilentlyContinue

@@ -81,8 +81,32 @@ if ($Beginner) {
 }
 
 # --- node check -------------------------------------------------------------
-if ($null -eq (Get-Command node -ErrorAction SilentlyContinue)) {
-    throw 'node was not found on PATH. Install Node.js 24 or newer first.'
+# Presence AND major version, while nothing on disk has been touched yet: an
+# old Node.js must fail here, before the state root is resolved, created or
+# ACL-locked, and long before any credential is requested.
+$node = Get-Command node -ErrorAction SilentlyContinue
+$nodeVersionOutput = $null
+if ($null -ne $node) {
+    $nodeVersionOutput = (& $node.Source --version 2>$null | Select-Object -First 1)
+}
+if (-not (Test-BridgeNodeVersionGate -VersionOutput $nodeVersionOutput)) {
+    if ($Beginner) {
+        # The missing-Node wording is deliberately identical to the launcher's
+        # :missing-tools copy, so a beginner reads one consistent sentence
+        # whichever entry point they came through.
+        if ($null -eq $node) {
+            Write-Host 'This setup needs Node.js on this computer.'
+            Write-Host 'Install Node.js from nodejs.org, then try this setup again.'
+            exit 1
+        }
+        Write-Host 'This setup needs a newer Node.js on this computer.'
+        Write-Host 'Get the current version from nodejs.org, install it, then try this setup again.'
+        exit 1
+    }
+    if ($null -eq $node) {
+        throw 'node was not found on PATH. Install Node.js 24 or newer first.'
+    }
+    throw "Node.js 24 or newer is required. Install Node.js 24 or newer first ('node --version' printed '$nodeVersionOutput')."
 }
 
 # --- state root: confined + ACL-locked BEFORE any secret exists --------------

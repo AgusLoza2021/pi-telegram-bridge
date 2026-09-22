@@ -100,11 +100,12 @@ function Test-BrokerServicePrerequisites {
         return $false
     }
     $versionOutput = (& $node.Source --version 2>$null | Select-Object -First 1)
-    if ("$versionOutput" -notmatch '^v(\d+)\.') {
+    $nodeMajor = Get-BridgeNodeMajorVersion -VersionOutput $versionOutput
+    if ($null -eq $nodeMajor) {
         Write-Host "could not determine the node version ('node --version' printed '$versionOutput')."
         return $false
     }
-    if ([int]$Matches[1] -lt 24) {
+    if ($nodeMajor -lt 24) {
         Write-Host "Node.js 24 or newer is required (found $versionOutput)."
         return $false
     }

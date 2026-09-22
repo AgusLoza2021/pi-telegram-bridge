@@ -526,12 +526,92 @@ describe('ps-runtime: T10 direct node QR smoke (dummy username+nonce)', () => {
   });
 });
 
+// F1 fail-fast: the Node.js major-version gate lives ONCE, in common.ps1,
+// and must be callable against synthetic 'node --version' output. Empty or
+// malformed output fails closed; 18/22 are rejected, 24+ accepted.
+describe('ps-runtime: shared Node.js version gate (common.ps1)', () => {
+  before(async function () {
+    if (!IS_WIN) this.skip();
+  });
+
+  const COMMON_PATH = join(SCRIPTS, 'common.ps1');
+
+  async function gateResult(versionOutput) {
+    const literal = String(versionOutput).replace(/'/g, "''");
+    const script = [
+      `. '${COMMON_PATH.replace(/'/g, "''")}'`,
+      `if (Test-BridgeNodeVersionGate -VersionOutput '${literal}') { Write-Output 'ACCEPT' } else { Write-Output 'REJECT' }`,
+    ].join('\r\n');
+    const { stdout } = await run('powershell.exe',
+      ['-NoProfile', '-NonInteractive', '-Command', script],
+      { cwd: TEST_RUNS, timeout: 60_000 });
+    return stdout.trim();
+  }
+
+  test('v24.13.1 and v26.0.0 are accepted', async () => {
+    assert.equal(await gateResult('v24.13.1'), 'ACCEPT');
+    assert.equal(await gateResult('v26.0.0'), 'ACCEPT');
+  });
+
+  test('v18.20.4 and v22.11.0 are rejected', async () => {
+    assert.equal(await gateResult('v18.20.4'), 'REJECT');
+    assert.equal(await gateResult('v22.11.0'), 'REJECT');
+  });
+
+  test('empty and malformed output fail closed', async () => {
+    assert.equal(await gateResult(''), 'REJECT');
+    assert.equal(await gateResult('garbage'), 'REJECT');
+    assert.equal(await gateResult('v24'), 'REJECT', 'an output without a minor segment is malformed, not acceptable');
+  });
+
+  test('Get-BridgeNodeMajorVersion parses the leading major and yields nothing for malformed output', async () => {
+    const script = [
+      `. '${COMMON_PATH.replace(/'/g, "''")}'`,
+      "Write-Output (Get-BridgeNodeMajorVersion -VersionOutput 'v24.13.1')",
+      "Write-Output (Get-BridgeNodeMajorVersion -VersionOutput 'v22.11.0')",
+      "Write-Output (Get-BridgeNodeMajorVersion -VersionOutput 'not-a-version')",
+    ].join('\r\n');
+    const { stdout } = await run('powershell.exe',
+      ['-NoProfile', '-NonInteractive', '-Command', script],
+      { cwd: TEST_RUNS, timeout: 60_000 });
+    const lines = stdout.trim().split(/\r?\n/).filter((l) => l.length > 0);
+    assert.deepEqual(lines, ['24', '22'],
+      'the parser returns the major for well-formed output and nothing for malformed output');
+  });
+
+  test('broker-service-common.ps1 reuses the shared parser: no second copy of the version logic', () => {
+    const brokerSource = readFileSync(join(SCRIPTS, 'broker-service-common.ps1'), 'utf8');
+    assert.match(brokerSource, /Get-BridgeNodeMajorVersion -VersionOutput \$versionOutput/,
+      'Test-BrokerServicePrerequisites must delegate parsing to common.ps1');
+    assert.ok(!brokerSource.includes("'^v(\\d+)\\.'"),
+      'the version regex must exist exactly once, in common.ps1');
+  });
+});
+
 // Standalone beginner setup contract: the double-click launcher selects this
 // mode, while direct setup keeps every advanced and legacy surface.
 describe('ps-runtime: launcher-only Beginner setup contract', () => {
   const setupSource = readFileSync(join(SCRIPTS, 'setup.ps1'), 'utf8');
   const installerSource = readFileSync(join(SCRIPTS, 'install-selective-extension.ps1'), 'utf8');
   const commonSource = readFileSync(join(SCRIPTS, 'selective-extension-common.ps1'), 'utf8');
+
+  test('the node presence+version gate precedes state resolution and the beginner path exits friendly before anything exists on disk', () => {
+    const nodeCheck = setupSource.indexOf('# --- node check');
+    const resolveState = setupSource.indexOf('$stateRoot = Resolve-BridgeStateDirectory');
+    assert.ok(nodeCheck >= 0 && resolveState > nodeCheck,
+      'the node check block must precede state resolution');
+    const gate = setupSource.indexOf('Test-BridgeNodeVersionGate', nodeCheck);
+    assert.ok(gate >= 0 && gate < resolveState,
+      'the Node.js major-version gate must run before the state root is resolved, created or ACL-locked');
+    const checkEnd = setupSource.indexOf('# --- state root', nodeCheck);
+    const block = setupSource.slice(nodeCheck, checkEnd);
+    assert.match(block, /Test-BridgeNodeVersionGate/,
+      'setup must reuse the shared common.ps1 gate, not a second copy of the version logic');
+    assert.match(block, /& \$node\.Source --version/,
+      'the version output must come from the resolved node itself');
+    assert.match(block, /if \(\$Beginner\)\s*\{[\s\S]*?nodejs\.org[\s\S]*?exit 1/,
+      'a Beginner failure must print the nodejs.org copy and exit nonzero instead of throwing');
+  });
 
   test('Beginner cannot combine with prepare-only or legacy and rejects before state resolution', () => {
     assert.match(setupSource, /\[switch\]\$Beginner/);
