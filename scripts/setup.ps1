@@ -666,7 +666,7 @@ if ($extensionAnswer -notmatch '^[nN]') {
     Write-Host 'Skipped. Install later with scripts/install-selective-extension.ps1.'
 }
 
-$serviceAnswer = Read-Host 'Register the current-user broker scheduled task now (starts at logon; NOT started by registration)? (Y/n)'
+$serviceAnswer = Read-Host 'Register the current-user broker scheduled task now (registered DISABLED; turn it on later with the telegram switch)? (Y/n)'
 $serviceInstalled = $false
 if ($serviceAnswer -notmatch '^[nN]') {
     $code = Invoke-SetupSubscript -ScriptName 'install-broker-service.ps1' -ScriptStateDirectory $stateRoot
@@ -687,7 +687,7 @@ if ($serviceInstalled) {
             Write-Warning "the start script exited with code $code; run scripts/start-broker-service.ps1 manually later."
         }
     } else {
-        Write-Host 'Not started. Start later with scripts/start-broker-service.ps1 (it also starts at next logon).'
+        Write-Host 'Not started. Turn the connection on later with "telegram on" (or scripts/start-broker-service.ps1).'
     }
 }
 
@@ -703,6 +703,8 @@ Write-Host '    /telegram-disconnect and /telegram-status.'
 Write-Host '  - From the authorized Telegram chat: /sessions, /use <shortId>,'
 Write-Host '    /status, /send, /steer, /followup, /abort, /disconnect.'
 Write-Host '    Plain text prompts the selected TUI; final outputs only.'
+Write-Host '  - Phone connection on demand: telegram on | telegram off | telegram status'
+Write-Host '    (nothing connects at sign-in until you run "telegram on").'
 Write-Host '  - Service lifecycle: scripts/status-broker-service.ps1,'
 Write-Host '    start-broker-service.ps1, stop-broker-service.ps1,'
 Write-Host '    uninstall-broker-service.ps1.'
