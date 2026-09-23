@@ -1,5 +1,17 @@
 # Pi Telegram Bridge — control Pi from your phone
 
+## HOW TO INSTALL
+
+**Quick setup for Windows 11** (requires Node.js 24+, Pi installed on this PC, and Telegram on your phone):
+
+1. Download the repository as a ZIP and extract it, or clone it with `git clone https://github.com/AgusLoza2021/pi-telegram-bridge.git`.
+2. Create your own Telegram bot by messaging **@BotFather** with `/newbot`. Keep its token private.
+3. Run **`Setup Pi Telegram.cmd`** from the extracted project folder and follow the prompts to enter your token and pair your phone with the QR code.
+4. When setup asks whether to start the connection, choose **Yes** to start now. If you choose No, open a Command Prompt in the project folder and run `telegram on` later. Check it with `telegram status`; use `telegram off` to stop it.
+5. Open Pi, run `/tg`, choose **Connect**, then message your bot in a private chat.
+
+The bridge intentionally ignores group chats. For prerequisites, screenshots, and troubleshooting, see the [complete beginner guide](#check-your-pc-first).
+
 ![Pi Telegram Bridge: a private Telegram chat reaches a Pi window linked with /tg, through the bridge on your own PC](docs/assets/banner.svg)
 
 Talk to a Pi coding session on your Windows PC from your own private Telegram bot: send a normal message from your phone and receive Pi's finalized answer in the same chat.
@@ -76,7 +88,7 @@ You will create your own private bot in Telegram. This takes about 2 minutes.
 4. When it asks, **paste the bot token from Step 2**. The window hides what you paste. The token stays on your PC: it is stored in encrypted form (protected for your Windows account) and is never typed, sent, or shown anywhere else — not on your phone, not in any chat, not in any log.
 5. The window shows a **QR code**. Open the camera app on your phone and point it at the code. Telegram opens your bot; tap **Start**. The code contains only the bot's name and a one-use pairing code — never the token.
 6. The window waits up to a minute for your phone. When your phone is recognized, it asks you to type **ENROLL** to confirm. Nothing is saved until you do.
-7. After you confirm, the window installs a small helper inside Pi (it stays inactive until *you* link a Pi window in Step 4), sets up the background connection, and starts it for you. From then on it is yours to control: the `telegram` file in your setup folder turns the connection on (`telegram on`), off (`telegram off`), or shows how it is doing (`telegram status`). Once you turn it off it stays off, even after you restart Windows.
+7. After you confirm, the window installs a small helper inside Pi (it stays inactive until *you* link a Pi window in Step 4) and registers the background task disabled. It then asks whether to start the connection now. If you say no, run `telegram on` from the setup folder when you are ready. Use `telegram off` to stop it and `telegram status` to check it. Once you turn it off, it stays off even after you restart Windows.
 
 If anything fails along the way, your previous settings are kept safe and nothing half-finished is saved. See [Fix problems](#fix-problems).
 
