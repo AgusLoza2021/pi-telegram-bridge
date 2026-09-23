@@ -41,6 +41,15 @@ jobs:
     # from the machine and user values, so neither a job-level env: nor GITHUB_ENV
     # reaches the children. The fix is to run the suite in the shell the project
     # supports, which is why the steps below declare shell: powershell.
+    #
+    # What this workflow cannot verify: the ACL, DPAPI, scheduled-task and
+    # setup.ps1 integration tests need a session whose user is NOT an
+    # administrator, because the state root must be lockable to the invoking user
+    # alone. A hosted runner session is an administrator session, so those tests
+    # print the environment reason and skip themselves rather than weaken the
+    # invariant they exist to protect. Everything else runs here, and the
+    # complete gate is scripts/test.ps1 on a real machine. CONTRIBUTING.md
+    # describes the split.
     name: Windows / Node 24
     runs-on: windows-latest
     timeout-minutes: 15
