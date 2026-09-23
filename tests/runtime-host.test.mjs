@@ -200,6 +200,19 @@ describe('RuntimeHost: local control channel', () => {
     assert.equal(spawnLog.length, 1);
     await host.shutdown('test');
   });
+
+  test('a consumed marker stays terminal across host ticks', async () => {
+    const ctx = setup({});
+    const { host, stateRoot } = ctx;
+    await host.start();
+    const controlPath = join(stateRoot, 'control.json');
+    const marker = JSON.stringify({ consumedAt: 123 });
+    writeFileSync(controlPath, marker);
+    host.tick(T0 + 1_000);
+    host.tick(T0 + 2_000);
+    assert.equal(readFileSync(controlPath, 'utf8'), marker, 'the terminal marker must not be rewritten or re-logged');
+    await host.shutdown('test');
+  });
 });
 
 describe('RuntimeHost: host-only demo mode', () => {

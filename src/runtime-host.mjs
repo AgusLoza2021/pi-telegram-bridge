@@ -316,18 +316,27 @@ export class RuntimeHost {
       return;
     }
     if (raw.trim().length === 0) return;
-    // Consume first, decide second: a command is applied at most once
-    // even if the host crashes mid-processing. The file is reset (never
-    // deleted) to keep the channel a plain file for operators.
+    let parsed;
+    let parseFailed = false;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      parseFailed = true;
+    }
+    // A consumed command rests as a bare { consumedAt } marker. It is
+    // terminal: re-consuming it would rewrite the file and log a rejection
+    // on every host tick for the life of the process.
+    if (!parseFailed && isPlainObject(parsed)
+        && parsed.command === undefined && typeof parsed.consumedAt === 'number') return;
+    // Consume before applying a fresh command, so it applies at most once
+    // even if the host crashes mid-processing. Keep the file, rather than
+    // deleting it, for operators.
     try {
       writeFileSync(this.#controlPath, JSON.stringify({ consumedAt: now }));
     } catch {
       this.#log({ code: 'control_reset_error' });
     }
-    let parsed;
-    try {
-      parsed = JSON.parse(raw);
-    } catch {
+    if (parseFailed) {
       this.#log({ code: 'control_invalid' });
       return;
     }
