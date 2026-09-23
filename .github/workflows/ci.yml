@@ -58,33 +58,32 @@ jobs:
           node-version: "24"
           package-manager-cache: false
 
-      # Runs the same probe twice: once in this step's own Windows PowerShell
-      # 5.1 process, and once in a child spawned with the exact flags the
-      # integration tests use. Earlier rounds showed the parent resolving
-      # Get-Acl while the child reports "found in the module
-      # Microsoft.PowerShell.Security, but the module could not be loaded", so the
-      # difference is process-level. This prints the four candidates for that
-      # difference on both sides. It deliberately does not fail the step: the
-      # output is the evidence.
-      - name: Diagnose the PowerShell the tests actually get
-        shell: powershell
+      # The previous probe settled that a PowerShell-spawned child with the exact
+      # test flags works: same PSModulePath, FullLanguage, Unrestricted, module
+      # 3.0.0.0 discovered, Get-Acl OK. One difference from the failing tests
+      # remained unexplored: they spawn from Node with windowsHide, which creates
+      # the child without a console. This runs the identical probe both ways and
+      # also tries an explicit Import-Module, which is the candidate fix.
+      - name: Diagnose the PowerShell the node children actually get
+        shell: bash
         run: |
-          $probe = @'
-          Write-Output "    PSModulePath: $env:PSModulePath"
-          Write-Output "    LanguageMode: $($ExecutionContext.SessionState.LanguageMode)"
-          Write-Output "    ExecutionPolicy: $(Get-ExecutionPolicy)"
-          Get-Module -ListAvailable Microsoft.PowerShell.Security | ForEach-Object { Write-Output "    discovered: $($_.Version) $($_.ModuleBase)" }
-          try { Get-Acl -LiteralPath $env:TEMP | Out-Null; Write-Output "    Get-Acl: OK" }
-          catch { Write-Output "    Get-Acl: FAILED [$($_.Exception.GetType().Name)] $($_.Exception.Message)" }
-          '@
-          $path = Join-Path $env:RUNNER_TEMP 'ps-probe.ps1'
-          Set-Content -LiteralPath $path -Value $probe -Encoding UTF8
-          Write-Output 'PARENT (this process):'
-          & $path
-          Write-Output 'CHILD (the flags the tests use):'
-          & powershell.exe -NoProfile -NonInteractive -Command "& '$path'"
-          Write-Output 'CHILD (with -ExecutionPolicy Bypass):'
-          & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $path
+          cat > "$RUNNER_TEMP/ps-child-probe.mjs" <<'EOF'
+          import { spawnSync } from 'node:child_process';
+          const probe = [
+            'Write-Output "    PSModulePath: $env:PSModulePath"',
+            'Write-Output "    LanguageMode: $($ExecutionContext.SessionState.LanguageMode)"',
+            'Get-Module -ListAvailable Microsoft.PowerShell.Security | ForEach-Object { Write-Output "    discovered: $($_.Version) $($_.ModuleBase)" }',
+            'try { Get-Acl -LiteralPath $env:TEMP | Out-Null; Write-Output "    Get-Acl: OK" } catch { Write-Output "    Get-Acl: FAILED $($_.Exception.Message)" }',
+            'try { Import-Module Microsoft.PowerShell.Security -ErrorAction Stop; Write-Output "    Import-Module: OK" } catch { Write-Output "    Import-Module: FAILED $($_.Exception.Message)" }',
+          ].join('; ');
+          for (const windowsHide of [false, true]) {
+            const r = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', probe], { encoding: 'utf8', windowsHide });
+            console.log(`NODE CHILD windowsHide=${windowsHide} status=${r.status}`);
+            console.log(r.stdout);
+            console.log(r.stderr);
+          }
+          EOF
+          node "$RUNNER_TEMP/ps-child-probe.mjs"
 
       # The exact command CONTRIBUTING.md documents: the single pinned production
       # dependency, no package lifecycle scripts, no audit, no fund.
