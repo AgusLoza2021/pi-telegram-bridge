@@ -342,3 +342,59 @@ function Write-BrokerStopControl {
     Write-JsonFileAtomic -Path (Join-Path $StateRoot 'broker-control.json') -Value $control
     return $true
 }
+
+<#
+.SYNOPSIS
+Bounded wait for the graceful stop to be confirmed either by the
+shutdownAt record the broker writes last or by the process disappearing.
+Returns $true when confirmed and $false on timeout, leaving the evidence
+in place. NEVER signals a process.
+#>
+function Wait-BrokerServiceShutdown {
+    param(
+        [Parameter(Mandatory = $true)][string]$StateRoot,
+        [int]$TimeoutSeconds = 20
+    )
+    $metaPath = Join-Path $StateRoot 'broker-meta.json'
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ((Get-Date) -lt $deadline) {
+        Start-Sleep -Milliseconds 500
+        $meta = Read-JsonFile -Path $metaPath
+        if ($null -eq $meta) { continue }
+        if ($null -ne (Get-BridgeMetaField -Meta $meta -Name 'shutdownAt')) { return $true }
+        $metaPid = Get-BridgeMetaField -Meta $meta -Name 'pid'
+        if ($null -ne $metaPid -and [int]$metaPid -gt 0) {
+            if ($null -eq (Get-Process -Id ([int]$metaPid) -ErrorAction SilentlyContinue)) { return $true }
+        }
+    }
+    return $false
+}
+
+<#
+.SYNOPSIS
+Stops the broker gracefully and then DISABLES the dedicated task - the
+bit that keeps the phone connection off until the owner asks for it
+again. The disable runs ONLY after the stop was confirmed: on timeout the
+task stays enabled and the control file stays on disk as evidence, so a
+half-applied stop can never silently swallow the next logon start.
+#>
+function Stop-BrokerServiceTask {
+    param(
+        [Parameter(Mandatory = $true)][string]$StateRoot,
+        [Parameter(Mandatory = $true)][string]$TaskName,
+        [int]$TimeoutSeconds = 20
+    )
+    $live = Get-BrokerLiveMeta -StateRoot $StateRoot
+    if ($null -ne $live) {
+        $instanceId = Get-BridgeMetaField -Meta $live -Name 'instanceId'
+        if ($null -eq $instanceId -or $instanceId -notmatch '^[0-9a-f]{32}$') {
+            throw 'broker-meta.json carries no valid instance id; refusing to write a control file.'
+        }
+        Write-BrokerStopControl -StateRoot $StateRoot -InstanceId $instanceId
+        if (-not (Wait-BrokerServiceShutdown -StateRoot $StateRoot -TimeoutSeconds $TimeoutSeconds)) {
+            return $false
+        }
+    }
+    Disable-ScheduledTask -TaskName $TaskName | Out-Null
+    return $true
+}
