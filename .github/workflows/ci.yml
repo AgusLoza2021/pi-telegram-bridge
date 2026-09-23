@@ -58,25 +58,33 @@ jobs:
           node-version: "24"
           package-manager-cache: false
 
-      # Replaces the earlier GITHUB_ENV attempt, which the test steps did not
-      # inherit, and the explicit-import check, which passed while autoload kept
-      # failing. This exercises autoload in the same environment the tests
-      # inherit and exits non-zero on failure, so a module-path mistake is one
-      # unambiguous line instead of seventeen confusing test failures.
-      - name: Prove Windows PowerShell 5.1 can autoload its security module
+      # Runs the same probe twice: once in this step's own Windows PowerShell
+      # 5.1 process, and once in a child spawned with the exact flags the
+      # integration tests use. Earlier rounds showed the parent resolving
+      # Get-Acl while the child reports "found in the module
+      # Microsoft.PowerShell.Security, but the module could not be loaded", so the
+      # difference is process-level. This prints the four candidates for that
+      # difference on both sides. It deliberately does not fail the step: the
+      # output is the evidence.
+      - name: Diagnose the PowerShell the tests actually get
         shell: powershell
         run: |
-          $ErrorActionPreference = 'Stop'
-          Write-Host "PSModulePath=$env:PSModulePath"
-          Get-Module -ListAvailable Microsoft.PowerShell.Security |
-            Format-List Name, Version, ModuleBase
-          try {
-            Get-Acl -LiteralPath $env:TEMP | Out-Null
-            Write-Host 'Get-Acl autoloaded'
-          } catch {
-            Write-Host "Get-Acl autoload FAILED: $($_.Exception.Message)"
-            exit 1
-          }
+          $probe = @'
+          Write-Output "    PSModulePath: $env:PSModulePath"
+          Write-Output "    LanguageMode: $($ExecutionContext.SessionState.LanguageMode)"
+          Write-Output "    ExecutionPolicy: $(Get-ExecutionPolicy)"
+          Get-Module -ListAvailable Microsoft.PowerShell.Security | ForEach-Object { Write-Output "    discovered: $($_.Version) $($_.ModuleBase)" }
+          try { Get-Acl -LiteralPath $env:TEMP | Out-Null; Write-Output "    Get-Acl: OK" }
+          catch { Write-Output "    Get-Acl: FAILED [$($_.Exception.GetType().Name)] $($_.Exception.Message)" }
+          '@
+          $path = Join-Path $env:RUNNER_TEMP 'ps-probe.ps1'
+          Set-Content -LiteralPath $path -Value $probe -Encoding UTF8
+          Write-Output 'PARENT (this process):'
+          & $path
+          Write-Output 'CHILD (the flags the tests use):'
+          & powershell.exe -NoProfile -NonInteractive -Command "& '$path'"
+          Write-Output 'CHILD (with -ExecutionPolicy Bypass):'
+          & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $path
 
       # The exact command CONTRIBUTING.md documents: the single pinned production
       # dependency, no package lifecycle scripts, no audit, no fund.
