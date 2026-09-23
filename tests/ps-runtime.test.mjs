@@ -4,7 +4,7 @@
 // drawn from actual icacls/file-system state, never from script output
 // alone.
 
-import { test, describe, before, after } from 'node:test';
+import { test, describe, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
@@ -48,17 +48,12 @@ async function icaclsText(dir) {
   return stdout;
 }
 
-describe('ps-runtime: setup -PrepareOnly (real PS 5.1, unique dirs)', () => {
-  before(async function () {
-    if (!IS_WIN) this.skip();
-  });
-
+describe('ps-runtime: setup -PrepareOnly (real PS 5.1, unique dirs)', { skip: !IS_WIN && 'these tests need Windows PowerShell 5.1' }, () => {
   // T06: selective live-TUI mode is the DEFAULT, so prepare-only writes the
   // selective shape (no pi discovery, no followups flag) and nothing else.
-  test('prepare-only writes the default selective runtime shape, locks the ACL and the capability — and never touches credentials', async function () {
-    // The real setup run must lock the state root down to the invoking user
-    // alone, which a hosted runner session cannot hold (tests/privileged.mjs).
-    if (userOnlyAclSkipReason) this.skip(userOnlyAclSkipReason);
+  // The real setup run must lock the state root down to the invoking user
+  // alone, which a hosted runner session cannot hold (tests/privileged.mjs).
+  test('prepare-only writes the default selective runtime shape, locks the ACL and the capability — and never touches credentials', { skip: userOnlyAclSkipReason }, async function () {
     const stateDir = uniqueDir('prep');
     const { stdout } = await powershell('setup.ps1', [
       '-PrepareOnly', '-StateDirectory', stateDir,
@@ -86,8 +81,7 @@ describe('ps-runtime: setup -PrepareOnly (real PS 5.1, unique dirs)', () => {
     assert.ok(!existsSync(join(stateDir, 'credentials.bin')), 'prepare-only must never touch credentials');
   });
 
-  test('prepare-only is idempotent: re-running takes a dated backup of runtime.json, keeps the instance id and the selective shape', async function () {
-    if (userOnlyAclSkipReason) this.skip(userOnlyAclSkipReason);
+  test('prepare-only is idempotent: re-running takes a dated backup of runtime.json, keeps the instance id and the selective shape', { skip: userOnlyAclSkipReason }, async function () {
     const stateDir = uniqueDir('prep2');
     await powershell('setup.ps1', ['-PrepareOnly', '-StateDirectory', stateDir]);
     const first = JSON.parse(readFileSync(join(stateDir, 'runtime.json'), 'utf8'));
@@ -105,8 +99,7 @@ describe('ps-runtime: setup -PrepareOnly (real PS 5.1, unique dirs)', () => {
 
   // T06: -LegacyHeadless is the explicit fallback; the pre-T06 runtime shape
   // (pi CLI/workspace + followups flag, no mode key) must stay protected.
-  test('-LegacyHeadless -PrepareOnly keeps the legacy headless runtime shape', async function () {
-    if (userOnlyAclSkipReason) this.skip(userOnlyAclSkipReason);
+  test('-LegacyHeadless -PrepareOnly keeps the legacy headless runtime shape', { skip: userOnlyAclSkipReason }, async function () {
     const stateDir = uniqueDir('prep3');
     const fixtures = makePiFixtures();
     const { stdout } = await powershell('setup.ps1', [
@@ -126,8 +119,7 @@ describe('ps-runtime: setup -PrepareOnly (real PS 5.1, unique dirs)', () => {
     assert.ok(!existsSync(join(stateDir, 'credentials.bin')), 'prepare-only must never touch credentials');
   });
 
-  test('default prepare-only migrates an existing legacy runtime.json to the selective shape without losing the instance id', async function () {
-    if (userOnlyAclSkipReason) this.skip(userOnlyAclSkipReason);
+  test('default prepare-only migrates an existing legacy runtime.json to the selective shape without losing the instance id', { skip: userOnlyAclSkipReason }, async function () {
     const stateDir = uniqueDir('prep4');
     const fixtures = makePiFixtures();
     await powershell('setup.ps1', [
@@ -171,14 +163,9 @@ describe('ps-runtime: setup -PrepareOnly (real PS 5.1, unique dirs)', () => {
   });
 });
 
-describe('ps-runtime: start.ps1 forwards the exact state root to prerequisites', () => {
-  before(async function () {
-    if (!IS_WIN) this.skip();
-    // Both members prepare a real state root first, so they inherit the
-    // same hosted-runner limitation as the prepare-only suite.
-    if (userOnlyAclSkipReason) this.skip(userOnlyAclSkipReason);
-  });
-
+// Both members prepare a real state root first, so they inherit the
+// same hosted-runner limitation as the prepare-only suite.
+describe('ps-runtime: start.ps1 forwards the exact state root to prerequisites', { skip: userOnlyAclSkipReason }, () => {
   const DOT_SOURCE_LINE = ". (Join-Path $PSScriptRoot 'common.ps1')";
 
   /**
@@ -281,11 +268,7 @@ describe('ps-runtime: start.ps1 forwards the exact state root to prerequisites',
   });
 });
 
-describe('ps-runtime: log rotation + dated backups (common.ps1 helpers)', () => {
-  before(async function () {
-    if (!IS_WIN) this.skip();
-  });
-
+describe('ps-runtime: log rotation + dated backups (common.ps1 helpers)', { skip: !IS_WIN && 'these tests need Windows PowerShell 5.1' }, () => {
   test('Rotate-BridgeLogFile archives the old log and leaves a fresh file in place (no truncation, no delete)', async () => {
     const dir = uniqueDir('rotate');
     mkdirSync(dir, { recursive: true });
@@ -445,11 +428,7 @@ describe('ps-runtime: T10 selective enrollment QR presentation (static source)',
 // T10 smoke (parent verifier runs the suite): the known qr-render.mjs script,
 // invoked directly with a DUMMY username + nonce exactly like the fixed setup
 // step, must emit a clean UTF-8 QR block with no mojibake/replacement markers.
-describe('ps-runtime: T10 direct node QR smoke (dummy username+nonce)', () => {
-  before(async function () {
-    if (!IS_WIN) this.skip();
-  });
-
+describe('ps-runtime: T10 direct node QR smoke (dummy username+nonce)', { skip: !IS_WIN && 'these tests need Windows PowerShell 5.1' }, () => {
   test('direct node qr-render emits a clean QR block: no replacement char, no code-page mojibake markers, no token', async () => {
     const { stdout } = await run('node', [
       join(MODULE_ROOT, 'src', 'qr-render.mjs'),
@@ -539,11 +518,7 @@ describe('ps-runtime: T10 direct node QR smoke (dummy username+nonce)', () => {
 // F1 fail-fast: the Node.js major-version gate lives ONCE, in common.ps1,
 // and must be callable against synthetic 'node --version' output. Empty or
 // malformed output fails closed; 18/22 are rejected, 24+ accepted.
-describe('ps-runtime: shared Node.js version gate (common.ps1)', () => {
-  before(async function () {
-    if (!IS_WIN) this.skip();
-  });
-
+describe('ps-runtime: shared Node.js version gate (common.ps1)', { skip: !IS_WIN && 'these tests need Windows PowerShell 5.1' }, () => {
   const COMMON_PATH = join(SCRIPTS, 'common.ps1');
 
   async function gateResult(versionOutput) {

@@ -122,14 +122,13 @@ const LIVE_STUBS = {
   verifyAcl: async () => ({ ok: true, sid: FAKE_SID }),
 };
 
-describe('state-acl: real Windows ACL (win32 only)', () => {
+// A hosted runner session cannot hold a user-only state root at all: the
+// environment probe in tests/privileged.mjs yields the skip reason instead
+// of failing the invariant (and reports non-win32 hosts the same way).
+describe('state-acl: real Windows ACL (win32 only)', { skip: userOnlyAclSkipReason }, () => {
   let realSid = null;
 
   before(async function () {
-    if (!IS_WIN) this.skip();
-    // A hosted runner session cannot hold a user-only state root at all:
-    // skip with the environment reason instead of failing the invariant.
-    if (userOnlyAclSkipReason) this.skip(userOnlyAclSkipReason);
     // Resolve the CURRENT user's SID the same way the scripts do.
     const { execFile } = await import('node:child_process');
     const { promisify } = await import('node:util');
@@ -190,14 +189,12 @@ describe('state-acl: real Windows ACL (win32 only)', () => {
   });
 });
 
-describe('state-acl: live identity + fresh ACL gate before credentials (win32 only)', () => {
+// Same environment gate as the real-ACL suite above: the live gate
+// demands a state root locked down to the invoking user alone.
+describe('state-acl: live identity + fresh ACL gate before credentials (win32 only)', { skip: userOnlyAclSkipReason }, () => {
   let realSid = null;
 
   before(async function () {
-    if (!IS_WIN) this.skip();
-    // Same environment gate as the real-ACL suite above: the live gate
-    // demands a state root locked down to the invoking user alone.
-    if (userOnlyAclSkipReason) this.skip(userOnlyAclSkipReason);
     const { execFile } = await import('node:child_process');
     const { promisify } = await import('node:util');
     const run = promisify(execFile);
