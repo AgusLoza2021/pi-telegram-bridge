@@ -69,6 +69,55 @@ function writeJsonAtomic(path, value) {
 }
 
 /**
+ * Default pid liveness probe: signal 0 tests existence without killing.
+ * Throws (e.g. ESRCH) when the pid is gone; the caller treats any throw
+ * as "not alive".
+ */
+function defaultIsPidAlive(pid) {
+  process.kill(pid, 0);
+  return true;
+}
+
+/**
+ * Startup visibility for an unclean previous death. Reads the previous
+ * broker-meta.json (before the first meta write clobbers it) and decides
+ * whether the previous run ended without recording a shutdown.
+ *
+ * Returns the diagnostic payload, or null:
+ * - no previous meta (first ever start) -> null;
+ * - previous meta with a non-null shutdownAt (clean stop) -> null;
+ * - shutdownAt === null and the previous pid is still alive -> null
+ *   (a second instance racing the capability lock, not a death);
+ * - shutdownAt === null and the pid is dead, missing or unverifiable ->
+ *   { code, previousPid, previousStartedAt, startedAt }.
+ *
+ * Never throws: a missing, corrupt or unreadable previous meta is
+ * swallowed and startup continues exactly as it does today.
+ */
+export function readUncleanPreviousRun(metaPath, startedAt, isPidAlive = defaultIsPidAlive) {
+  try {
+    const previous = JSON.parse(readFileSync(metaPath, 'utf8'));
+    if (!isPlainObject(previous) || previous.shutdownAt !== null) return null;
+    const previousPid = previous.pid;
+    let previousAlive = false;
+    try {
+      previousAlive = Number.isInteger(previousPid) && previousPid > 0 && isPidAlive(previousPid) === true;
+    } catch {
+      previousAlive = false; // dead or unverifiable pid is the real case
+    }
+    if (previousAlive) return null;
+    return {
+      code: 'broker_unclean_restart',
+      previousPid,
+      previousStartedAt: previous.startedAt,
+      startedAt,
+    };
+  } catch {
+    return null; // first ever start, or unreadable/corrupt meta: stay silent
+  }
+}
+
+/**
  * Bounded code-only JSONL logger with size-cap rotation into a local
  * archive dir. Events carry fixed codes and counts only; callers must
  * never place credentials, tokens, URLs or raw payloads into events.
@@ -220,6 +269,14 @@ export async function runBrokerMain(argv = process.argv.slice(2), io = process) 
   }
 
   const startedAt = Date.now();
+
+  // Startup visibility: before the first meta write clobbers the previous
+  // run's evidence, report a previous run that never recorded a shutdown.
+  // A live previous pid means a second instance is racing the capability
+  // lock, not a death, so that case stays silent. Never throws.
+  const uncleanRestart = readUncleanPreviousRun(metaPath, startedAt);
+  if (uncleanRestart) logger(uncleanRestart);
+
   const writeMeta = (heartbeatAt, extra = {}) => {
     try {
       // Credential-free by construction: fixed fields only.

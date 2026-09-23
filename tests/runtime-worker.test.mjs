@@ -4,12 +4,13 @@
 
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { Store } from '../src/store.mjs';
 import { WorkerBootstrapError, parseWorkerCredentials, createRuntimeWorker } from '../src/runtime-worker.mjs';
+import { readUncleanPreviousRun } from '../src/runtime-broker.mjs';
 
 const TEST_RUNS = fileURLToPath(new URL('../.local/test-runs/', import.meta.url));
 mkdirSync(TEST_RUNS, { recursive: true });
@@ -141,5 +142,76 @@ describe('createRuntimeWorker', () => {
     await disabled.worker.drainPending();
     await disabled.worker.dispose();
     assert.ok(true);
+  });
+});
+
+// Startup visibility for an unclean previous broker death: the previous
+// run never recorded a shutdown (shutdownAt stays null after a kill),
+// so the next start must say so exactly once — unless the previous pid
+// is still alive (a second instance racing the capability lock, not a
+// death). All cases are pure: the pid liveness probe is injected, so no
+// real broker process is ever launched here.
+describe('readUncleanPreviousRun (broker unclean-restart visibility)', () => {
+  const T1 = 1_700_000_100_000;
+  const T2 = 1_700_000_200_000;
+
+  // Simulates process.kill(pid, 0) throwing ESRCH for a dead pid.
+  const deadPid = () => {
+    throw Object.assign(new Error('ESRCH'), { code: 'ESRCH' });
+  };
+
+  function writeMetaFile(value) {
+    const root = mkdtempSync(join(TEST_RUNS, 'broker-meta-'));
+    const metaPath = join(root, 'broker-meta.json');
+    writeFileSync(metaPath, JSON.stringify(value));
+    return metaPath;
+  }
+
+  test('reports the previous run when shutdownAt is null and the pid is dead', () => {
+    const metaPath = writeMetaFile({ pid: 424242, startedAt: T1, shutdownAt: null });
+    assert.deepEqual(readUncleanPreviousRun(metaPath, T2, deadPid), {
+      code: 'broker_unclean_restart',
+      previousPid: 424242,
+      previousStartedAt: T1,
+      startedAt: T2,
+    });
+  });
+
+  test('stays silent when the previous run recorded a shutdown', () => {
+    const metaPath = writeMetaFile({ pid: 424242, startedAt: T1, shutdownAt: T1 + 5 });
+    assert.equal(readUncleanPreviousRun(metaPath, T2, deadPid), null);
+  });
+
+  test('stays silent on the first ever start (no previous meta)', () => {
+    const root = mkdtempSync(join(TEST_RUNS, 'broker-meta-'));
+    assert.equal(readUncleanPreviousRun(join(root, 'broker-meta.json'), T2, deadPid), null);
+  });
+
+  test('swallows a corrupt or unreadable previous meta and never throws', () => {
+    const root = mkdtempSync(join(TEST_RUNS, 'broker-meta-'));
+    const corrupt = join(root, 'broker-meta.json');
+    writeFileSync(corrupt, '{"pid": 424242, "shutdownAt": null'); // truncated
+    assert.equal(readUncleanPreviousRun(corrupt, T2, deadPid), null);
+    const unreadable = join(mkdtempSync(join(TEST_RUNS, 'broker-meta-')), 'broker-meta.json');
+    mkdirSync(unreadable); // a directory where the file should be
+    assert.equal(readUncleanPreviousRun(unreadable, T2, deadPid), null);
+  });
+
+  test('stays silent when the previous pid is still alive (capability-lock race)', () => {
+    const metaPath = writeMetaFile({ pid: 424242, startedAt: T1, shutdownAt: null });
+    assert.equal(readUncleanPreviousRun(metaPath, T2, () => true), null);
+  });
+
+  test('default probe treats the current process as alive and stays silent', () => {
+    const metaPath = writeMetaFile({ pid: process.pid, startedAt: T1, shutdownAt: null });
+    assert.equal(readUncleanPreviousRun(metaPath, T2), null);
+  });
+
+  test('reports an unverifiable (missing) pid as an unclean death', () => {
+    const metaPath = writeMetaFile({ startedAt: T1, shutdownAt: null });
+    const payload = readUncleanPreviousRun(metaPath, T2, deadPid);
+    assert.equal(payload.code, 'broker_unclean_restart');
+    assert.equal(payload.previousPid, undefined);
+    assert.equal(payload.previousStartedAt, T1);
   });
 });
