@@ -89,6 +89,18 @@ describe('rpc-framing: strict LF JSONL', () => {
     assert.equal(lines.length, 0);
   });
 
+  test('a throwing handler reports handler_error, not bad_json, and never throws', () => {
+    const handlerErrors = [];
+    const throwing = new LfJsonReader({
+      onLine: () => {
+        throw new Error('handler defect');
+      },
+      onError: (info) => handlerErrors.push(info),
+    });
+    assert.doesNotThrow(() => throwing.push('{"valid":"json"}\n'));
+    assert.deepEqual(handlerErrors, [{ reason: 'handler_error' }]);
+  });
+
   test('encodeRpcLine produces single-line JSON with no control newlines', () => {
     const line = encodeRpcLine({ type: 'prompt', message: 'two\nlines' });
     assert.ok(!line.includes('\n'));

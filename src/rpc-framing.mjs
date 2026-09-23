@@ -68,12 +68,22 @@ export class LfJsonReader {
       this.#onError({ reason: 'line_too_long', raw: '' });
       return;
     }
+    let parsed;
     try {
-      this.#onLine(JSON.parse(line));
+      parsed = JSON.parse(line);
     } catch {
       // Never echo the raw line: child stdout may contain sensitive
       // transcript content. Only the reason and the length go out.
       this.#onError({ reason: 'bad_json', length: line.length });
+      return;
+    }
+    try {
+      this.#onLine(parsed);
+    } catch {
+      // A handler defect is not malformed input: report it under its own
+      // fixed reason. Still swallowed (stream errors are never fatal) and
+      // never echoing content: the exception message may embed the raw line.
+      this.#onError({ reason: 'handler_error' });
     }
   }
 }
