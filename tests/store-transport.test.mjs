@@ -217,6 +217,34 @@ describe('store: outbox delivery bookkeeping', () => {
   });
 });
 
+describe('store: inbox schema is a dedup ledger, not a work queue', () => {
+  test('fresh schema has no processed_at column and no markInboxProcessed method', () => {
+    const dir = mkdtempSync(join(TEST_RUNS, 't03-inbox-schema-'));
+    const store = new Store(join(dir, 'main.sqlite'), { now: () => T0 });
+    const dbPath = join(dir, 'main.sqlite');
+    try {
+      assert.equal(
+        typeof store.markInboxProcessed,
+        'undefined',
+        'markInboxProcessed must not exist: dedup is by primary key via recordInbox',
+      );
+      assert.equal(store.recordInbox({ inboxId: 'tg:1', kind: 'message', payload: {} }), true);
+    } finally {
+      store.close();
+    }
+    const db = new DatabaseSync(dbPath);
+    try {
+      const columns = db.prepare('PRAGMA table_info(inbox)').all().map((row) => row.name);
+      assert.ok(
+        !columns.includes('processed_at'),
+        `processed_at must not exist in a fresh schema; columns: ${columns.join(',')}`,
+      );
+    } finally {
+      db.close();
+    }
+  });
+});
+
 describe('store: atomic transport update unit', () => {
   test('withTransaction commits inbox + action + outbox + offset together', () => {
     const dir = mkdtempSync(join(TEST_RUNS, 't03-tx-'));

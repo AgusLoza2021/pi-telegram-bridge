@@ -264,8 +264,11 @@ export class Store {
         inbox_id TEXT PRIMARY KEY,
         kind TEXT NOT NULL,
         payload_json TEXT NOT NULL,
-        received_at INTEGER NOT NULL,
-        processed_at INTEGER
+        received_at INTEGER NOT NULL
+        -- Inbox is a DEDUP LEDGER, not a work queue: dedup is by primary-key
+        -- presence via recordInbox. Nothing writes or reads a processed
+        -- marker. Databases created earlier may still carry an unused
+        -- processed_at column; CREATE TABLE IF NOT EXISTS leaves them alone.
       );
       CREATE TABLE IF NOT EXISTS actions (
         action_id TEXT PRIMARY KEY,
@@ -675,14 +678,6 @@ export class Store {
         )
         .run(inboxId, kind, payloadJson, this.#now());
       return info.changes === 1;
-    });
-  }
-
-  markInboxProcessed(inboxId) {
-    this.#transaction(() => {
-      this.#db
-        .prepare('UPDATE inbox SET processed_at = ? WHERE inbox_id = ?')
-        .run(this.#now(), inboxId);
     });
   }
 
