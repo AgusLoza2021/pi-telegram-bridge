@@ -298,7 +298,8 @@ describe('beginner copy: no builder ever leaks internals or jargon', () => {
 // --- setup.ps1 beginner-path copy (static bytes, never executed) -----------
 
 const MODULE_ROOT = fileURLToPath(new URL('..', import.meta.url));
-const SETUP_SOURCE = readFileSync(join(MODULE_ROOT, 'scripts', 'setup.ps1'), 'utf8');
+// Normalise once so multi-line literal searches work on CRLF checkouts too.
+const SETUP_SOURCE = readFileSync(join(MODULE_ROOT, 'scripts', 'setup.ps1'), 'utf8').replaceAll('\r\n', '\n');
 const DOC_SOURCE = readFileSync(join(MODULE_ROOT, 'docs', 'BEGINNER_UX.md'), 'utf8');
 
 /** MSG-S12: a missing Pi is a warning with the next action, never a blocker. */

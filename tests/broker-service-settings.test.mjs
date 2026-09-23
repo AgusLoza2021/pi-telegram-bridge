@@ -8,7 +8,8 @@ import { fileURLToPath } from 'node:url';
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
 const COMMON = join(ROOT, 'scripts', 'broker-service-common.ps1');
 const INSTALLER = join(ROOT, 'scripts', 'install-broker-service.ps1');
-const COMMON_SOURCE = readFileSync(COMMON, 'utf8');
+// Normalise once so multi-line literal searches work on CRLF checkouts too.
+const COMMON_SOURCE = readFileSync(COMMON, 'utf8').replaceAll('\r\n', '\n');
 const INSTALLER_SOURCE = readFileSync(INSTALLER, 'utf8');
 const IS_WIN = process.platform === 'win32';
 

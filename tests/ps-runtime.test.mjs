@@ -191,7 +191,7 @@ describe('ps-runtime: start.ps1 forwards the exact state root to prerequisites',
   function makeStartHarness(label) {
     const dir = uniqueDir(label);
     mkdirSync(dir, { recursive: true });
-    const source = readFileSync(join(SCRIPTS, 'start.ps1'), 'utf8');
+    const source = readFileSync(join(SCRIPTS, 'start.ps1'), 'utf8').replaceAll('\r\n', '\n');
     assert.ok(source.includes(DOT_SOURCE_LINE), 'start.ps1 must dot-source common.ps1');
     const copy = source.replace(DOT_SOURCE_LINE, '# harness copy: common.ps1 pre-loaded by the driver (prerequisite shim)');
     const copyPath = join(dir, 'start-harness.ps1');
@@ -319,7 +319,7 @@ describe('ps-runtime: log rotation + dated backups (common.ps1 helpers)', () => 
 // and the deep-link interpolation must brace ${botUsername} before "?start"
 // (an unbraced "$botUsername?start" parsed as one undefined variable name).
 describe('ps-runtime: T10 selective enrollment QR presentation (static source)', () => {
-  const source = readFileSync(join(SCRIPTS, 'setup.ps1'), 'utf8');
+  const source = readFileSync(join(SCRIPTS, 'setup.ps1'), 'utf8').replaceAll('\r\n', '\n');
 
   function selectiveEnrollmentSource() {
     const start = source.indexOf('function Invoke-SelectiveEnrollment {');
@@ -590,7 +590,7 @@ describe('ps-runtime: shared Node.js version gate (common.ps1)', () => {
   });
 
   test('broker-service-common.ps1 reuses the shared parser: no second copy of the version logic', () => {
-    const brokerSource = readFileSync(join(SCRIPTS, 'broker-service-common.ps1'), 'utf8');
+    const brokerSource = readFileSync(join(SCRIPTS, 'broker-service-common.ps1'), 'utf8').replaceAll('\r\n', '\n');
     assert.match(brokerSource, /Get-BridgeNodeMajorVersion -VersionOutput \$versionOutput/,
       'Test-BrokerServicePrerequisites must delegate parsing to common.ps1');
     assert.ok(!brokerSource.includes("'^v(\\d+)\\.'"),
@@ -601,9 +601,9 @@ describe('ps-runtime: shared Node.js version gate (common.ps1)', () => {
 // Standalone beginner setup contract: the double-click launcher selects this
 // mode, while direct setup keeps every advanced and legacy surface.
 describe('ps-runtime: launcher-only Beginner setup contract', () => {
-  const setupSource = readFileSync(join(SCRIPTS, 'setup.ps1'), 'utf8');
-  const installerSource = readFileSync(join(SCRIPTS, 'install-selective-extension.ps1'), 'utf8');
-  const commonSource = readFileSync(join(SCRIPTS, 'selective-extension-common.ps1'), 'utf8');
+  const setupSource = readFileSync(join(SCRIPTS, 'setup.ps1'), 'utf8').replaceAll('\r\n', '\n');
+  const installerSource = readFileSync(join(SCRIPTS, 'install-selective-extension.ps1'), 'utf8').replaceAll('\r\n', '\n');
+  const commonSource = readFileSync(join(SCRIPTS, 'selective-extension-common.ps1'), 'utf8').replaceAll('\r\n', '\n');
 
   test('the node presence+version gate precedes state resolution and the beginner path exits friendly before anything exists on disk', () => {
     const nodeCheck = setupSource.indexOf('# --- node check');

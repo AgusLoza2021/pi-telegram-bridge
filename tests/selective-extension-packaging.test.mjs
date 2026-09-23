@@ -63,7 +63,7 @@ function collectRuntimeRelativeClosure(entryRel) {
 // of the PowerShell source, so the test cannot pass because of a typo in
 // a hand-maintained expectation list.
 function parsePayloadMapFromSource() {
-  const source = readFileSync(COMMON_PS1, 'utf8');
+  const source = readFileSync(COMMON_PS1, 'utf8').replaceAll('\r\n', '\n');
   const body = /function\s+Get-SelectivePayloadMap\s*\{([\s\S]*?)\n\}/.exec(source);
   assert.ok(body, 'Get-SelectivePayloadMap must exist in selective-extension-common.ps1');
   const entries = [];
