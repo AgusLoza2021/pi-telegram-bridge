@@ -7,9 +7,12 @@
 # - Writes broker-control.json ATOMICALLY ({instanceId, command:
 #   'stop-broker', issuedAt}) - the exact contract parsed by
 #   src/runtime-broker.mjs.
-# - Waits at most 20 seconds for shutdownAt; a timeout exits 2 and
-#   leaves the evidence in place. NEVER calls Stop-Process and never
-#   signals an arbitrary PID.
+# - Waits at most 20 seconds for shutdownAt; a timeout exits 2, leaves
+#   the task ENABLED and the evidence in place. NEVER calls Stop-Process
+#   and never signals an arbitrary PID.
+# - Once the graceful stop IS confirmed it also DISABLES the task: that is
+#   what keeps the phone connection off across the next sign-in. The
+#   on-demand switch (scripts/telegram.ps1 off) shares this same helper.
 #
 # No stop happens in this session: this file is source only.
 
@@ -25,37 +28,17 @@ $ErrorActionPreference = 'Stop'
 $stateRoot = Resolve-BridgeStateDirectory -StateDirectory $StateDirectory
 Test-BridgeStateRootLock -Path $stateRoot | Out-Null
 
-$metaPath = Join-Path $stateRoot 'broker-meta.json'
 $live = Get-BrokerLiveMeta -StateRoot $stateRoot
 if ($null -eq $live) {
     Write-Host 'no live broker (broker-meta.json absent, stale or already shut down).'
-    exit 0
 }
 
-$instanceId = Get-BridgeMetaField -Meta $live -Name 'instanceId'
-if ($null -eq $instanceId -or $instanceId -notmatch '^[0-9a-f]{32}$') {
-    throw 'broker-meta.json carries no valid instance id; refusing to write a control file.'
+$taskName = Get-BrokerServiceTaskName
+$stopped = Stop-BrokerServiceTask -StateRoot $stateRoot -TaskName $taskName -TimeoutSeconds 20
+if (-not $stopped) {
+    Write-Host 'the broker did not confirm a shutdown within 20s; the task was left ENABLED and the control file and meta remain in place as evidence. Check scripts/status-broker-service.ps1.'
+    exit 2
 }
 
-Write-BrokerStopControl -StateRoot $stateRoot -InstanceId $instanceId
-Write-Host "stop-broker requested for instance $instanceId (pid $($live.pid)); waiting up to 20s..."
-
-$deadline = (Get-Date).AddSeconds(20)
-while ((Get-Date) -lt $deadline) {
-    Start-Sleep -Milliseconds 500
-    $meta = Read-JsonFile -Path $metaPath
-    if ($null -ne $meta -and $null -ne (Get-BridgeMetaField -Meta $meta -Name 'shutdownAt')) {
-        Write-Host 'broker stopped gracefully (shutdownAt recorded).'
-        exit 0
-    }
-    if ($null -ne $meta -and $null -ne (Get-BridgeMetaField -Meta $meta -Name 'pid')) {
-        $stillAlive = Get-Process -Id ([int](Get-BridgeMetaField -Meta $meta -Name 'pid')) -ErrorAction SilentlyContinue
-        if ($null -eq $stillAlive) {
-            Write-Host 'broker process exited.'
-            exit 0
-        }
-    }
-}
-
-Write-Host 'the broker did not confirm a shutdown within 20s; the control file and meta remain in place as evidence. Check scripts/status-broker-service.ps1.'
-exit 2
+Write-Host 'broker stopped gracefully and the task is disabled; nothing will start at the next logon.'
+exit 0

@@ -50,7 +50,7 @@ The advanced flow performs these stages:
 1. **Protect the state directory.** It creates `.local/state/`, applies a user-only Windows ACL, and verifies the result before any secret exists.
 2. **Write nonsecret runtime identity.** It writes `runtime.json` with the validated instance ID and selective bridge mode. Existing configuration is backed up before replacement.
 3. **Enroll.** It reads the token with hidden input, validates the bot, refuses active webhooks, and pairs through a locally rendered QR code by default. The QR contains only the validated bot username and a fresh 128-bit nonce. Manual numeric ID entry is available as an advanced fallback. An explicit `ENROLL` confirmation is required before the atomic DPAPI credential commit.
-4. **Offer local installation.** It can install the global Pi extension, register the current-user scheduled task, and start the broker. Unlike the beginner launcher, these choices are presented individually.
+4. **Offer local installation.** It can install the global Pi extension, register the current-user scheduled task (always registered disabled), and start the broker. Unlike the beginner launcher, these choices are presented individually.
 
 Abort before confirmation and the previous credentials and configuration remain unchanged.
 
@@ -75,19 +75,23 @@ The QR renderer is local-only computation. It does not call an online QR service
 
 The dedicated scheduled task is named `PiTelegramBridgeBroker`. It runs as the current interactive user with limited privileges, stores no Windows password, and pins the exact Node.js executable and repository paths captured at installation.
 
-The task:
+The task is registered **disabled**. That enable bit is the connection switch: nothing runs at a sign-in until `telegram on`, and `telegram off` clears the bit again, so the connection stays off across restarts.
+
+Once enabled, the task:
 
 - starts at user logon and when explicitly requested;
 - does not stop when the PC leaves Task Scheduler's idle state;
 - has no execution-time limit;
 - ignores duplicate start requests while one instance is running;
-- can retry an unexpected failure up to three times at one-minute intervals;
-- installs disabled when enrollment is incomplete, preventing a logon crash loop.
+- can retry an unexpected failure up to three times at one-minute intervals.
 
 ```powershell
+telegram on                           # enable the task and start the broker; fails closed if credentials are missing
+telegram off                          # graceful stop, then disable, so the connection stays off across sign-ins
+telegram status                       # read-only: is the connection on, and is the broker live?
 scripts/status-broker-service.ps1     # task state and credential-free broker health; add -Json for scripts
 scripts/start-broker-service.ps1      # enable and start; wait for a fresh heartbeat; reuse a live broker
-scripts/stop-broker-service.ps1       # request graceful instance-bound shutdown; never kill an arbitrary PID
+scripts/stop-broker-service.ps1       # request graceful instance-bound shutdown, then disable; never kill an arbitrary PID
 scripts/uninstall-broker-service.ps1  # graceful stop, dated XML backup, remove only this task
 ```
 

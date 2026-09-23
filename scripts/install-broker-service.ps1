@@ -14,10 +14,10 @@
 # - Prerequisites: Windows PowerShell 5.1+, Node 24+, confined state
 #   root with a verified current-user ACL (through the existing common
 #   helpers; ACLs are never weakened).
-# - Credentials: if the DPAPI blob or runtime.json is absent, the task is
-#   registered DISABLED and SETUP_REQUIRED is reported (no start, no
-#   logon failure loop). With credentials present the task is enabled but
-#   NOT started unless -Start is passed explicitly.
+# - On-demand default: the task is ALWAYS registered DISABLED, whatever
+#   the credential state. Nothing may start at logon until the owner turns
+#   the connection on with the telegram switch; -Start is the explicit
+#   opt-in for a caller that has just enrolled credentials.
 #
 # No registration happens in this session: this file is source only.
 
@@ -71,28 +71,25 @@ Register-ScheduledTask -TaskName $taskName -Trigger $trigger -Principal $princip
 $registeredTaskXml = Export-ScheduledTask -TaskName $taskName
 Assert-BrokerServiceTaskXml -TaskXml $registeredTaskXml | Out-Null
 
-# Credentials gate: without the DPAPI blob the task stays DISABLED so a
-# logon can never enter a start-crash-restart loop.
-if ($credentialsPresent) {
-    Enable-ScheduledTask -TaskName $taskName | Out-Null
-    $taskEnabled = $true
-} else {
-    Disable-ScheduledTask -TaskName $taskName | Out-Null
-    $taskEnabled = $false
-}
+# On-demand default: disable the freshly registered task so a sign-in
+# starts nothing. The switch is the only thing that enables it again,
+# which is also why a missing credential can no longer produce a logon
+# failure loop - nothing runs at logon unless the owner asked for it.
+Disable-ScheduledTask -TaskName $taskName | Out-Null
+$taskEnabled = $false
 
 $manifest = Write-BrokerServiceManifest -TaskName $taskName -NodeExe $nodeExe -ModuleRoot $moduleRoot `
     -StateDirectory $stateRoot -CredentialsPresent $credentialsPresent -TaskEnabled $taskEnabled
 
 Write-Host ''
 if ($credentialsPresent) {
-    Write-Host 'INSTALL OK - task enabled (not started).'
+    Write-Host 'INSTALL OK - task registered DISABLED; nothing starts at logon.'
     if (-not $Start) {
-        Write-Host 'Start it explicitly with scripts/start-broker-service.ps1 (or re-run install with -Start).'
+        Write-Host 'Turn the connection on with "telegram on" (or re-run install with -Start).'
     }
 } else {
     Write-Host 'SETUP_REQUIRED - credentials are missing; the task was registered DISABLED.'
-    Write-Host 'Run scripts/setup.ps1 to enroll, then scripts/start-broker-service.ps1.'
+    Write-Host 'Run scripts/setup.ps1 to enroll, then turn the connection on with "telegram on".'
 }
 Write-Host "Task: $taskName (logon trigger, current user, Interactive, Limited)."
 Write-Host "Node: $nodeExe"

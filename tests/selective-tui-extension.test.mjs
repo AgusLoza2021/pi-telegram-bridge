@@ -40,13 +40,13 @@ const MSG_C6_UNLINKED = 'Unlinked. This window no longer talks to Telegram.';
 const MSG_C8_SETUP =
   "Your PC isn't linked to Telegram yet. Double-click Setup Pi Telegram on your PC first, then come back here.";
 const MSG_C2_PHONE_UNAVAILABLE =
-  "Linked, but the phone connection on this PC isn't running right now. Restart Windows, then send your message again. This Pi will stay linked.";
+  "Linked, but the phone connection on this PC isn't running right now. In the Pi Telegram folder run \".\\telegram on\", then send your message again. This Pi will stay linked.";
 const msgC2 = (bareLabel) =>
   `Linked. Send a message from your phone — this Pi (Pi · ${bareLabel}) will answer. Type /tg off to unlink.`;
 const msgC3 = (bareLabel, state) =>
   `This Pi is linked as 'Pi · ${bareLabel}' (currently ${state}). Type /tg off to unlink.`;
 const msgC3Unavailable = (bareLabel) =>
-  `This Pi is linked as 'Pi · ${bareLabel}', but the phone connection on this PC isn't running right now. Restart Windows, then try again.`;
+  `This Pi is linked as 'Pi · ${bareLabel}', but the phone connection on this PC isn't running right now. Run ".\\telegram on" in the Pi Telegram folder, then try again.`;
 const TEST_INSTANCE_ID = 'a'.repeat(32);
 
 /** Duck-typed ExtensionAPI: records commands, events, sends and tools. */

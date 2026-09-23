@@ -158,9 +158,11 @@ export function createBrokerLogger({
 
 /**
  * Pure broker-control verdict: returns 'stop', 'foreign', 'invalid',
- * 'unknown' or 'empty'. The stop command is honored only when the
- * instanceId matches the ops config exactly; foreign or malformed
- * payloads are consumed and ignored (fail closed).
+ * 'unknown', 'consumed' or 'empty'. The stop command is honored only when
+ * the instanceId matches the ops config exactly; foreign or malformed
+ * payloads are consumed and ignored (fail closed). 'consumed' is the bare
+ * marker a command leaves behind once it was applied: a terminal resting
+ * state, not a pending command.
  */
 export function parseBrokerControl(raw, instanceId) {
   if (typeof raw !== 'string' || raw.trim().length === 0) return 'empty';
@@ -170,9 +172,24 @@ export function parseBrokerControl(raw, instanceId) {
   } catch {
     return 'invalid';
   }
-  if (!isPlainObject(parsed) || parsed.instanceId !== instanceId) return 'foreign';
+  if (!isPlainObject(parsed)) return 'foreign';
+  // Checked before the instance id: the marker is written without one, so
+  // skipping this would make every later tick read it as a foreign payload.
+  if (parsed.command === undefined && typeof parsed.consumedAt === 'number') return 'consumed';
+  if (parsed.instanceId !== instanceId) return 'foreign';
   if (!CONTROL_COMMANDS.has(parsed.command)) return 'unknown';
   return parsed.command === 'stop-broker' ? 'stop' : 'unknown';
+}
+
+/**
+ * Pure decision for one control tick: the verdict, plus whether this tick
+ * must reset the file because it carried a fresh command. Kept separate
+ * from the timer so the invariant "a consumed marker is never re-consumed"
+ * is testable without touching a file or a clock.
+ */
+export function decideControlTick(raw, instanceId) {
+  const verdict = parseBrokerControl(raw, instanceId);
+  return { verdict, consume: verdict !== 'empty' && verdict !== 'consumed' };
 }
 
 /**
@@ -302,8 +319,13 @@ export async function runBrokerMain(argv = process.argv.slice(2), io = process) 
     abort.abort();
   };
 
-  // Local control channel (state-root broker-control.json), consumed
-  // first and decided second so a stop request applies at most once.
+  // Local control channel (state-root broker-control.json). A pending
+  // command is reset to a bare consumed marker before it is applied, so a
+  // stop request still applies at most once even if the broker dies
+  // mid-tick. A marker already consumed is terminal and left untouched:
+  // re-consuming it would make the reset above its own next input, so the
+  // tick would rewrite the file and log a rejection once per second for the
+  // whole life of the broker.
   const controlTimer = setInterval(() => {
     let raw;
     try {
@@ -311,13 +333,13 @@ export async function runBrokerMain(argv = process.argv.slice(2), io = process) 
     } catch {
       return;
     }
-    if (raw.trim().length === 0) return;
+    const { verdict, consume } = decideControlTick(raw, config.instanceId);
+    if (!consume) return;
     try {
       writeJsonAtomic(controlPath, { consumedAt: Date.now() });
     } catch {
       logger({ code: 'control_reset_error' });
     }
-    const verdict = parseBrokerControl(raw, config.instanceId);
     if (verdict === 'stop') stop('control');
     else if (verdict === 'invalid') logger({ code: 'control_invalid' });
     else if (verdict === 'foreign') logger({ code: 'control_rejected' });

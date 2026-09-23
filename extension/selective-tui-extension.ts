@@ -85,11 +85,11 @@ const MSG_C4_BUSY =
 const MSG_C2_LINKED = (bareLabel: string) =>
   `Linked. Send a message from your phone — this Pi (${displayLabel(bareLabel)}) will answer. Type /tg off to unlink.`;
 const MSG_C2_PHONE_UNAVAILABLE =
-  "Linked, but the phone connection on this PC isn't running right now. Restart Windows, then send your message again. This Pi will stay linked.";
+  "Linked, but the phone connection on this PC isn't running right now. In the Pi Telegram folder run \".\\telegram on\", then send your message again. This Pi will stay linked.";
 const MSG_C3_STATUS = (bareLabel: string, state: string) =>
   `This Pi is linked as '${displayLabel(bareLabel)}' (currently ${state}). Type /tg off to unlink.`;
 const MSG_C3_STATUS_PHONE_UNAVAILABLE = (bareLabel: string) =>
-  `This Pi is linked as '${displayLabel(bareLabel)}', but the phone connection on this PC isn't running right now. Restart Windows, then try again.`;
+  `This Pi is linked as '${displayLabel(bareLabel)}', but the phone connection on this PC isn't running right now. Run ".\\telegram on" in the Pi Telegram folder, then try again.`;
 const MSG_C5_UNLINK_ASK = 'Unlink this Pi from Telegram?';
 const MSG_C7_BUSY =
   'Warning: a task is still running here. Its result will NOT be sent to Telegram anymore.';
