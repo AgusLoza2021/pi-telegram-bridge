@@ -6,9 +6,18 @@
 // Telegram button) and the guarantee that no beginner-visible builder can
 // leak short ids, tracking ids, cwd, pid or jargon — even from a hostile
 // label.
+//
+// The setup.ps1 beginner-path copy (Pi-missing warning, unsafe-folder
+// refusals) is pinned as STATIC SOURCE bytes: the beginner setup flow is
+// interactive by design and must never be executed by a test, so these
+// assertions follow the windows-launcher.test.mjs convention of reading the
+// script bytes instead of spawning PowerShell.
 
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import {
   MAX_BUTTON_TEXT_CHARS,
@@ -283,5 +292,140 @@ describe('beginner copy: no builder ever leaks internals or jargon', () => {
     // "broker" is an advanced-layer word: allowed only after the label.
     assert.doesNotMatch(beginnerPortion, /broker/i);
     assert.match(advancedPortion, /broker/i);
+  });
+});
+
+// --- setup.ps1 beginner-path copy (static bytes, never executed) -----------
+
+const MODULE_ROOT = fileURLToPath(new URL('..', import.meta.url));
+const SETUP_SOURCE = readFileSync(join(MODULE_ROOT, 'scripts', 'setup.ps1'), 'utf8');
+const DOC_SOURCE = readFileSync(join(MODULE_ROOT, 'docs', 'BEGINNER_UX.md'), 'utf8');
+
+/** MSG-S12: a missing Pi is a warning with the next action, never a blocker. */
+const PI_MISSING_LINES = [
+  'Pi is not on this computer yet. Your private link is safe and will wait.',
+  'Install Pi on this PC, then open it and type /tg to connect.',
+];
+
+/** MSG-E5/MSG-E6: the state root cannot be kept local-only there. */
+const ONEDRIVE_REFUSAL = 'This folder is inside OneDrive, so your private link cannot stay only on this PC.';
+const PROTECTED_FOLDER_REFUSAL = 'This folder is inside a protected Windows folder, so setup cannot keep your private link safe here.';
+const UNSAFE_FOLDER_ACTION = 'Move the setup folder to a normal folder on this PC (for example C:\\pi-telegram-bridge), then run setup again.';
+
+/** MSG-S12..MSG-E6 must be marked implemented in the document, not design. */
+const NEW_IMPLEMENTED_IDS = ['MSG-S12', 'MSG-E5', 'MSG-E6'];
+
+function beginnerPlanSlice() {
+  const start = SETUP_SOURCE.indexOf("if ($Beginner) {\n    Write-Host ''\n    Write-Host 'Finishing setup...'");
+  assert.ok(start >= 0, 'the beginner component plan must exist');
+  const end = SETUP_SOURCE.indexOf('# --- post-enrollment offers', start);
+  assert.ok(end > start, 'the beginner plan must be bounded');
+  return SETUP_SOURCE.slice(start, end);
+}
+
+describe('beginner copy: setup.ps1 missing-Pi warning (MSG-S12)', () => {
+  test('the exact warning lines exist on the beginner path', () => {
+    for (const line of PI_MISSING_LINES) {
+      assert.ok(SETUP_SOURCE.includes(line), `missing exact copy: ${line}`);
+    }
+  });
+
+  test('the warning is conditional, so a Pi-present run prints none of it', () => {
+    const firstWarning = SETUP_SOURCE.indexOf(PI_MISSING_LINES[0]);
+    assert.ok(firstWarning >= 0);
+    const guard = SETUP_SOURCE.lastIndexOf('if ($beginnerPiMissing) {', firstWarning);
+    assert.ok(guard >= 0 && guard < firstWarning,
+      'the warning lines must sit inside an explicit Pi-missing conditional');
+  });
+
+  test('a missing Pi never fails the install: the warning branch cannot exit nonzero', () => {
+    const plan = beginnerPlanSlice();
+    assert.equal(plan.match(/exit [1-9]/g), null,
+      'no hardcoded nonzero exit may exist in the beginner plan; only exit $code and exit 0');
+    assert.ok(plan.includes('exit 0'), 'the beginner plan must still complete successfully');
+    assert.ok(plan.includes(PI_MISSING_LINES[0]),
+      'the warning must live inside the plan, after enrollment');
+  });
+
+  test('Pi detection happens before the extension installer creates the Pi directory', () => {
+    const detection = SETUP_SOURCE.indexOf('$beginnerPiMissing = ($null -eq $piCommand');
+    const plan = beginnerPlanSlice();
+    const planStart = SETUP_SOURCE.indexOf(plan);
+    const extensionInstall = plan.indexOf("'install-selective-extension.ps1'");
+    assert.ok(detection >= 0, 'the Pi presence detection must exist');
+    assert.ok(extensionInstall >= 0, 'the plan must install the extension');
+    assert.ok(detection < planStart + extensionInstall,
+      'the detection must run before the extension install, which creates the Pi directory itself');
+  });
+
+  test('the warning copy is jargon-free', () => {
+    for (const line of PI_MISSING_LINES) {
+      for (const word of JARGON) {
+        assert.doesNotMatch(line, new RegExp(word.replace(' ', '\\s+'), 'i'),
+          `jargon "${word}" leaked into setup warning`);
+      }
+    }
+  });
+
+  test('the document marks MSG-S12 as implemented', () => {
+    assert.ok(DOC_SOURCE.includes('MSG-S12'), 'the document must define MSG-S12');
+    const marker = DOC_SOURCE.indexOf('MSG-S12');
+    const statusArea = DOC_SOURCE.slice(marker, marker + 400);
+    assert.match(statusArea, /implemented/i, 'MSG-S12 must be marked implemented');
+  });
+});
+
+describe('beginner copy: setup.ps1 unsafe-folder refusals (MSG-E5, MSG-E6)', () => {
+  test('the exact refusal lines exist', () => {
+    assert.ok(SETUP_SOURCE.includes(ONEDRIVE_REFUSAL), 'missing the OneDrive refusal');
+    assert.ok(SETUP_SOURCE.includes(PROTECTED_FOLDER_REFUSAL), 'missing the protected-folder refusal');
+    assert.ok(SETUP_SOURCE.includes(UNSAFE_FOLDER_ACTION), 'missing the next action');
+  });
+
+  test('the refusal fires BEFORE the state root is locked or any secret is captured', () => {
+    const refusal = SETUP_SOURCE.indexOf(ONEDRIVE_REFUSAL);
+    const lock = SETUP_SOURCE.indexOf('$capabilitySid = Lock-BridgeStateRoot -Path $stateRoot');
+    const tokenPrompt = SETUP_SOURCE.indexOf("Read-Host -Prompt 'Bot token (masked)'");
+    assert.ok(lock > refusal, 'the ACL lock must happen after the refusal gate');
+    assert.ok(tokenPrompt > refusal, 'the token prompt must happen after the refusal gate');
+  });
+
+  test('the refusal only fires on the flagged condition and exits 1 for beginners', () => {
+    const gate = SETUP_SOURCE.indexOf('if ($null -ne $unsafeRootReason) {');
+    assert.ok(gate >= 0, 'the refusal must be conditional on the detected unsafe location');
+    const blockEnd = SETUP_SOURCE.indexOf('New-Item -ItemType Directory -Path $stateRoot', gate);
+    const block = SETUP_SOURCE.slice(gate, blockEnd);
+    assert.match(block, /if \(\$Beginner\) \{/, 'the beginner refusal branch must exist');
+    assert.match(block, /exit 1/, 'the beginner refusal must exit nonzero');
+    assert.match(block, /throw /, 'the advanced path must still throw a technical error');
+  });
+
+  test('the healthy path keeps its original behavior: resolve, create, lock, unchanged', () => {
+    const resolveIndex = SETUP_SOURCE.indexOf('$stateRoot = Resolve-BridgeStateDirectory -StateDirectory $StateDirectory');
+    assert.ok(resolveIndex >= 0);
+    const createLine = SETUP_SOURCE.indexOf('New-Item -ItemType Directory -Path $stateRoot -Force | Out-Null', resolveIndex);
+    const lockLine = SETUP_SOURCE.indexOf('$capabilitySid = Lock-BridgeStateRoot -Path $stateRoot', resolveIndex);
+    assert.ok(createLine > resolveIndex && lockLine > createLine,
+      'resolve -> create -> lock must stay in the original order on the healthy path');
+  });
+
+  test('the refusal copy is jargon-free and names no real absolute user path', () => {
+    const lines = [ONEDRIVE_REFUSAL, PROTECTED_FOLDER_REFUSAL, UNSAFE_FOLDER_ACTION];
+    for (const line of lines) {
+      for (const word of JARGON) {
+        assert.doesNotMatch(line, new RegExp(word.replace(' ', '\\s+'), 'i'),
+          `jargon "${word}" leaked into setup refusal`);
+      }
+      assert.doesNotMatch(line, /C:\\Users\\/, 'no real absolute user path may appear');
+    }
+  });
+
+  test('the document marks MSG-E5 and MSG-E6 as implemented', () => {
+    for (const id of ['MSG-E5', 'MSG-E6']) {
+      assert.ok(DOC_SOURCE.includes(id), `the document must define ${id}`);
+      const marker = DOC_SOURCE.indexOf(id);
+      const statusArea = DOC_SOURCE.slice(marker, marker + 400);
+      assert.match(statusArea, /implemented/i, `${id} must be marked implemented`);
+    }
   });
 });

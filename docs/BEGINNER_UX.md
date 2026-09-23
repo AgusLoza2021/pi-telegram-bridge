@@ -1,12 +1,47 @@
 # Beginner UX Contract — Pi ⇄ Telegram on Windows 11 (T01)
 
-Audience: non-technical users first, implementers second. This document is the **contract** for what a beginner sees and can do; every string in quotes is exact user-facing copy. It is documentation/design only — it adds no runtime behavior by itself. Section 13 maps each UX requirement to the existing safe operations it must be built on.
+Audience: non-technical users first, implementers second. This document is a **two-tier contract**: it separates what a beginner sees today from what is still a design target. Every string in quotes is either exact user-facing copy that exists in the code today (**implemented**) or an agreed target that no code prints yet (**design**). A reader must never have to guess which one they are looking at: every `MSG-…` id carries its status inline, and §0 is the per-id status table. It is documentation only — it adds no runtime behavior by itself. Section 13 maps each UX requirement to the existing safe operations it must be built on.
 
 Conventions:
 
-- `MSG-…` ids are stable copy references used by the acceptance matrix (§14) and future tests.
+- `MSG-…` ids are stable copy references used by the acceptance matrix (§14) and the tests. **Implemented** ids are pinned byte-exact by tests (the Telegram-side strings by `tests/beginner-copy.test.mjs`); **design** ids are not in any code path, and no test may assert them as live.
+- Where live beginner copy differs from a design string, the live wording lives in `scripts/setup.ps1` (its `-Beginner` branches) and `Setup Pi Telegram.cmd`. Until a design id is implemented, those surfaces — not this document — are what the user actually reads.
 - "Beginner path" means: no Windows internals (encryption, services, tasks, permissions), no short session ids, no slash commands except `/tg` and `/start` unless the user opts into advanced mode (§11).
 - V1 copy language: **English**. The friendly-label → operation mapping (§8) is written so a translation layer can replace strings later without changing behavior.
+
+---
+
+## 0. Copy status table (implemented vs. design)
+
+Status was verified by reading the code, id by id — not estimated. **Implemented** means the exact quoted string exists on the named source location today. **Design** means the id's string exists nowhere in the code; the named surface is where it must be built, and that surface currently shows different (live) wording.
+
+| Id | Status | Source location (implemented) / build surface (design) |
+|---|---|---|
+| `MSG-S1`…`MSG-S11` | design | `scripts/setup.ps1` `-Beginner` branches + `Setup Pi Telegram.cmd` (live wording differs from every target string below) |
+| `MSG-S12` | implemented | `scripts/setup.ps1` — Beginner component plan (missing-Pi warning) |
+| `MSG-C1`…`MSG-C8` (incl. `MSG-C2B`, `MSG-C3B`) | implemented | `extension/selective-tui-extension.ts` (`MSG_C1_CONFIRM` … `MSG_C8_SETUP`) |
+| `MSG-T2` | implemented | `src/beginner-copy.mjs` (`homeNoLive`), sent by `src/selective-telegram-broker.mjs` |
+| `MSG-T3` | implemented | `src/beginner-copy.mjs` (`homeOne`) |
+| `MSG-T4` | implemented | `src/beginner-copy.mjs` (`homeMultiple` + label buttons) |
+| `MSG-T5` | implemented | `src/beginner-copy.mjs` (`sessionGone`) |
+| `MSG-T1` | design | broker `/start` home (setup-incomplete case) |
+| `MSG-P1` | implemented | `src/beginner-copy.mjs` (`pendingSaved`) |
+| `MSG-P2` | implemented | `src/beginner-copy.mjs` (`pendingSent`) |
+| `MSG-P3` | design | broker no-session path (a live variant exists: `plainNoLive` / `noLiveGuidance`, wording differs) |
+| `MSG-B1` | implemented | `src/beginner-copy.mjs` (`busyFollowup`) |
+| `MSG-B2` | implemented | `src/beginner-copy.mjs` (`busySteer`) |
+| `MSG-B3` | implemented | `src/beginner-copy.mjs` (`busyAbortSent`) |
+| `MSG-B4` | design | busy-choice discard ack (a live near-variant exists: `busyDiscard`, wording differs) |
+| `MSG-B5` | design | busy-choice card headline (live variant: `busyCard`, wording differs) |
+| `MSG-B6` | design | busy-choice text prompt |
+| `MSG-O1` | implemented | `src/beginner-copy.mjs` (`disconnectAsk` + `DISCONNECT_BUTTON`/`CANCEL_BUTTON`) |
+| `MSG-O2` | implemented | `src/beginner-copy.mjs` (`stopAck`) |
+| `MSG-E1` | design | `scripts/setup.ps1` recoverable-failure paths |
+| `MSG-E2` | design | broker error path (PC unreachable) |
+| `MSG-E3` | design | setup repeated-failure path |
+| `MSG-E4` | implemented | `src/beginner-copy.mjs` (`unknownCommand`) |
+| `MSG-E5` | implemented | `scripts/setup.ps1` — unsafe-location gate (OneDrive refusal) |
+| `MSG-E6` | implemented | `scripts/setup.ps1` — unsafe-location gate (protected-folder refusal) |
 
 ---
 
@@ -36,18 +71,21 @@ Entry: the user double-clicks the setup launcher (a thin double-clickable wrappe
 
 States: `NOT_ENROLLED → TOKEN_PROMPT → TOKEN_CHECK → QR_WAITING → (QR_EXPIRED ↺) → ENROLLED → SERVICE_RUNNING`; any step may enter `RECOVERABLE_FAILURE` and return to the failed step.
 
+Status: **every string in this state machine except `MSG-S12` is design.** The live `-Beginner` setup copy in `scripts/setup.ps1` and `Setup Pi Telegram.cmd` differs from every target string below (§0); this table is the target those surfaces must converge on.
+
 | State | Trigger | Exact copy / behavior |
 |---|---|---|
-| `NOT_ENROLLED` | Launcher opened, PC not linked yet | `MSG-S1`: "Welcome! This links your PC to your own Telegram bot so you can talk to Pi from your phone. Press Enter to start." |
-| `NOT_ENROLLED` (already linked) | Launcher opened, PC already linked | `MSG-S2`: "This PC is already linked. Press Enter to keep the current link, or type RESET to start over." |
-| `TOKEN_PROMPT` | User pressed Enter | `MSG-S3`: "Paste the token BotFather gave you (it looks like 123456789:AA…), then press Enter. It stays on this computer." Input masked; no echo. |
-| `TOKEN_CHECK` | Token pasted | `MSG-S4`: "Checking your bot…". On success: `MSG-S5`: "Found your bot: @<botname>." |
-| `TOKEN_CHECK` (invalid token) | Bot check fails | `MSG-S6`: "That token didn't work. Copy it again from BotFather (send /token to BotFather to see it) and paste it here." → stays in `TOKEN_PROMPT`. |
-| `QR_WAITING` | Bot verified | `MSG-S7`: "Open the Camera app on your phone and point it at this code. Tap the Telegram link, then tap Start." QR rendered locally; below it: `MSG-S8`: "Waiting for your scan… (expires in 60 seconds)" with a live countdown. |
-| `QR_EXPIRED` | 60 s elapsed without scan | `MSG-S9`: "The code expired. Press Enter for a new one." → fresh code, same `QR_WAITING` copy. Three consecutive expiries → `RECOVERABLE_FAILURE` with `MSG-E3`. |
-| `ENROLLED` | Scan paired successfully | `MSG-S10`: "Done! Your PC and Telegram are linked." |
-| `SERVICE_RUNNING` | Background link started | `MSG-S11`: "Your link is active and will start automatically each time you sign in to Windows. Open Pi, type /tg, and send a message from your phone." |
-| `RECOVERABLE_FAILURE` | Any recoverable error (scan failed, network down, restart needed) | `MSG-E1`: "Something didn't work: <plain reason>. Nothing was changed — your previous settings are intact. Press Enter to try again, or close this window." Plain reasons from a fixed whitelist (§10); internal causes never surface by name. |
+| `NOT_ENROLLED` | Launcher opened, PC not linked yet | `MSG-S1` (design): "Welcome! This links your PC to your own Telegram bot so you can talk to Pi from your phone. Press Enter to start." |
+| `NOT_ENROLLED` (already linked) | Launcher opened, PC already linked | `MSG-S2` (design): "This PC is already linked. Press Enter to keep the current link, or type RESET to start over." |
+| `TOKEN_PROMPT` | User pressed Enter | `MSG-S3` (design): "Paste the token BotFather gave you (it looks like 123456789:AA…), then press Enter. It stays on this computer." Input masked; no echo. |
+| `TOKEN_CHECK` | Token pasted | `MSG-S4` (design): "Checking your bot…". On success: `MSG-S5` (design): "Found your bot: @<botname>." |
+| `TOKEN_CHECK` (invalid token) | Bot check fails | `MSG-S6` (design): "That token didn't work. Copy it again from BotFather (send /token to BotFather to see it) and paste it here." → stays in `TOKEN_PROMPT`. |
+| `QR_WAITING` | Bot verified | `MSG-S7` (design): "Open the Camera app on your phone and point it at this code. Tap the Telegram link, then tap Start." QR rendered locally; below it: `MSG-S8` (design): "Waiting for your scan… (expires in 60 seconds)" with a live countdown. |
+| `QR_EXPIRED` | 60 s elapsed without scan | `MSG-S9` (design): "The code expired. Press Enter for a new one." → fresh code, same `QR_WAITING` copy. Three consecutive expiries → `RECOVERABLE_FAILURE` with `MSG-E3`. |
+| `ENROLLED` | Scan paired successfully | `MSG-S10` (design): "Done! Your PC and Telegram are linked." |
+| `ENROLLED` (note, beginner path) | Setup finished but Pi is not on the PC yet | `MSG-S12` (implemented): "Pi is not on this computer yet. Your private link is safe and will wait." + "Install Pi on this PC, then open it and type /tg to connect." Warning only — setup still succeeds. |
+| `SERVICE_RUNNING` | Background link started | `MSG-S11` (design): "Your link is active and will start automatically each time you sign in to Windows. Open Pi, type /tg, and send a message from your phone." |
+| `RECOVERABLE_FAILURE` | Any recoverable error (scan failed, network down, restart needed) | `MSG-E1` (design): "Something didn't work: <plain reason>. Nothing was changed — your previous settings are intact. Press Enter to try again, or close this window." Plain reasons from a fixed whitelist (§10); internal causes never surface by name. |
 
 Hard rules:
 
@@ -59,22 +97,22 @@ Hard rules:
 
 ## 4. Pi `/tg` — state machine
 
-`/tg` is the beginner alias of the existing opt-in connect command. **Every Pi process stays disconnected by default; nothing ever connects automatically.** The extension is present but inert until the user types `/tg` in that specific Pi window.
+`/tg` is the beginner alias of the existing opt-in connect command. **Every Pi process stays disconnected by default; nothing ever connects automatically.** The extension is present but inert until the user types `/tg` in that specific Pi window. Status: **all copy in this state machine is implemented** in `extension/selective-tui-extension.ts` (§0).
 
 States: `DISCONNECTED → CONFIRM_PROMPT → CONNECTED`; `CONNECTED → DISCONNECT_PROMPT → DISCONNECTED`. `BUSY` is an annotation that changes copy, not reachability.
 
 | State | Trigger | Exact copy / behavior |
 |---|---|---|
-| `DISCONNECTED` | `/tg` typed, this Pi not linked | `MSG-C1` (confirmation prompt): "Link this Pi window to Telegram? You'll be able to send it messages from your phone and it will reply there. [Connect] [Cancel]" |
-| `CONNECTED` | User chose Connect and the PC phone connection has a fresh matching heartbeat | `MSG-C2`: "Linked. Send a message from your phone — this Pi (Pi · <label>) will answer. Type /tg off to unlink." The label is auto-derived: project folder name (§5). |
-| `CONNECTED_LOCAL_ONLY` | User chose Connect but the PC phone connection is missing, stale, shut down, foreign or dead | `MSG-C2B`: "Linked, but the phone connection on this PC isn't running right now. Restart Windows, then send your message again. This Pi will stay linked." The local link remains active so routing recovers automatically when the PC connection returns. |
-| `CONNECTED` | `/tg` typed while linked and the PC phone connection is live | `MSG-C3`: "This Pi is linked as 'Pi · <label>' (currently <state>). Type /tg off to unlink." (idempotent status, no re-confirmation) |
-| `CONNECTED_LOCAL_ONLY` | `/tg` typed while linked but the PC phone connection is unavailable | `MSG-C3B`: "This Pi is linked as 'Pi · <label>', but the phone connection on this PC isn't running right now. Restart Windows, then try again." |
-| `BUSY` (annotation on connect) | `/tg` confirm while a task is running | Confirm copy appended: `MSG-C4`: "Note: this Pi is in the middle of a task. Its result will arrive on Telegram when it finishes." |
-| `DISCONNECT_PROMPT` | `/tg off` typed while linked | `MSG-C5`: "Unlink this Pi from Telegram? [Unlink] [Cancel]" |
-| `DISCONNECTED` (after unlink) | User chose Unlink | `MSG-C6`: "Unlinked. This window no longer talks to Telegram." |
-| `DISCONNECT_PROMPT` (busy) | `/tg off` while a task is running | Copy appended: `MSG-C7`: "Warning: a task is still running here. Its result will NOT be sent to Telegram anymore. [Unlink anyway] [Cancel]" |
-| (any) | `/tg` in a Pi with setup incomplete | `MSG-C8`: "Your PC isn't linked to Telegram yet. Double-click Setup Pi Telegram on your PC first, then come back here." |
+| `DISCONNECTED` | `/tg` typed, this Pi not linked | `MSG-C1` (implemented; confirmation prompt): "Link this Pi window to Telegram? You'll be able to send it messages from your phone and it will reply there. [Connect] [Cancel]" |
+| `CONNECTED` | User chose Connect and the PC phone connection has a fresh matching heartbeat | `MSG-C2` (implemented): "Linked. Send a message from your phone — this Pi (Pi · <label>) will answer. Type /tg off to unlink." The label is auto-derived: project folder name (§5). |
+| `CONNECTED_LOCAL_ONLY` | User chose Connect but the PC phone connection is missing, stale, shut down, foreign or dead | `MSG-C2B` (implemented): "Linked, but the phone connection on this PC isn't running right now. Restart Windows, then send your message again. This Pi will stay linked." The local link remains active so routing recovers automatically when the PC connection returns. |
+| `CONNECTED` | `/tg` typed while linked and the PC phone connection is live | `MSG-C3` (implemented): "This Pi is linked as 'Pi · <label>' (currently <state>). Type /tg off to unlink." (idempotent status, no re-confirmation) |
+| `CONNECTED_LOCAL_ONLY` | `/tg` typed while linked but the PC phone connection is unavailable | `MSG-C3B` (implemented): "This Pi is linked as 'Pi · <label>', but the phone connection on this PC isn't running right now. Restart Windows, then try again." |
+| `BUSY` (annotation on connect) | `/tg` confirm while a task is running | Confirm copy appended: `MSG-C4` (implemented): "Note: this Pi is in the middle of a task. Its result will arrive on Telegram when it finishes." |
+| `DISCONNECT_PROMPT` | `/tg off` typed while linked | `MSG-C5` (implemented): "Unlink this Pi from Telegram? [Unlink] [Cancel]" |
+| `DISCONNECTED` (after unlink) | User chose Unlink | `MSG-C6` (implemented): "Unlinked. This window no longer talks to Telegram." |
+| `DISCONNECT_PROMPT` (busy) | `/tg off` while a task is running | Copy appended: `MSG-C7` (implemented): "Warning: a task is still running here. Its result will NOT be sent to Telegram anymore. [Unlink anyway] [Cancel]" |
+| (any) | `/tg` in a Pi with setup incomplete | `MSG-C8` (implemented): "Your PC isn't linked to Telegram yet. Double-click Setup Pi Telegram on your PC first, then come back here." |
 
 Hard rules:
 
@@ -94,15 +132,15 @@ Hard rules:
 
 ## 6. Telegram `/start` home
 
-What the user sees when they open the bot chat or send `/start` (also shown automatically the first time after pairing).
+What the user sees when they open the bot chat or send `/start` (also shown automatically the first time after pairing). Status: **all copy in this table is implemented** in `src/beginner-copy.mjs` (§0) except `MSG-T1` (design).
 
 | Situation | Exact copy / behavior |
 |---|---|
-| Setup not finished | `MSG-T1`: "Hi! Your PC needs one more step: double-click Setup Pi Telegram on your PC, then come back here." |
-| Linked, no live Pi | `MSG-T2`: "You're linked, but no Pi window is connected right now. Open Pi on your PC and type /tg." |
-| Exactly one live Pi | `MSG-T3`: "Connected to Pi · <label>. Just type a message and it goes to that Pi." — no buttons needed; the session is auto-selected. |
-| Multiple live Pis | `MSG-T4`: "Which Pi should I talk to?" + one button per live session (`Pi · demo-project`, `Pi · notes-app`, …) + `[Refresh]`. Tapping a button selects that session for plain messages (§7) and re-sends `MSG-T3` naming it. No short ids anywhere. |
-| Selected session disappeared | `MSG-T5`: "Pi · <label> just closed or disconnected. Pick another:" + same buttons as above (or `MSG-T2` if none left). Nothing the user typed is lost silently: a held prompt follows the rules in §7. |
+| Setup not finished | `MSG-T1` (design): "Hi! Your PC needs one more step: double-click Setup Pi Telegram on your PC, then come back here." |
+| Linked, no live Pi | `MSG-T2` (implemented): "You're linked, but no Pi window is connected right now. Open Pi on your PC and type /tg." |
+| Exactly one live Pi | `MSG-T3` (implemented): "Connected to Pi · <label>. Just type a message and it goes to that Pi." — no buttons needed; the session is auto-selected. |
+| Multiple live Pis | `MSG-T4` (implemented): "Which Pi should I talk to?" + one button per live session (`Pi · demo-project`, `Pi · notes-app`, …) + `[Refresh]`. Tapping a button selects that session for plain messages (§7) and re-sends `MSG-T3` naming it. No short ids anywhere. |
+| Selected session disappeared | `MSG-T5` (implemented): "Pi · <label> just closed or disconnected. Pick another:" + same buttons as above (or `MSG-T2` if none left). Nothing the user typed is lost silently: a held prompt follows the rules in §7. |
 
 Auto-selection rule: with exactly one live session, it is selected implicitly and `MSG-T3` says so. With multiple, **nothing is auto-selected** — plain text is held (§7) until the user picks.
 
@@ -115,9 +153,9 @@ An ordinary text message (not starting with `/`) from the authorized user.
 | Situation | Behavior / copy |
 |---|---|
 | One live Pi (auto-selected) | Direct dispatch. No prompt, no buttons. |
-| Multiple live Pis, none selected | **Hold exactly one pending prompt.** Reply `MSG-P1`: "Your message is saved. Choose which Pi should get it:" + session buttons. Tapping a button dispatches the held text **once** to that Pi, then confirms `MSG-P2`: "Sent to Pi · <label>." |
+| Multiple live Pis, none selected | **Hold exactly one pending prompt.** Reply `MSG-P1` (implemented): "Your message is saved. Choose which Pi should get it:" + session buttons. Tapping a button dispatches the held text **once** to that Pi, then confirms `MSG-P2` (implemented): "Sent to Pi · <label>." |
 | Second plain text while one is pending | The new text **replaces** the pending one (the older text is discarded, never dispatched). Re-show `MSG-P1` with the new text waiting. This keeps the invariant "at most one pending prompt, dispatched at most once". |
-| No live Pi | `MSG-P3`: "There's no Pi connected right now. Open Pi on your PC and type /tg — then your messages will reach it. (Nothing was lost — send it again once Pi is linked.)" |
+| No live Pi | `MSG-P3` (design): "There's no Pi connected right now. Open Pi on your PC and type /tg — then your messages will reach it. (Nothing was lost — send it again once Pi is linked.)" A live variant already runs (`plainNoLive` in `src/beginner-copy.mjs`); its wording differs from this target. |
 | Selected Pi is busy | Busy choice card (§8) — the text is held as the pending prompt until the user picks. |
 | Session vanished between hold and choice | Tapping a dead session's button → `MSG-T5` (§6); the pending prompt stays pending for the next choice. |
 
@@ -134,12 +172,12 @@ When the selected Pi is mid-task and the user acts (sends plain text, or taps **
 
 | Button (user-facing, V1 English) | Maps to | Effect copy after tap |
 |---|---|---|
-| `Add my message for after this task` | follow-up (queue for running turn) | `MSG-B1`: "Got it — Pi · <label> will see your message right after the current task." |
-| `Redirect the current task` | steer (inject into running turn) | `MSG-B2`: "Done — Pi · <label> got your message and will adjust what it's doing." |
-| `Stop the task and use my message` | abort, then dispatch held prompt to the idle session | `MSG-B3`: "Stopped. Your message is on its way to Pi · <label>." |
-| `Leave it alone` | no-op (cancel; held prompt discarded if one existed, else nothing) | `MSG-B4`: "Okay — I left Pi · <label> working." |
+| `Add my message for after this task` | follow-up (queue for running turn) | `MSG-B1` (implemented): "Got it — Pi · <label> will see your message right after the current task." |
+| `Redirect the current task` | steer (inject into running turn) | `MSG-B2` (implemented): "Done — Pi · <label> got your message and will adjust what it's doing." |
+| `Stop the task and use my message` | abort, then dispatch held prompt to the idle session | `MSG-B3` (implemented): "Stopped. Your message is on its way to Pi · <label>." |
+| `Leave it alone` | no-op (cancel; held prompt discarded if one existed, else nothing) | `MSG-B4` (design): "Okay — I left Pi · <label> working." (a live near-variant exists: `busyDiscard`, wording differs) |
 
-If there is no held prompt (user tapped busy actions without sending text), the card is: `MSG-B5`: "Pi · <label> is working on a task. What would you like to do?" + the four buttons above (the first three then prompt for text with `MSG-B6`: "Type your message and send it.").
+If there is no held prompt (user tapped busy actions without sending text), the card is: `MSG-B5` (design): "Pi · <label> is working on a task. What would you like to do?" + the four buttons above (the first three then prompt for text with `MSG-B6` (design): "Type your message and send it."). A live variant of the card headline runs (`busyCard` in `src/beginner-copy.mjs`); its wording differs from this target.
 
 Hard rules:
 
@@ -167,8 +205,8 @@ Reply by just typing here · /help for more
 |---|---|
 | *(typing any text)* | "Reply" is implicit: a new plain text follows §7 routing to the same selected Pi. The card footer says so; there is no Reply button to press. |
 | `Change Pi` | Re-sends `MSG-T4` (§6) with the live-session buttons. |
-| `Disconnect` | `MSG-C5` equivalent, remotely: `MSG-O1`: "Unlink Pi · <label>? You can relink it any time from the PC. [Unlink] [Cancel]" |
-| `Stop` | **Not on the final output card** (the task already ended). A `Stop this task` button appears only on interim cards that report a still-running task — e.g. the follow-up confirmation (`MSG-B1`) and steer confirmation (`MSG-B2`) carry `[Stop this task]` mapped to abort, confirming with `MSG-O2`: "Stopped. Pi · <label> is idle now." |
+| `Disconnect` | `MSG-C5` equivalent, remotely: `MSG-O1` (implemented): "Unlink Pi · <label>? You can relink it any time from the PC. [Unlink] [Cancel]" |
+| `Stop` | **Not on the final output card** (the task already ended). A `Stop this task` button appears only on interim cards that report a still-running task — e.g. the follow-up confirmation (`MSG-B1`) and steer confirmation (`MSG-B2`) carry `[Stop this task]` mapped to abort, confirming with `MSG-O2` (implemented): "Stopped. Pi · <label> is idle now." |
 
 Delivery rules unchanged: bounded message size, safe chunking, final text only — no reasoning, no tool transcripts, no token stream.
 
@@ -188,13 +226,15 @@ All beginner buttons are Telegram inline callbacks. Constraints, verifiable per 
 
 ## 11. Errors and the advanced escape hatch
 
-Friendly errors follow the fixed-whitelist pattern: each known failure has one plain-English line plus a next action. Examples:
+Friendly errors follow the fixed-whitelist pattern: each known failure has one plain-English line plus a next action. Status per id: `MSG-E4` implemented (`src/beginner-copy.mjs`); `MSG-E2` and `MSG-E3` design; `MSG-E5` and `MSG-E6` implemented (`scripts/setup.ps1` unsafe-location gate).
 
 | Situation | Copy |
 |---|---|
-| PC unreachable (asleep/offline) | `MSG-E2`: "Pi isn't answering right now — is your PC awake? It can't reply while asleep or offline. Try again in a moment." |
-| Repeated setup failure | `MSG-E3`: "Setup keeps failing. Check your internet connection and try again. If it still fails, the 'Fix problems' section of the guide on your PC has next steps." |
-| Unknown `/`-command typed by a beginner | `MSG-E4`: "I didn't understand that. Send /help to see what I can do." (Lines starting with `/` inside a prompt remain refused, as today.) |
+| PC unreachable (asleep/offline) | `MSG-E2` (design): "Pi isn't answering right now — is your PC awake? It can't reply while asleep or offline. Try again in a moment." |
+| Repeated setup failure | `MSG-E3` (design): "Setup keeps failing. Check your internet connection and try again. If it still fails, the 'Fix problems' section of the guide on your PC has next steps." |
+| Unknown `/`-command typed by a beginner | `MSG-E4` (implemented): "I didn't understand that. Send /help to see what I can do." (Lines starting with `/` inside a prompt remain refused, as today.) |
+| Setup run from inside OneDrive (or any synced folder) | `MSG-E5` (implemented): "This folder is inside OneDrive, so your private link cannot stay only on this PC." + "Move the setup folder to a normal folder on this PC (for example C:\pi-telegram-bridge), then run setup again." Setup refuses before anything is written or asked for: the credential blob must stay on this PC, and a synced folder copies it elsewhere no matter what local permissions say. |
+| Setup run from a protected Windows folder (for example Program Files) | `MSG-E6` (implemented): "This folder is inside a protected Windows folder, so setup cannot keep your private link safe here." + the same next action as `MSG-E5`. Setup refuses before anything is written or asked for. |
 | Text sent to a dead session | `MSG-T5` (§6). |
 
 **Advanced escape hatch.** `/help` always answers with a two-part reply: the three beginner sentences (talk to Pi by typing; type /tg on the PC to link; this chat is private to you), then an advanced block pointing to the full command documentation on the PC (`README.md` — Telegram commands table: `/sessions`, `/use`, `/status`, `/send`, `/steer`, `/followup`, `/abort`, `/disconnect`). All existing slash commands keep working unchanged for users who opt in; they are documented **separately** in the README and are never pushed onto the beginner path. Short ids appear only in that advanced layer.
@@ -225,13 +265,15 @@ Gaps this contract requires implementers to close (all additive, none new-privil
 5. The single-pending-prompt hold-and-choose flow with exactly-once dispatch.
 6. Beginner copy strings centralized (single source, English V1) so the §8/§14 mapping stays verifiable.
 
+Status of these gaps: item 6 is done for the Telegram-side copy (`src/beginner-copy.mjs`, pinned by `tests/beginner-copy.test.mjs`); the setup-side copy (§3) is still per-surface in `scripts/setup.ps1` and `Setup Pi Telegram.cmd`. Items 1–5 and every **design** id in §0 remain open.
+
 Nothing in this contract weakens existing guarantees: no secrets in chat/argv/logs, no shell endpoint, no listener, no auto-connect, final outputs only.
 
 ---
 
 ## 14. Acceptance matrix
 
-Each row: observable state/event → required visible copy/action → the implementation surface that must satisfy it. "Delta" rows do not exist today and must be built; all others bind existing behavior to this copy.
+Each row: observable state/event → required visible copy/action → the implementation surface that must satisfy it. Copy status per id is defined in §0: an **implemented** id's string already runs on the named surface (pinned by tests); a **design** id is the agreed target that must still be built there. "Delta" rows name surfaces that do not exist today and must be built; all other rows bind existing behavior to this copy.
 
 | # | State / event | Copy / action | Implementation surface |
 |---|---|---|---|

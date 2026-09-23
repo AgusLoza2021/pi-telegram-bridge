@@ -111,6 +111,55 @@ if (-not (Test-BridgeNodeVersionGate -VersionOutput $nodeVersionOutput)) {
 
 # --- state root: confined + ACL-locked BEFORE any secret exists --------------
 $stateRoot = Resolve-BridgeStateDirectory -StateDirectory $StateDirectory
+
+# --- unsafe location gate: refuse BEFORE anything is written or captured -----
+# The credential blob lives inside the state root and its only protection is
+# the user-only ACL confinement verified by Lock-BridgeStateRoot below. Under
+# OneDrive (or any sync folder) the ACL lock still verifies, but the file
+# contents are copied off this PC by the sync client, so local-only
+# confinement CANNOT be guaranteed there; under Program Files the folder is
+# machine-administered rather than per-user. Both are refused before the state
+# root is created, locked, or any secret is captured - the same fail-early
+# ordering as the Node.js gate above. The refusal is a hard stop, not a
+# warning: a successful setup that syncs the credential blob off the PC would
+# silently defeat the ACL confinement the whole model rests on.
+$unsafeRootReason = $null
+$stateRootFull = [System.IO.Path]::GetFullPath($stateRoot).TrimEnd('\')
+$oneDriveRoot = $env:OneDrive
+if (-not [string]::IsNullOrWhiteSpace($oneDriveRoot)) {
+    $oneDrivePrefix = [System.IO.Path]::GetFullPath($oneDriveRoot).TrimEnd('\') + '\'
+    if ($stateRootFull.StartsWith($oneDrivePrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+        $unsafeRootReason = 'OneDrive'
+    }
+}
+if ($null -eq $unsafeRootReason) {
+    foreach ($segment in $stateRootFull.Split('\')) {
+        if ($segment -like 'OneDrive*') { $unsafeRootReason = 'OneDrive'; break }
+    }
+}
+if ($null -eq $unsafeRootReason) {
+    foreach ($machineRoot in @($env:ProgramFiles, ${env:ProgramFiles(x86)}, $env:ProgramW6432)) {
+        if ([string]::IsNullOrWhiteSpace($machineRoot)) { continue }
+        $machinePrefix = [System.IO.Path]::GetFullPath($machineRoot).TrimEnd('\') + '\'
+        if ($stateRootFull.StartsWith($machinePrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+            $unsafeRootReason = 'Program Files'
+            break
+        }
+    }
+}
+if ($null -ne $unsafeRootReason) {
+    if ($Beginner) {
+        if ($unsafeRootReason -eq 'OneDrive') {
+            Write-Host 'This folder is inside OneDrive, so your private link cannot stay only on this PC.'
+        } else {
+            Write-Host 'This folder is inside a protected Windows folder, so setup cannot keep your private link safe here.'
+        }
+        Write-Host 'Move the setup folder to a normal folder on this PC (for example C:\pi-telegram-bridge), then run setup again.'
+        exit 1
+    }
+    throw "state root location cannot be kept private on this PC ($unsafeRootReason): $stateRootFull"
+}
+
 New-Item -ItemType Directory -Path $stateRoot -Force | Out-Null
 $capabilitySid = Lock-BridgeStateRoot -Path $stateRoot
 if (-not $Beginner) {
@@ -558,6 +607,20 @@ if ($PrepareOnly) {
 
 Invoke-SelectiveEnrollment
 
+# Pi presence is a WARNING, never a blocker: the broker never spawns Pi and
+# the bridge is fully usable without it, so Pi can legitimately be installed
+# after enrollment. Detected BEFORE the component steps because the extension
+# installer creates the Pi discovery directory (~\.pi\agent) as a side effect,
+# which would make any later existence check meaningless. Pi counts as
+# present when the pi command is on PATH or Pi's agent directory already
+# exists (installed at some point, even if not on this shell's PATH).
+$beginnerPiMissing = $false
+if ($Beginner) {
+    $piCommand = Get-Command pi -ErrorAction SilentlyContinue
+    $piAgentDir = Join-Path ([Environment]::GetFolderPath('UserProfile')) '.pi\agent'
+    $beginnerPiMissing = ($null -eq $piCommand -and -not (Test-Path -LiteralPath $piAgentDir))
+}
+
 # The double-click Beginner path performs the three dedicated component steps
 # only after explicit ENROLL. Child output is confined to the already locked,
 # ignored local state tree; only paths are passed to the child scripts, never
@@ -565,6 +628,10 @@ Invoke-SelectiveEnrollment
 if ($Beginner) {
     Write-Host ''
     Write-Host 'Finishing setup...'
+    if ($beginnerPiMissing) {
+        Write-Host 'Pi is not on this computer yet. Your private link is safe and will wait.'
+        Write-Host 'Install Pi on this PC, then open it and type /tg to connect.'
+    }
     $componentLog = Join-Path $stateRoot 'logs\setup-components.log'
     $componentScripts = @(
         'install-selective-extension.ps1',
