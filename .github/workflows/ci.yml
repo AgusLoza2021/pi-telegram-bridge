@@ -25,22 +25,27 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 15
 
-    # Windows PowerShell 5.1 must be able to autoload Microsoft.PowerShell.Security.
-    # The hosted runner exports a PSModulePath that points at a PowerShell 7
-    # install, so 5.1 discovers a security module it cannot load, and every
-    # Get-Acl call fails with "found in the module ... but the module could not be
-    # loaded". That breaks Test-BridgeStateRootAcl in scripts/common.ps1 and
-    # verifyUserOnlyAclWindows in src/state-acl.mjs, which then report
-    # acl_inheritance_enabled: an unmeasurable probe presented as a security
-    # finding.
+    # Windows PowerShell 5.1 must be able to AUTOLOAD Microsoft.PowerShell.Security.
+    # The hosted runner exports a PSModulePath whose first entry,
+    # %ProgramFiles%\WindowsPowerShell\Modules, carries a copy of that module built
+    # for PowerShell 7. Windows PowerShell 5.1 discovers that copy first, cannot
+    # load it, and reports
     #
-    # Job-level env, not GITHUB_ENV: this value must be in the environment of
-    # every step's whole process tree, including the powershell.exe children the
-    # integration tests spawn. Windows PowerShell 5.1 still appends its own
-    # default module directories, so this only removes the PowerShell 7 path that
-    # breaks the autoload; it does not hide any module the project relies on.
+    #   The 'Get-Acl' command was found in the module 'Microsoft.PowerShell.Security',
+    #   but the module could not be loaded.
+    #
+    # An explicit Import-Module by name still resolves the working copy, which is
+    # why an earlier version of this step looked healthy while every test that
+    # relied on autoload failed.
+    #
+    # Every module this project uses (Security for Get-Acl/Set-Acl and the DPAPI
+    # cmdlets, ScheduledTasks, CimCmdlets, LocalAccounts) ships in the single
+    # directory below, so restricting the path to it removes only the shadowing
+    # PowerShell 7 copy. Job-level env and not GITHUB_ENV: the value has to be in
+    # the environment of every step's whole process tree, including the
+    # powershell.exe children the integration tests spawn.
     env:
-      PSModulePath: 'C:\Program Files\WindowsPowerShell\Modules;C:\Windows\system32\WindowsPowerShell\v1.0\Modules'
+      PSModulePath: 'C:\Windows\system32\WindowsPowerShell\v1.0\Modules'
     steps:
       - name: Check out the repository
         uses: actions/checkout@v7
@@ -54,14 +59,24 @@ jobs:
           package-manager-cache: false
 
       # Replaces the earlier GITHUB_ENV attempt, which the test steps did not
-      # inherit. This proves the value above reaches a grandchild process shaped
-      # exactly like the ones the tests spawn, so a module-path mistake fails here
-      # as one line instead of surfacing as seventeen confusing test failures.
-      - name: Prove Windows PowerShell 5.1 can load its security module
+      # inherit, and the explicit-import check, which passed while autoload kept
+      # failing. This exercises autoload in the same environment the tests
+      # inherit and exits non-zero on failure, so a module-path mistake is one
+      # unambiguous line instead of seventeen confusing test failures.
+      - name: Prove Windows PowerShell 5.1 can autoload its security module
         shell: powershell
         run: |
-          Write-Host "step PSModulePath=$env:PSModulePath"
-          & powershell.exe -NoProfile -NonInteractive -Command '$ErrorActionPreference = "Stop"; Write-Output "child PSModulePath=$env:PSModulePath"; Get-Acl -LiteralPath $env:TEMP | Out-Null; Write-Output "child Get-Acl resolved"'
+          $ErrorActionPreference = 'Stop'
+          Write-Host "PSModulePath=$env:PSModulePath"
+          Get-Module -ListAvailable Microsoft.PowerShell.Security |
+            Format-List Name, Version, ModuleBase
+          try {
+            Get-Acl -LiteralPath $env:TEMP | Out-Null
+            Write-Host 'Get-Acl autoloaded'
+          } catch {
+            Write-Host "Get-Acl autoload FAILED: $($_.Exception.Message)"
+            exit 1
+          }
 
       # The exact command CONTRIBUTING.md documents: the single pinned production
       # dependency, no package lifecycle scripts, no audit, no fund.
