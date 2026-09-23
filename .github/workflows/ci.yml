@@ -24,6 +24,23 @@ jobs:
     name: Windows / Node 24
     runs-on: windows-latest
     timeout-minutes: 15
+
+    # Windows PowerShell 5.1 must be able to autoload Microsoft.PowerShell.Security.
+    # The hosted runner exports a PSModulePath that points at a PowerShell 7
+    # install, so 5.1 discovers a security module it cannot load, and every
+    # Get-Acl call fails with "found in the module ... but the module could not be
+    # loaded". That breaks Test-BridgeStateRootAcl in scripts/common.ps1 and
+    # verifyUserOnlyAclWindows in src/state-acl.mjs, which then report
+    # acl_inheritance_enabled: an unmeasurable probe presented as a security
+    # finding.
+    #
+    # Job-level env, not GITHUB_ENV: this value must be in the environment of
+    # every step's whole process tree, including the powershell.exe children the
+    # integration tests spawn. Windows PowerShell 5.1 still appends its own
+    # default module directories, so this only removes the PowerShell 7 path that
+    # breaks the autoload; it does not hide any module the project relies on.
+    env:
+      PSModulePath: 'C:\Program Files\WindowsPowerShell\Modules;C:\Windows\system32\WindowsPowerShell\v1.0\Modules'
     steps:
       - name: Check out the repository
         uses: actions/checkout@v7
@@ -36,25 +53,15 @@ jobs:
           node-version: "24"
           package-manager-cache: false
 
-      # The hosted runner exports a PSModulePath that points at a PowerShell 7
-      # install, so Windows PowerShell 5.1 cannot autoload Get-Acl, Set-Acl and
-      # the rest of the modules it ships with. Without this the real-ACL and
-      # DPAPI integration tests fail with a module-not-found error inside
-      # Test-BridgeStateRootAcl, which surfaces as a state-ACL refusal and is
-      # easily mistaken for a security finding. The step then proves the fix on
-      # itself, so a wrong diagnosis fails here instead of 15 tests later.
-      - name: Restore the Windows PowerShell 5.1 module path
+      # Replaces the earlier GITHUB_ENV attempt, which the test steps did not
+      # inherit. This proves the value above reaches a grandchild process shaped
+      # exactly like the ones the tests spawn, so a module-path mistake fails here
+      # as one line instead of surfacing as seventeen confusing test failures.
+      - name: Prove Windows PowerShell 5.1 can load its security module
         shell: powershell
         run: |
-          $modulePath = "$env:ProgramFiles\WindowsPowerShell\Modules;$env:SystemRoot\system32\WindowsPowerShell\v1.0\Modules"
-          # -Encoding ascii is deliberate: Out-File -Encoding utf8 in Windows
-          # PowerShell 5.1 writes a BOM, and a BOM in GITHUB_ENV corrupts the
-          # variable name for every later step.
-          Add-Content -LiteralPath $env:GITHUB_ENV -Value "PSModulePath=$modulePath" -Encoding ascii
-          $env:PSModulePath = $modulePath
-          Import-Module Microsoft.PowerShell.Security -ErrorAction Stop
-          Get-Acl -LiteralPath $env:GITHUB_WORKSPACE | Out-Null
-          Write-Host "Get-Acl resolves once the Windows PowerShell 5.1 module path is restored"
+          Write-Host "step PSModulePath=$env:PSModulePath"
+          & powershell.exe -NoProfile -NonInteractive -Command '$ErrorActionPreference = "Stop"; Write-Output "child PSModulePath=$env:PSModulePath"; Get-Acl -LiteralPath $env:TEMP | Out-Null; Write-Output "child Get-Acl resolved"'
 
       # The exact command CONTRIBUTING.md documents: the single pinned production
       # dependency, no package lifecycle scripts, no audit, no fund.
