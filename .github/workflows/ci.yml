@@ -21,31 +21,29 @@ jobs:
     # The published supported environment is Windows 11 with Windows PowerShell 5.1
     # and Node.js 24 or newer. A Linux or macOS job would claim support the project
     # does not have, and SECURITY.md would contradict it.
-    name: Windows / Node 24
-    runs-on: windows-latest
-    timeout-minutes: 15
-
-    # Windows PowerShell 5.1 must be able to AUTOLOAD Microsoft.PowerShell.Security.
-    # The hosted runner exports a PSModulePath whose first entry,
-    # %ProgramFiles%\WindowsPowerShell\Modules, carries a copy of that module built
-    # for PowerShell 7. Windows PowerShell 5.1 discovers that copy first, cannot
-    # load it, and reports
+    # Windows PowerShell 5.1 must be able to AUTOLOAD Microsoft.PowerShell.Security,
+    # because the integration tests drive real ACLs and DPAPI through
+    # Get-Acl/Set-Acl in powershell.exe children.
+    #
+    # The default shell for a run: step on this image is pwsh (PowerShell 7), and
+    # its PSModulePath carries the PowerShell 7 module directories. The
+    # powershell.exe children the tests spawn inherit that path, find the
+    # PowerShell 7 copy of Microsoft.PowerShell.Security first, cannot load it and
+    # report
     #
     #   The 'Get-Acl' command was found in the module 'Microsoft.PowerShell.Security',
     #   but the module could not be loaded.
     #
-    # An explicit Import-Module by name still resolves the working copy, which is
-    # why an earlier version of this step looked healthy while every test that
-    # relied on autoload failed.
+    # src/state-acl.mjs turns that into acl_inheritance_enabled, so it looked like
+    # seventeen ACL and DPAPI test failures rather than a shell choice.
     #
-    # Every module this project uses (Security for Get-Acl/Set-Acl and the DPAPI
-    # cmdlets, ScheduledTasks, CimCmdlets, LocalAccounts) ships in the single
-    # directory below, so restricting the path to it removes only the shadowing
-    # PowerShell 7 copy. Job-level env and not GITHUB_ENV: the value has to be in
-    # the environment of every step's whole process tree, including the
-    # powershell.exe children the integration tests spawn.
-    env:
-      PSModulePath: 'C:\Windows\system32\WindowsPowerShell\v1.0\Modules'
+    # Overriding PSModulePath does not work: both PowerShell versions rebuild it
+    # from the machine and user values, so neither a job-level env: nor GITHUB_ENV
+    # reaches the children. The fix is to run the suite in the shell the project
+    # supports, which is why the steps below declare shell: powershell.
+    name: Windows / Node 24
+    runs-on: windows-latest
+    timeout-minutes: 15
     steps:
       - name: Check out the repository
         uses: actions/checkout@v7
@@ -58,39 +56,33 @@ jobs:
           node-version: "24"
           package-manager-cache: false
 
-      # The previous probe settled that a PowerShell-spawned child with the exact
-      # test flags works: same PSModulePath, FullLanguage, Unrestricted, module
-      # 3.0.0.0 discovered, Get-Acl OK. One difference from the failing tests
-      # remained unexplored: they spawn from Node with windowsHide, which creates
-      # the child without a console. This runs the identical probe both ways and
-      # also tries an explicit Import-Module, which is the candidate fix.
-      - name: Diagnose the PowerShell the node children actually get
-        shell: bash
+      # Evidence for the shell choice below. The default shell for a run: step is
+      # pwsh, whose module path carries the PowerShell 7 directories that the
+      # tests' powershell.exe children then inherit.
+      - name: Report the module path the default shell exports
+        shell: pwsh
+        run: Write-Host "pwsh PSModulePath=$env:PSModulePath"
+
+      # Guards the choice: if the image ever stops shipping a Windows PowerShell
+      # 5.1 that can autoload Get-Acl, this fails as one line instead of surfacing
+      # as seventeen ACL and DPAPI test failures.
+      - name: Prove Windows PowerShell 5.1 autoloads Get-Acl
+        shell: powershell
         run: |
-          cat > "$RUNNER_TEMP/ps-child-probe.mjs" <<'EOF'
-          import { spawnSync } from 'node:child_process';
-          const probe = [
-            'Write-Output "    PSModulePath: $env:PSModulePath"',
-            'Write-Output "    LanguageMode: $($ExecutionContext.SessionState.LanguageMode)"',
-            'Get-Module -ListAvailable Microsoft.PowerShell.Security | ForEach-Object { Write-Output "    discovered: $($_.Version) $($_.ModuleBase)" }',
-            'try { Get-Acl -LiteralPath $env:TEMP | Out-Null; Write-Output "    Get-Acl: OK" } catch { Write-Output "    Get-Acl: FAILED $($_.Exception.Message)" }',
-            'try { Import-Module Microsoft.PowerShell.Security -ErrorAction Stop; Write-Output "    Import-Module: OK" } catch { Write-Output "    Import-Module: FAILED $($_.Exception.Message)" }',
-          ].join('; ');
-          for (const windowsHide of [false, true]) {
-            const r = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', probe], { encoding: 'utf8', windowsHide });
-            console.log(`NODE CHILD windowsHide=${windowsHide} status=${r.status}`);
-            console.log(r.stdout);
-            console.log(r.stderr);
-          }
-          EOF
-          node "$RUNNER_TEMP/ps-child-probe.mjs"
+          Write-Host "5.1 PSModulePath=$env:PSModulePath"
+          try { Get-Acl -LiteralPath $env:TEMP | Out-Null; Write-Host 'Get-Acl autoloaded' }
+          catch { Write-Host "Get-Acl autoload FAILED: $($_.Exception.Message)"; exit 1 }
 
       # The exact command CONTRIBUTING.md documents: the single pinned production
       # dependency, no package lifecycle scripts, no audit, no fund.
       - name: Install the pinned dependency
         run: npm ci --ignore-scripts --omit=dev --no-audit --no-fund
 
+      # shell: powershell is load-bearing, not cosmetic: it is what puts the
+      # Windows PowerShell 5.1 module path into the environment of the
+      # powershell.exe children the integration tests spawn. See the job comment.
       - name: Run the node test suite
+        shell: powershell
         run: npm test
 
       # scripts/test.ps1 is the documented single validation entry point. It re-runs
