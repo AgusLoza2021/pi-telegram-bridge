@@ -42,6 +42,30 @@ function New-BrokerServiceTaskSettings {
 
 <#
 .SYNOPSIS
+Builds the logon trigger with a five-minute repetition interval. The
+repetition is the SELF-HEAL path: RestartOnFailure (kept as a second line
+of defence) is not trusted, because it failed to relaunch the broker on
+the real machine after a STATUS_CONTROL_C_EXIT death. Task Scheduler
+re-fires a repeated logon trigger every 5 minutes regardless of how the
+previous run ended, and MultipleInstances=IgnoreNew (asserted below)
+makes each repetition a no-op while the broker is healthy and a relaunch
+when it is dead.
+PowerShell 5.1 cannot set a repetition directly on a logon trigger
+(mutating its CIM Repetition object throws), so the repetition object is
+built on a throwaway -Once trigger and copied over. No repetition
+duration is set, so the repetition never expires.
+#>
+function New-BrokerServiceTaskTrigger {
+    param([Parameter(Mandatory = $true)][string]$UserIdentity)
+    $logonTrigger = New-ScheduledTaskTrigger -AtLogOn -User $UserIdentity
+    $repetitionSource = New-ScheduledTaskTrigger -Once -At (Get-Date) `
+        -RepetitionInterval (New-TimeSpan -Minutes 5)
+    $logonTrigger.Repetition = $repetitionSource.Repetition
+    return $logonTrigger
+}
+
+<#
+.SYNOPSIS
 Fail-closed readback of the registered XML. Construction success is not
 enough: Task Scheduler must persist the settings that keep one broker alive.
 #>
@@ -58,7 +82,10 @@ function Assert-BrokerServiceTaskXml {
         '<MultipleInstancesPolicy>\s*IgnoreNew\s*</MultipleInstancesPolicy>',
         '<StartWhenAvailable>\s*true\s*</StartWhenAvailable>',
         '<RestartOnFailure>[\s\S]*?<Interval>\s*PT1M\s*</Interval>',
-        '<RestartOnFailure>[\s\S]*?<Count>\s*3\s*</Count>'
+        '<RestartOnFailure>[\s\S]*?<Count>\s*3\s*</Count>',
+        # The repetition must be INSIDE the logon trigger: a repetition
+        # anywhere else in the document does not re-fire the logon start.
+        '<LogonTrigger>(?:(?!</LogonTrigger>)[\s\S])*?<Repetition>(?:(?!</Repetition>)[\s\S])*?<Interval>\s*PT5M\s*</Interval>'
     )
     foreach ($pattern in $required) {
         if ($TaskXml -notmatch $pattern) {

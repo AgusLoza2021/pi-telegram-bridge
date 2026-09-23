@@ -74,6 +74,12 @@ describe('broker service task settings', () => {
   });
 
   test('registered XML verifier accepts the safe shape and rejects idle-stop regression', { skip: !IS_WIN }, () => {
+    // The accept fixture carries the REAL persisted logon-trigger repetition
+    // fragment from the PiTelegramBridgeRepetitionProbe probe (Task Scheduler
+    // persisted Interval PT5M with NO Duration element inside <LogonTrigger>).
+    const logonTriggerWithRepetition = '<Triggers><LogonTrigger>'
+      + '<Repetition><Interval>PT5M</Interval><StopAtDurationEnd>true</StopAtDurationEnd></Repetition>'
+      + '</LogonTrigger></Triggers>';
     const good = '<Task><Settings>'
       + '<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>'
       + '<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>'
@@ -82,7 +88,9 @@ describe('broker service task settings', () => {
       + '<IdleSettings><StopOnIdleEnd>false</StopOnIdleEnd></IdleSettings>'
       + '<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>'
       + '<RestartOnFailure><Interval>PT1M</Interval><Count>3</Count></RestartOnFailure>'
-      + '</Settings></Task>';
+      + '</Settings>'
+      + logonTriggerWithRepetition
+      + '</Task>';
     const command = [
       `. ${quotePs(COMMON)}`,
       `$good = ${quotePs(good)}`,
@@ -96,11 +104,62 @@ describe('broker service task settings', () => {
     assert.equal(ps(command), 'OK');
   });
 
+  test('registered XML verifier rejects a logon trigger without the five-minute repetition', { skip: !IS_WIN }, () => {
+    const good = '<Task><Settings>'
+      + '<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>'
+      + '<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>'
+      + '<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>'
+      + '<StartWhenAvailable>true</StartWhenAvailable>'
+      + '<IdleSettings><StopOnIdleEnd>false</StopOnIdleEnd></IdleSettings>'
+      + '<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>'
+      + '<RestartOnFailure><Interval>PT1M</Interval><Count>3</Count></RestartOnFailure>'
+      + '</Settings>'
+      + '<Triggers><LogonTrigger></LogonTrigger></Triggers>'
+      + '</Task>';
+    const command = [
+      `. ${quotePs(COMMON)}`,
+      `$good = ${quotePs(good)}`,
+      '$rejected = $false',
+      'try { Assert-BrokerServiceTaskXml -TaskXml $good | Out-Null } catch { $rejected = $true }',
+      'if (-not $rejected) { throw "missing logon-trigger repetition was accepted" }',
+      'Write-Output "OK"',
+    ].join('; ');
+    assert.equal(ps(command), 'OK');
+  });
+
+  test('registered XML verifier anchors the repetition inside the logon trigger, not anywhere in the document', { skip: !IS_WIN }, () => {
+    // A repetition OUTSIDE the logon trigger must not satisfy the check:
+    // only a repetition inside <LogonTrigger> re-fires the logon start.
+    const misplaced = '<Task><Settings>'
+      + '<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>'
+      + '<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>'
+      + '<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>'
+      + '<StartWhenAvailable>true</StartWhenAvailable>'
+      + '<IdleSettings><StopOnIdleEnd>false</StopOnIdleEnd></IdleSettings>'
+      + '<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>'
+      + '<RestartOnFailure><Interval>PT1M</Interval><Count>3</Count></RestartOnFailure>'
+      + '</Settings>'
+      + '<Repetition><Interval>PT5M</Interval><StopAtDurationEnd>true</StopAtDurationEnd></Repetition>'
+      + '<Triggers><LogonTrigger></LogonTrigger></Triggers>'
+      + '</Task>';
+    const command = [
+      `. ${quotePs(COMMON)}`,
+      `$misplaced = ${quotePs(misplaced)}`,
+      '$rejected = $false',
+      'try { Assert-BrokerServiceTaskXml -TaskXml $misplaced | Out-Null } catch { $rejected = $true }',
+      'if (-not $rejected) { throw "repetition outside the logon trigger was accepted" }',
+      'Write-Output "OK"',
+    ].join('; ');
+    assert.equal(ps(command), 'OK');
+  });
+
   test('installer reads back and verifies the task after registration', () => {
     const register = INSTALLER_SOURCE.indexOf('Register-ScheduledTask');
     const exportTask = INSTALLER_SOURCE.indexOf('Export-ScheduledTask', register);
     const assertTask = INSTALLER_SOURCE.indexOf('Assert-BrokerServiceTaskXml', exportTask);
     assert.match(INSTALLER_SOURCE, /\$settings = New-BrokerServiceTaskSettings/);
+    assert.match(INSTALLER_SOURCE, /\$trigger = New-BrokerServiceTaskTrigger -UserIdentity \$identityName/,
+      'the installer must build its trigger through the single-source helper');
     assert.ok(register >= 0 && exportTask > register && assertTask > exportTask,
       'registration must be followed by XML readback and fail-closed verification');
   });

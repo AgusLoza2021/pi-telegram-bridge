@@ -55,7 +55,7 @@ if ($null -ne $backupPath) {
 }
 
 $identityName = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
-$trigger = New-ScheduledTaskTrigger -AtLogOn -User $identityName
+$trigger = New-BrokerServiceTaskTrigger -UserIdentity $identityName
 $principal = New-ScheduledTaskPrincipal -UserId $identityName `
     -LogonType Interactive -RunLevel Limited
 $settings = New-BrokerServiceTaskSettings
