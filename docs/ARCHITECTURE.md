@@ -117,7 +117,7 @@ The broker exposes nonsecret health through `broker-meta.json`: instance identit
 | TUI client | `src/tui-bridge-client.mjs` | Credential-free Pi-side transport client, heartbeats, command claims, and bounded event writes. |
 | Pi extension | `extension/selective-tui-extension.ts` | Local opt-in commands, official Pi API dispatch, state reporting, and finalized-text forwarding. |
 | Extension installer | `scripts/install-selective-extension.ps1` and common helpers | Fixed-payload staging, hash verification, reparse protection, dated backup, and reversible installation. |
-| Broker task lifecycle | `scripts/*-broker-service.ps1` and common helpers | Current-user scheduled task registration, persisted safety settings, status, start, graceful stop, backup, and uninstall. |
+| Broker task lifecycle | `scripts/telegram.ps1` (the on/off/status switch) plus `scripts/*-broker-service.ps1` and common helpers | Current-user scheduled task registration (disabled by default), the on/off enable bit, persisted safety settings, status, start, graceful stop, backup, and uninstall. |
 | Legacy runtime | `src/runtime-host.mjs`, `src/runtime-worker.mjs`, `src/telegram-worker.mjs` | Explicit fallback host/worker workflow; not used by the default selective broker. |
 
 ## Installed extension payload
@@ -135,6 +135,7 @@ A generated `index.ts` binds that installation to the selected local state direc
 
 `PiTelegramBridgeBroker` runs as the current interactive user with limited privileges. The registered settings are verified after installation:
 
+- registered disabled: the on/off switch owns the enable bit, so a sign-in starts nothing until the owner turns the connection on;
 - logon trigger for the current user;
 - no stop-on-idle or battery termination;
 - unlimited execution duration;

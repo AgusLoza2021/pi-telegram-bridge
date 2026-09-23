@@ -76,7 +76,7 @@ You will create your own private bot in Telegram. This takes about 2 minutes.
 4. When it asks, **paste the bot token from Step 2**. The window hides what you paste. The token stays on your PC: it is stored in encrypted form (protected for your Windows account) and is never typed, sent, or shown anywhere else — not on your phone, not in any chat, not in any log.
 5. The window shows a **QR code**. Open the camera app on your phone and point it at the code. Telegram opens your bot; tap **Start**. The code contains only the bot's name and a one-use pairing code — never the token.
 6. The window waits up to a minute for your phone. When your phone is recognized, it asks you to type **ENROLL** to confirm. Nothing is saved until you do.
-7. After you confirm, the window installs a small helper inside Pi (it stays inactive until *you* link a Pi window in Step 4), sets up a background connection that starts automatically each time you sign in to Windows, and starts it.
+7. After you confirm, the window installs a small helper inside Pi (it stays inactive until *you* link a Pi window in Step 4), sets up the background connection, and starts it for you. From then on it is yours to control: the `telegram` file in your setup folder turns the connection on (`telegram on`), off (`telegram off`), or shows how it is doing (`telegram status`). Once you turn it off it stays off, even after you restart Windows.
 
 If anything fails along the way, your previous settings are kept safe and nothing half-finished is saved. See [Fix problems](#fix-problems).
 
@@ -133,9 +133,9 @@ Find your symptom, then follow the matching action. A failed setup never replace
 | The QR code expired or will not scan | Close setup and run `Setup Pi Telegram.cmd` again for a fresh code. Raise the screen brightness and move the phone closer. |
 | The QR link opens a web page | Open Telegram directly, search for your bot username, tap **Start**, then run setup again. |
 | `/tg` does not exist in Pi | Type `/reload`, or restart Pi if it was already open during setup. |
-| `/tg` says the phone connection is unavailable | Keep the Pi linked and restart Windows so the background connection starts again at sign-in. Then send your message again. |
+| `/tg` says the phone connection is unavailable | The background connection is off. Open a Command Prompt in your setup folder, run `telegram on`, then send your message again. |
 | The bot says no Pi is connected | Open Pi on the PC, type `/tg`, and choose **Connect**. |
-| The bot does not answer | Make sure the PC is awake and online. If needed, restart Windows so the background connection starts at sign-in. |
+| The bot does not answer | Make sure the PC is awake and online, then check the background connection: run `telegram status` in your setup folder, and `telegram on` if it is off. |
 | Several Pi windows are linked | Tap **Change Pi** and choose the readable project label you want. |
 | You want to remove the bridge | Follow [Uninstall and rollback](docs/ADVANCED.md#uninstall-and-rollback). State and backups are preserved unless you remove them yourself. |
 
@@ -150,7 +150,7 @@ For service status, repair, manual setup, and the full command reference, see th
 | **`/tg`** | The command you type inside a Pi window to link (or unlink, with `/tg off`) that window to your phone. |
 | **Pi window** | One running copy of Pi in a terminal. You can have several; each one is linked separately. |
 | **Session / workspace** | A session is one live Pi window the bridge knows about; the workspace is the project folder that window is working in. Its folder name becomes the readable label you see on your phone, like `Pi · my-project`. |
-| **The background connection** | A small program that runs quietly on your PC and shuttles messages between Telegram and Pi, so Pi can answer even when that Pi window is doing something else. It starts each time you sign in to Windows (it is registered as a Windows scheduled task, and it talks to Telegram by long polling). |
+| **The background connection** | A small program that runs quietly on your PC and shuttles messages between Telegram and Pi, so Pi can answer even when that Pi window is doing something else. It is registered as a Windows scheduled task, but it starts nothing until you turn it on with `telegram on`, and it stays off after a restart once you turned it off. It talks to Telegram by long polling. |
 
 ## Is it safe?
 
