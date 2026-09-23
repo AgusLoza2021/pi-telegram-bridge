@@ -14,6 +14,7 @@
 
 import { test, describe, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
+import { getEventListeners } from 'node:events';
 import { mkdtempSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -335,6 +336,76 @@ describe('telegram-api: abort, timeout and bounded responses', () => {
       return true;
     });
     assert.equal(attempts, 1, 'unbounded bodies must not be retried');
+    await api.close();
+  });
+
+  test('outbound requests forbid redirects: init.redirect is error', async () => {
+    // A real redirect follow can only be prevented by the fetch option
+    // itself: the fake never follows, so the captured init is the only
+    // observable contract surface here.
+    const { calls, fetchImpl } = makeFakeFetch({
+      getMe: jsonResponse({ ok: true, result: { id: 42, is_bot: true } }),
+    });
+    const api = makeApi(fetchImpl);
+    await api.getMe();
+    assert.equal(calls[0].init.redirect, 'error');
+    await api.close();
+  });
+
+  test('retry sleeps with the default backoff leave zero abort listeners on an external signal', async () => {
+    // A 502 on every attempt forces the retry path. The default sleep (not
+    // the injected instant one) is what registers an abort listener per
+    // retry; a long-lived external signal must not accumulate them.
+    const { fetchImpl } = makeFakeFetch({
+      getMe: () => jsonResponse({ ok: false, error_code: 502, description: 'Bad Gateway' }, 502),
+    });
+    const api = new TelegramApi({
+      botToken: TOKEN,
+      fetchImpl,
+      maxRetries: 3,
+      baseDelayMs: 5,
+      maxDelayMs: 5,
+      jitterRatio: 0,
+    });
+    const controller = new AbortController();
+    await assert.rejects(
+      () => api.getMe({ signal: controller.signal }),
+      (error) => error.code === 'server',
+    );
+    assert.equal(
+      getEventListeners(controller.signal, 'abort').length,
+      0,
+      'retry sleeps must detach their abort listener once settled',
+    );
+    await api.close();
+  });
+
+  test('abort during a default-backoff retry sleep still rejects with aborted', async () => {
+    let attempts = 0;
+    const fetchImpl = async (url, init) => {
+      attempts += 1;
+      if (attempts === 1) {
+        return jsonResponse({ ok: false, error_code: 502, description: 'Bad Gateway' }, 502);
+      }
+      return new Promise((resolve, reject) => {
+        init.signal.addEventListener('abort', () => {
+          const error = new Error('AbortError');
+          error.name = 'AbortError';
+          reject(error);
+        });
+      });
+    };
+    const api = new TelegramApi({
+      botToken: TOKEN,
+      fetchImpl,
+      maxRetries: 3,
+      baseDelayMs: 1000,
+      jitterRatio: 0,
+    });
+    const controller = new AbortController();
+    const pending = api.getMe({ signal: controller.signal });
+    setTimeout(() => controller.abort(), 20);
+    await assert.rejects(() => pending, (error) => error.code === 'aborted');
     await api.close();
   });
 

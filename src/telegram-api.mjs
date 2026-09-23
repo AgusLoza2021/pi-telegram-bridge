@@ -39,12 +39,17 @@ export class TelegramApiError extends Error {
 }
 
 const defaultSleep = (ms, signal) => new Promise((resolve, reject) => {
-  const timer = setTimeout(resolve, ms);
+  const onAbort = () => {
+    clearTimeout(timer);
+    reject(new TelegramApiError({ code: 'aborted' }));
+  };
+  const timer = setTimeout(() => {
+    // Detach on normal completion too: retry sleeps run on a long-lived
+    // external signal, and a leaked listener per retry grows unbounded.
+    if (signal) signal.removeEventListener('abort', onAbort);
+    resolve();
+  }, ms);
   if (signal) {
-    const onAbort = () => {
-      clearTimeout(timer);
-      reject(new TelegramApiError({ code: 'aborted' }));
-    };
     if (signal.aborted) onAbort();
     else signal.addEventListener('abort', onAbort, { once: true });
   }
@@ -156,6 +161,10 @@ export class TelegramApi {
           headers: { 'content-type': 'application/json' },
           body: JSON.stringify(payload),
           signal: controller.signal,
+          // The URL carries the bot token and api.telegram.org never
+          // legitimately redirects: refuse to follow a 3xx from an
+          // intermediary instead of replaying the request to it.
+          redirect: 'error',
         });
       } catch (error) {
         if (signal?.aborted || this.#closed) throw new TelegramApiError({ code: 'aborted' });
