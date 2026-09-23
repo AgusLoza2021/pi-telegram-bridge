@@ -67,6 +67,12 @@ export class TelegramWorker {
   #now;
   #logger;
   #limiter;
+  /**
+   * Memory-only outbound throttle state: while non-zero, the current
+   * throttle episode already logged its record and retries wait until this
+   * timestamp instead of re-attempting (and re-logging) the limiter.
+   */
+  #outboundRetryNotBefore = 0;
   #started = false;
 
   /**
@@ -846,9 +852,33 @@ export class TelegramWorker {
 
   // --- outbound sending -------------------------------------------------------
 
+  /**
+   * One outbound limiter take with edge-triggered throttle recording: a
+   * consecutive run of denials is ONE episode and is logged exactly once,
+   * carrying the retryAfterMs the limiter reported. While that wait is
+   * still pending the limiter is not re-attempted (and not re-logged);
+   * the episode ends only when a take is allowed again, so a later denial
+   * after a recovery is a new episode and stays fully visible.
+   */
+  #takeOutbound() {
+    const now = this.#now();
+    if (now < this.#outboundRetryNotBefore) {
+      return { allowed: false, retryAfterMs: this.#outboundRetryNotBefore - now };
+    }
+    const take = this.#limiter.take('outbound', now);
+    if (take.allowed) {
+      this.#outboundRetryNotBefore = 0;
+      return take;
+    }
+    if (this.#outboundRetryNotBefore === 0) {
+      this.#log('rate_limited_outbound', { retryAfterMs: take.retryAfterMs });
+    }
+    this.#outboundRetryNotBefore = now + Math.max(0, take.retryAfterMs);
+    return take;
+  }
+
   async #sendText(row) {
-    if (!this.#limiter.take('outbound', this.#now()).allowed) {
-      this.#log('rate_limited_outbound');
+    if (!this.#takeOutbound().allowed) {
       return; // stays pending; next cycle retries
     }
     try {
@@ -905,9 +935,8 @@ export class TelegramWorker {
       this.#log('keyboard_max_attempts');
       return;
     }
-    if (!this.#limiter.take('outbound', this.#now()).allowed) {
-      this.#log('rate_limited_outbound');
-      return;
+    if (!this.#takeOutbound().allowed) {
+      return; // stays pending; next cycle retries
     }
     try {
       await this.#api.sendMessage({
@@ -961,7 +990,7 @@ export class TelegramWorker {
 
   // --- misc ---------------------------------------------------------------
 
-  #log(code) {
-    this.#logger({ code, workerId: this.#ownerId });
+  #log(code, detail = null) {
+    this.#logger({ code, workerId: this.#ownerId, ...(isPlainObject(detail) ? detail : {}) });
   }
 }

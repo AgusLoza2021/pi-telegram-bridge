@@ -2113,3 +2113,174 @@ describe('broker runtime config: selective shape, legacy compatibility, fail clo
     );
   });
 });
+
+describe('SelectiveTelegramBroker: one honest outbound throttle record per episode', () => {
+  // A saturated limiter makes every denial deterministic without network:
+  // the single outbound token is consumed by one successful send and every
+  // later take inside the 60s window is denied with retryAfterMs = 60000.
+  const THROTTLED_CONFIG = Object.freeze({
+    telegram: { allowedUserId: 101, allowedChatId: 202 },
+    bridge: { maxMessageChars: 3800, rateLimit: { max: 1, windowMs: 60_000 } },
+  });
+
+  function makeFixture() {
+    const dir = mkdtempSync(join(TEST_RUNS, 'sel-throttle-'));
+    let t = 1_700_000_000_000;
+    const now = () => t;
+    const store = new Store(join(dir, 'bridge.sqlite'), { now, isProcessAlive: () => true });
+    const clientA = new TuiBridgeClient(store, { staleAfterMs: 30_000 });
+    return {
+      store,
+      clientA,
+      now,
+      advance(ms) { t += ms; },
+      connectA() {
+        assert.equal(clientA.connect({ ...A, shortId: 'aaa111', label: 'alpha', pid: 1111, cwd: 'C:/proj/alpha' }).ok, true);
+      },
+      close() { store.close(); },
+    };
+  }
+
+  function newBroker(fx, api, config = THROTTLED_CONFIG) {
+    const logs = [];
+    const broker = new SelectiveTelegramBroker({
+      store: fx.store,
+      api,
+      config,
+      now: fx.now,
+      logger: (event) => logs.push(event),
+    });
+    return { broker, logs };
+  }
+
+  const throttleRecords = (logs) => logs.filter((e) => e.code === 'rate_limited_outbound');
+  const pendingEvents = (fx) => fx.store.listPendingBrokerTuiEvents({ limit: 10 });
+
+  /** Drop transport leftovers (connectA appends a connected event) so every
+   *  test starts from a quiet store. */
+  function clearTransport(fx) {
+    const pending = pendingEvents(fx);
+    if (pending.length > 0) {
+      fx.store.acknowledgeTuiEvents({ eventIds: pending.map((e) => e.eventId) });
+    }
+    while (fx.store.claimNextTuiCommand({ trackingId: A.trackingId, connectionId: A.connectionId }).ok) {}
+  }
+
+  test('a single outbound denial on the drain path records exactly one throttle record', async () => {
+    const fx = makeFixture();
+    try {
+      fx.connectA();
+      clearTransport(fx);
+      const api = makeFakeApi();
+      const { broker, logs } = newBroker(fx, api);
+      // The first event consumes the only outbound token and sends fine.
+      assert.equal(fx.clientA.publishFinalOutput({ ...A, text: 'FIRST' }).ok, true);
+      await broker.drainTuiEvents();
+      assert.equal(api.sent.length, 1);
+      assert.equal(throttleRecords(logs).length, 0);
+      // The second event is denied: exactly ONE record, with the wait the
+      // limiter asked for — never one record per log site.
+      assert.equal(fx.clientA.publishFinalOutput({ ...A, text: 'SECOND' }).ok, true);
+      await broker.drainTuiEvents();
+      const records = throttleRecords(logs);
+      assert.equal(records.length, 1,
+        `a single denial must produce exactly one record, saw ${records.length}`);
+      assert.equal(records[0].retryAfterMs, 60_000,
+        'the record must state how long the limiter asked the broker to wait');
+      assert.equal(pendingEvents(fx).length, 1, 'the denied event stays pending');
+      assert.equal(api.sent.length, 1, 'a denied send transports nothing');
+    } finally { fx.close(); }
+  });
+
+  test('a persistent throttle across poll cycles records once for the whole episode', async () => {
+    const fx = makeFixture();
+    try {
+      fx.connectA();
+      clearTransport(fx);
+      const api = makeFakeApi();
+      const { broker, logs } = newBroker(fx, api);
+      assert.equal(fx.clientA.publishFinalOutput({ ...A, text: 'FIRST' }).ok, true);
+      await broker.drainTuiEvents(); // consumes the token
+      assert.equal(fx.clientA.publishFinalOutput({ ...A, text: 'SECOND' }).ok, true);
+      await broker.drainTuiEvents(); // denied once: the episode record
+      assert.equal(throttleRecords(logs).length, 1);
+      for (let cycle = 0; cycle < 5; cycle++) {
+        fx.advance(1_000); // one poll-gap step, still inside the throttle window
+        await broker.drainTuiEvents();
+      }
+      assert.equal(throttleRecords(logs).length, 1,
+        `a persistent throttle must stay one record per episode, saw ${throttleRecords(logs).length}`);
+      assert.equal(api.sent.length, 1, 'the broker does not re-attempt the send while still throttled');
+      assert.equal(pendingEvents(fx).length, 1, 'the event keeps waiting, it is never dropped');
+    } finally { fx.close(); }
+  });
+
+  test('a denial after a successful send is a new episode and records again', async () => {
+    const fx = makeFixture();
+    try {
+      fx.connectA();
+      clearTransport(fx);
+      const api = makeFakeApi();
+      const { broker, logs } = newBroker(fx, api);
+      assert.equal(fx.clientA.publishFinalOutput({ ...A, text: 'FIRST' }).ok, true);
+      await broker.drainTuiEvents(); // consumes the token
+      assert.equal(fx.clientA.publishFinalOutput({ ...A, text: 'SECOND' }).ok, true);
+      await broker.drainTuiEvents(); // denied: episode 1
+      assert.equal(throttleRecords(logs).length, 1);
+      // Once the window frees, the pending event is delivered and silent.
+      fx.advance(60_000);
+      await broker.drainTuiEvents();
+      assert.equal(api.sent.length, 2);
+      assert.match(api.sent[1].text, /SECOND/);
+      assert.equal(pendingEvents(fx).length, 0);
+      assert.equal(throttleRecords(logs).length, 1, 'the recovery itself must not log');
+      // A fresh denial now is a NEW episode and must stay fully visible.
+      assert.equal(fx.clientA.publishFinalOutput({ ...A, text: 'THIRD' }).ok, true);
+      await broker.drainTuiEvents();
+      assert.equal(throttleRecords(logs).length, 2,
+        'the edge trigger must never swallow a later real throttling event');
+    } finally { fx.close(); }
+  });
+
+  test('an unthrottled drain records nothing new and behaves exactly as before', async () => {
+    const fx = makeFixture();
+    try {
+      fx.connectA();
+      clearTransport(fx);
+      const api = makeFakeApi();
+      const { broker, logs } = newBroker(fx, api, BROKER_CONFIG); // generous limiter
+      assert.equal(fx.clientA.publishFinalOutput({ ...A, text: 'PLAIN' }).ok, true);
+      await broker.drainTuiEvents();
+      assert.equal(api.sent.length, 1);
+      assert.match(api.sent[0].text, /PLAIN/);
+      assert.equal(pendingEvents(fx).length, 0, 'the event is acknowledged after the send');
+      assert.equal(throttleRecords(logs).length, 0, 'a healthy send logs no throttle record');
+    } finally { fx.close(); }
+  });
+
+  test('a rate-limited queued reply records exactly once and stays queued for retry', async () => {
+    const fx = makeFixture();
+    try {
+      fx.connectA();
+      clearTransport(fx);
+      const api = makeFakeApi();
+      const { broker, logs } = newBroker(fx, api);
+      // A first authorized command consumes the single outbound token.
+      broker.handleUpdate(msg('/help'));
+      await broker.flushReplies();
+      assert.equal(api.sent.length, 1);
+      assert.equal(throttleRecords(logs).length, 0);
+      // A second reply — a callback query, which bypasses the inbound
+      // limiter — is throttled outbound: exactly one record, notice kept.
+      broker.handleUpdate(cb('v1:c'));
+      await broker.flushReplies();
+      assert.equal(throttleRecords(logs).length, 1,
+        `the flush path must produce exactly one record, saw ${throttleRecords(logs).length}`);
+      // Once the window frees, the kept notice is delivered — never lost.
+      fx.advance(60_000);
+      await broker.flushReplies();
+      assert.equal(api.sent.length, 2, 'the queued notice is retried after the throttle');
+      assert.equal(throttleRecords(logs).length, 1, 'the recovery itself must not log');
+    } finally { fx.close(); }
+  });
+});

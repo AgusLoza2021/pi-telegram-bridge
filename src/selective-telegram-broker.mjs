@@ -274,6 +274,12 @@ export class SelectiveTelegramBroker {
   #now;
   #logger;
   #limiter;
+  /**
+   * Memory-only outbound throttle state: while non-zero, the current
+   * throttle episode already logged its record and retries wait until this
+   * timestamp instead of re-attempting (and re-logging) the limiter.
+   */
+  #outboundRetryNotBefore = 0;
   /** Memory-only selected tracking id; never persisted anywhere. */
   #selectedTrackingId = null;
   /** trackingId -> { label, shortId }; identity for prefixing drained events. */
@@ -1232,8 +1238,12 @@ export class SelectiveTelegramBroker {
       }
       const outcome = await this.#sendChunks(rendered.text, rendered.replyMarkup);
       if (outcome !== 'sent') {
-        this.#log(outcome === 'uncertain' ? 'send_uncertain'
-          : outcome === 'rate_limited' ? 'rate_limited_outbound' : 'send_failed');
+        // The throttle record is written exactly once by #sendChunks at the
+        // edge of the episode; repeating it here would double-count a single
+        // denial and log once per poll cycle for a persistent throttle.
+        if (outcome !== 'rate_limited') {
+          this.#log(outcome === 'uncertain' ? 'send_uncertain' : 'send_failed');
+        }
         return;
       }
       this.#store.acknowledgeTuiEvents({ eventIds: [event.eventId] });
@@ -1261,11 +1271,35 @@ export class SelectiveTelegramBroker {
     }
   }
 
+  /**
+   * One outbound limiter take with edge-triggered throttle recording: a
+   * consecutive run of denials is ONE episode and is logged exactly once,
+   * carrying the retryAfterMs the limiter reported. While that wait is
+   * still pending the limiter is not re-attempted (and not re-logged);
+   * the episode ends only when a take is allowed again, so a later denial
+   * after a recovery is a new episode and stays fully visible.
+   */
+  #takeOutbound() {
+    const now = this.#now();
+    if (now < this.#outboundRetryNotBefore) {
+      return { allowed: false, retryAfterMs: this.#outboundRetryNotBefore - now };
+    }
+    const take = this.#limiter.take('outbound', now);
+    if (take.allowed) {
+      this.#outboundRetryNotBefore = 0;
+      return take;
+    }
+    if (this.#outboundRetryNotBefore === 0) {
+      this.#log('rate_limited_outbound', { retryAfterMs: take.retryAfterMs });
+    }
+    this.#outboundRetryNotBefore = now + Math.max(0, take.retryAfterMs);
+    return take;
+  }
+
   async #sendChunks(text, replyMarkup = null) {
     const chunks = chunkMessage(text, this.#maxMessageChars);
     for (let i = 0; i < chunks.length; i++) {
-      if (!this.#limiter.take('outbound', this.#now()).allowed) {
-        this.#log('rate_limited_outbound');
+      if (!this.#takeOutbound().allowed) {
         return 'rate_limited';
       }
       try {
@@ -1435,7 +1469,7 @@ export class SelectiveTelegramBroker {
     }
   }
 
-  #log(code) {
-    this.#logger({ code, brokerId: this.#ownerId });
+  #log(code, detail = null) {
+    this.#logger({ code, brokerId: this.#ownerId, ...(isPlainObject(detail) ? detail : {}) });
   }
 }

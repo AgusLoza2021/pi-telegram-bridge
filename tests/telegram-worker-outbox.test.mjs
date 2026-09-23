@@ -688,3 +688,93 @@ describe('verifier M: centralized option validation at the common render path', 
     });
   }
 });
+
+describe('worker: one honest outbound throttle record per episode', () => {
+  // A saturated limiter makes every denial deterministic without network:
+  // the single outbound token is consumed by one successful send and every
+  // later take inside the 60s window is denied with retryAfterMs = 60000.
+  const THROTTLED_CONFIG = {
+    telegram: { allowedUserId: String(USER_ID), allowedChatId: String(CHAT_ID) },
+    bridge: { maxMessageChars: 3800, rateLimit: { max: 1, windowMs: 60_000 } },
+  };
+
+  function makeThrottledFixture() {
+    const dir = mkdtempSync(join(TEST_RUNS, 't03-throttle-'));
+    let t = T0;
+    const now = () => t;
+    const store = new Store(join(dir, 'main.sqlite'), { now });
+    const api = makeStubApi();
+    const logs = [];
+    const worker = makeWorker(store, api, { config: THROTTLED_CONFIG, now, logger: (event) => logs.push(event) });
+    return { store, api, worker, logs, advance(ms) { t += ms; } };
+  }
+
+  const throttleRecords = (logs) => logs.filter((e) => e.code === 'rate_limited_outbound');
+  const enqueueText = (store, text) => store.enqueueOutbox({ requestId: null, kind: 'tg_text', payload: { text } });
+  const enqueueKeyboard = (store, text) => store.enqueueOutbox({ requestId: null, kind: 'tg_keyboard', payload: { text } });
+
+  test('a throttled text row records once per episode although the drain retries it', async () => {
+    const fx = makeThrottledFixture();
+    enqueueText(fx.store, 'first');
+    await fx.worker.drainOnce(); // consumes the only outbound token
+    assert.equal(fx.api.calls.length, 1);
+    assert.equal(throttleRecords(fx.logs).length, 0);
+    enqueueText(fx.store, 'second');
+    await fx.worker.drainOnce(); // denied: the episode record
+    const records = throttleRecords(fx.logs);
+    assert.equal(records.length, 1,
+      `a single denial must produce exactly one record, saw ${records.length}`);
+    assert.equal(records[0].retryAfterMs, 60_000,
+      'the record must state how long the limiter asked the worker to wait');
+    // drainPending retries the still-pending row every cycle; the episode
+    // stays ONE record and the send is not re-attempted while throttled.
+    await fx.worker.drainPending();
+    assert.equal(throttleRecords(fx.logs).length, 1,
+      `a persistent throttle must stay one record per episode, saw ${throttleRecords(fx.logs).length}`);
+    assert.equal(fx.api.calls.length, 1, 'no re-attempt while still throttled');
+    assert.equal(fx.store.listPendingOutbox().length, 1, 'the row keeps waiting, it is never dropped');
+  });
+
+  test('a throttled keyboard row records once per episode too', async () => {
+    const fx = makeThrottledFixture();
+    enqueueText(fx.store, 'first');
+    await fx.worker.drainOnce(); // consumes the token
+    enqueueKeyboard(fx.store, 'pick one');
+    await fx.worker.drainOnce(); // denied: the episode record
+    assert.equal(throttleRecords(fx.logs).length, 1);
+    await fx.worker.drainPending();
+    assert.equal(throttleRecords(fx.logs).length, 1,
+      `the keyboard row must not add per-cycle records, saw ${throttleRecords(fx.logs).length}`);
+    assert.equal(fx.store.listPendingOutbox().length, 1, 'the keyboard stays pending');
+  });
+
+  test('a denial after a successful send is a new episode and records again', async () => {
+    const fx = makeThrottledFixture();
+    enqueueText(fx.store, 'first');
+    await fx.worker.drainOnce(); // consumes the token
+    enqueueText(fx.store, 'second');
+    await fx.worker.drainOnce(); // denied: episode 1
+    assert.equal(throttleRecords(fx.logs).length, 1);
+    fx.advance(60_000); // window frees
+    await fx.worker.drainOnce();
+    assert.equal(fx.api.calls.length, 2, 'the pending row is delivered once the window frees');
+    assert.equal(fx.store.listPendingOutbox().length, 0);
+    assert.equal(throttleRecords(fx.logs).length, 1, 'the recovery itself must not log');
+    enqueueText(fx.store, 'third');
+    await fx.worker.drainOnce(); // denied again: episode 2
+    assert.equal(throttleRecords(fx.logs).length, 2,
+      'the edge trigger must never swallow a later real throttling event');
+  });
+
+  test('an unthrottled drain records nothing new and behaves exactly as before', async () => {
+    const fx = makeThrottledFixture();
+    // Default generous limiter: sends flow and no throttle record appears.
+    const logs = [];
+    const worker = makeWorker(fx.store, fx.api, { logger: (event) => logs.push(event) });
+    enqueueText(fx.store, 'plain');
+    await worker.drainPending();
+    assert.equal(fx.api.calls.length, 1);
+    assert.equal(throttleRecords(logs).length, 0, 'a healthy send logs no throttle record');
+    assert.equal(fx.store.listPendingOutbox().length, 0);
+  });
+});
