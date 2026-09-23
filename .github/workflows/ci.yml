@@ -36,6 +36,26 @@ jobs:
           node-version: "24"
           package-manager-cache: false
 
+      # The hosted runner exports a PSModulePath that points at a PowerShell 7
+      # install, so Windows PowerShell 5.1 cannot autoload Get-Acl, Set-Acl and
+      # the rest of the modules it ships with. Without this the real-ACL and
+      # DPAPI integration tests fail with a module-not-found error inside
+      # Test-BridgeStateRootAcl, which surfaces as a state-ACL refusal and is
+      # easily mistaken for a security finding. The step then proves the fix on
+      # itself, so a wrong diagnosis fails here instead of 15 tests later.
+      - name: Restore the Windows PowerShell 5.1 module path
+        shell: powershell
+        run: |
+          $modulePath = "$env:ProgramFiles\WindowsPowerShell\Modules;$env:SystemRoot\system32\WindowsPowerShell\v1.0\Modules"
+          # -Encoding ascii is deliberate: Out-File -Encoding utf8 in Windows
+          # PowerShell 5.1 writes a BOM, and a BOM in GITHUB_ENV corrupts the
+          # variable name for every later step.
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "PSModulePath=$modulePath" -Encoding ascii
+          $env:PSModulePath = $modulePath
+          Import-Module Microsoft.PowerShell.Security -ErrorAction Stop
+          Get-Acl -LiteralPath $env:GITHUB_WORKSPACE | Out-Null
+          Write-Host "Get-Acl resolves once the Windows PowerShell 5.1 module path is restored"
+
       # The exact command CONTRIBUTING.md documents: the single pinned production
       # dependency, no package lifecycle scripts, no audit, no fund.
       - name: Install the pinned dependency
