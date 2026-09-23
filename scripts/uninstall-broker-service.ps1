@@ -46,17 +46,7 @@ if ($null -ne $live) {
     }
     Write-BrokerStopControl -StateRoot $stateRoot -InstanceId $instanceId
     Write-Host "graceful stop requested for instance $instanceId; waiting up to 20s..."
-    $deadline = (Get-Date).AddSeconds(20)
-    $stopped = $false
-    while ((Get-Date) -lt $deadline) {
-        Start-Sleep -Milliseconds 500
-        $meta = Read-JsonFile -Path (Join-Path $stateRoot 'broker-meta.json')
-        if ($null -ne $meta -and $null -ne (Get-BridgeMetaField -Meta $meta -Name 'shutdownAt')) { $stopped = $true; break }
-        if ($null -ne $meta -and $null -ne (Get-BridgeMetaField -Meta $meta -Name 'pid')) {
-            $stillAlive = Get-Process -Id ([int](Get-BridgeMetaField -Meta $meta -Name 'pid')) -ErrorAction SilentlyContinue
-            if ($null -eq $stillAlive) { $stopped = $true; break }
-        }
-    }
+    $stopped = Wait-BrokerServiceShutdown -StateRoot $stateRoot -TimeoutSeconds 20
     if (-not $stopped) {
         Write-Host 'the broker did not confirm a shutdown within 20s; uninstall aborted (evidence left in place). Run scripts/stop-broker-service.ps1 and retry.'
         exit 2

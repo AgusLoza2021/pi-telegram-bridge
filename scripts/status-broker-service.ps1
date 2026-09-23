@@ -83,5 +83,6 @@ if ($Json) {
         Write-Host 'SETUP_REQUIRED - credentials are missing; the task is disabled.'
     }
     Write-Host ''
+    Write-Host 'on demand: telegram on | telegram off | telegram status'
     Write-Host 'start: scripts/start-broker-service.ps1   stop: scripts/stop-broker-service.ps1'
 }
