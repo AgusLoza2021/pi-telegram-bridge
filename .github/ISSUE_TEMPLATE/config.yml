@@ -1,0 +1,12 @@
+# Blank issues are disabled on purpose. On a project whose security boundaries are
+# the product, a free-form report invites requests that cannot be accepted and
+# leaks credentials into a public thread.
+blank_issues_enabled: false
+
+contact_links:
+  - name: Report a security vulnerability (private)
+    url: https://github.com/AgusLoza2021/pi-telegram-bridge/security/advisories/new
+    about: Never open a public issue for a vulnerability. Use this private advisory form instead.
+  - name: Setup help — read the guide first
+    url: https://github.com/AgusLoza2021/pi-telegram-bridge/blob/main/README.md
+    about: The README walks through setup step by step, including the Fix problems section.

@@ -3,6 +3,29 @@
   "version": "0.2.0",
   "private": true,
   "license": "MIT",
+  "author": "Agustin Lozano",
+  "keywords": [
+    "pi",
+    "pi-coding-agent",
+    "telegram",
+    "telegram-bot",
+    "coding-agent",
+    "remote-control",
+    "windows",
+    "powershell",
+    "local-first",
+    "privacy",
+    "long-polling",
+    "security"
+  ],
+  "homepage": "https://github.com/AgusLoza2021/pi-telegram-bridge",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/AgusLoza2021/pi-telegram-bridge.git"
+  },
+  "bugs": {
+    "url": "https://github.com/AgusLoza2021/pi-telegram-bridge/issues"
+  },
   "description": "Control explicitly linked Pi sessions from an authorized Telegram chat, with local-only setup and final-output-only delivery.",
   "type": "module",
   "engines": {

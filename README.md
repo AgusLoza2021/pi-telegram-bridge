@@ -50,7 +50,7 @@ You need the **whole folder** of this project on your PC — not just this READM
 Pick one of these two routes:
 
 - **You received a ZIP file.** Right-click the ZIP file and choose **Extract All...**. Choose a simple, short location such as `C:\pi-telegram-bridge`, and finish the extraction. Do not run the tool from inside the ZIP window — always from the extracted folder.
-- **You use git.** Run `git clone <repository-url>` in a terminal. <!-- TODO: replace <repository-url> once the repository is published -->
+- **You use git.** Run `git clone https://github.com/AgusLoza2021/pi-telegram-bridge.git` in a terminal.
 
 Two places to avoid:
 

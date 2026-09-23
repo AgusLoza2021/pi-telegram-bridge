@@ -32,7 +32,7 @@ Tranquilidad: el instalador ahora **rechaza un Node.js no compatible antes de pr
 Necesitas **la carpeta completa** del proyecto, no solo el README.
 
 - **Si te pasaron un archivo ZIP:** haz clic derecho sobre el ZIP y elige **Extraer todo...**. Elige una ruta simple y corta, por ejemplo `C:\pi-telegram-bridge`, y termina la extracción. No ejecutes la herramienta desde dentro de la ventana del ZIP: siempre desde la carpeta extraída.
-- **Si usas git:** ejecuta `git clone <repository-url>` en una terminal.
+- **Si usas git:** ejecuta `git clone https://github.com/AgusLoza2021/pi-telegram-bridge.git` en una terminal.
 
 Dos lugares a evitar:
 
