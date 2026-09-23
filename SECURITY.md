@@ -39,3 +39,7 @@ Version 1 targets Windows 11, Windows PowerShell 5.1, Node.js 24 or newer, Teleg
 ## Non-security reports
 
 Use the public bug form for sanitized reproducible defects that do not cross a security boundary. Feature requests, copy improvements, unsupported operating systems, and general setup questions are not private vulnerability reports.
+
+## Code of conduct
+
+Behaviour in this project's spaces is covered by the [Code of conduct](CODE_OF_CONDUCT.md), which routes reports through the private channel defined in this file.

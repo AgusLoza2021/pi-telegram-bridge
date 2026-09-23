@@ -1,5 +1,7 @@
 # Pi Telegram Bridge — control Pi from your phone
 
+![Pi Telegram Bridge: a private Telegram chat reaches a Pi window linked with /tg, through the bridge on your own PC](docs/assets/banner.svg)
+
 Talk to a Pi coding session on your Windows PC from your own private Telegram bot: send a normal message from your phone and receive Pi's finalized answer in the same chat.
 
 You control only Pi sessions that you explicitly link with `/tg`. This is **not** remote CMD, PowerShell, or shell access to your PC.
@@ -179,3 +181,4 @@ Released under the [MIT License](LICENSE).
 
 - Report security issues through [SECURITY.md](SECURITY.md).
 - Development setup and contribution rules are in [CONTRIBUTING.md](CONTRIBUTING.md).
+- Community expectations and enforcement are in the [Code of conduct](CODE_OF_CONDUCT.md).

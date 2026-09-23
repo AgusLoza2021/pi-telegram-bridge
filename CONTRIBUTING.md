@@ -2,6 +2,8 @@
 
 Thanks for helping make Pi easier to use from a phone. Keep changes small, reviewable, and inside the security boundaries documented in [SECURITY.md](SECURITY.md).
 
+Participation in this project is covered by the [Code of conduct](CODE_OF_CONDUCT.md).
+
 ## Development setup
 
 Requirements:
@@ -41,5 +43,7 @@ Before changing public behavior, read the [architecture](docs/ARCHITECTURE.md), 
 ## Pull requests
 
 Use a focused branch and Conventional Commit messages. Describe the user-visible outcome, security-boundary impact, and exact checks run. List skipped manual checks honestly. Do not add generated state (`.local/`), `node_modules/`, credentials, logs, databases, or editor artifacts.
+
+Pull requests are expected to be green on the same gates that CI runs on `windows-latest` (`.github/workflows/ci.yml`): `npm test` and `scripts/test.ps1`.
 
 By contributing, you agree that your contribution is licensed under the repository's MIT license.

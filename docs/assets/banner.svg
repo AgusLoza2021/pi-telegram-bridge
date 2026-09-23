@@ -1,0 +1,43 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 280" width="1280" height="280" role="img" aria-labelledby="banner-title banner-desc">
+  <title id="banner-title">Pi Telegram Bridge</title>
+  <desc id="banner-desc">A private Telegram chat reaches a Pi window linked with /tg, through the bridge running on your own PC.</desc>
+
+  <rect width="1280" height="280" rx="20" fill="#0B1220"/>
+  <rect x="0.5" y="0.5" width="1279" height="279" rx="19.5" fill="none" stroke="#1F2A3D"/>
+
+  <text x="64" y="100" font-family="Segoe UI, -apple-system, BlinkMacSystemFont, Helvetica Neue, Arial, sans-serif" font-size="42" font-weight="700" fill="#F8FAFC">Pi Telegram Bridge</text>
+  <rect x="64" y="122" width="88" height="4" rx="2" fill="#38BDF8"/>
+  <text x="64" y="166" font-family="Segoe UI, -apple-system, BlinkMacSystemFont, Helvetica Neue, Arial, sans-serif" font-size="18" fill="#93A4BC">Control your Pi coding sessions</text>
+  <text x="64" y="192" font-family="Segoe UI, -apple-system, BlinkMacSystemFont, Helvetica Neue, Arial, sans-serif" font-size="18" fill="#93A4BC">from your own private Telegram bot.</text>
+  <text x="64" y="234" font-family="Segoe UI, -apple-system, BlinkMacSystemFont, Helvetica Neue, Arial, sans-serif" font-size="14" fill="#5B6B85">Windows 11  ·  PowerShell 5.1  ·  Node.js 24+  ·  MIT License</text>
+
+  <g>
+    <rect x="578" y="102" width="128" height="76" rx="14" fill="#131C2E" stroke="#2A3A55"/>
+    <text x="642" y="134" text-anchor="middle" font-family="Segoe UI, -apple-system, BlinkMacSystemFont, Helvetica Neue, Arial, sans-serif" font-size="16" font-weight="600" fill="#E2E8F0">Phone</text>
+    <text x="642" y="157" text-anchor="middle" font-family="Segoe UI, -apple-system, BlinkMacSystemFont, Helvetica Neue, Arial, sans-serif" font-size="12.5" fill="#8496B0">private chat</text>
+  </g>
+  <path d="M706 140 h18" stroke="#2A3A55" stroke-width="3" stroke-linecap="round"/>
+  <path d="M724 134 l8 6 l-8 6" fill="none" stroke="#38BDF8" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+
+  <g>
+    <rect x="740" y="102" width="128" height="76" rx="14" fill="#131C2E" stroke="#2A3A55"/>
+    <text x="804" y="134" text-anchor="middle" font-family="Segoe UI, -apple-system, BlinkMacSystemFont, Helvetica Neue, Arial, sans-serif" font-size="16" font-weight="600" fill="#E2E8F0">Telegram</text>
+    <text x="804" y="157" text-anchor="middle" font-family="Segoe UI, -apple-system, BlinkMacSystemFont, Helvetica Neue, Arial, sans-serif" font-size="12.5" fill="#8496B0">Bot API</text>
+  </g>
+  <path d="M868 140 h18" stroke="#2A3A55" stroke-width="3" stroke-linecap="round"/>
+  <path d="M886 134 l8 6 l-8 6" fill="none" stroke="#38BDF8" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+
+  <g>
+    <rect x="902" y="102" width="128" height="76" rx="14" fill="#131C2E" stroke="#2A3A55"/>
+    <text x="966" y="134" text-anchor="middle" font-family="Segoe UI, -apple-system, BlinkMacSystemFont, Helvetica Neue, Arial, sans-serif" font-size="16" font-weight="600" fill="#E2E8F0">Bridge</text>
+    <text x="966" y="157" text-anchor="middle" font-family="Segoe UI, -apple-system, BlinkMacSystemFont, Helvetica Neue, Arial, sans-serif" font-size="12.5" fill="#8496B0">on your PC</text>
+  </g>
+  <path d="M1030 140 h18" stroke="#2A3A55" stroke-width="3" stroke-linecap="round"/>
+  <path d="M1048 134 l8 6 l-8 6" fill="none" stroke="#38BDF8" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+
+  <g>
+    <rect x="1064" y="102" width="128" height="76" rx="14" fill="#131C2E" stroke="#38BDF8" stroke-width="1.5"/>
+    <text x="1128" y="134" text-anchor="middle" font-family="Segoe UI, -apple-system, BlinkMacSystemFont, Helvetica Neue, Arial, sans-serif" font-size="16" font-weight="600" fill="#E2E8F0">Pi window</text>
+    <text x="1128" y="157" text-anchor="middle" font-family="Segoe UI, -apple-system, BlinkMacSystemFont, Helvetica Neue, Arial, sans-serif" font-size="12.5" fill="#8496B0">linked by /tg</text>
+  </g>
+</svg>

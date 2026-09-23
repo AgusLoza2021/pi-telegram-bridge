@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Least privilege: no job in this workflow writes to the repository.
+permissions:
+  contents: read
+
+# A newer push to the same branch or pull request makes the running job obsolete.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    # The published supported environment is Windows 11 with Windows PowerShell 5.1
+    # and Node.js 24 or newer. A Linux or macOS job would claim support the project
+    # does not have, and SECURITY.md would contradict it.
+    name: Windows / Node 24
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v7
+
+      # The floor here matches package.json "engines" and the README prerequisites
+      # table. A floating specifier such as lts/* would hide a toolchain change.
+      - name: Install Node.js 24
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          package-manager-cache: false
+
+      # The exact command CONTRIBUTING.md documents: the single pinned production
+      # dependency, no package lifecycle scripts, no audit, no fund.
+      - name: Install the pinned dependency
+        run: npm ci --ignore-scripts --omit=dev --no-audit --no-fund
+
+      - name: Run the node test suite
+        run: npm test
+
+      # scripts/test.ps1 is the documented single validation entry point. It re-runs
+      # the node suite through the shared runner and then parses every scripts/*.ps1
+      # file with the real Windows PowerShell 5.1 parser. The duplicated node run is
+      # deliberate: it is what proves the gate contributors are told to run actually
+      # passes, and the job finishes in well under a minute.
+      - name: Run the documented gate (scripts/test.ps1)
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test.ps1

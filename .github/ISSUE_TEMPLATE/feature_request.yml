@@ -1,0 +1,74 @@
+name: Feature request
+description: Propose a change that keeps every documented security boundary intact
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Read the README **Fix problems** section and [SECURITY.md](../SECURITY.md) first.
+        This project refuses any change that weakens a documented boundary, however
+        useful it might look.
+
+  - type: checkboxes
+    id: boundaries
+    attributes:
+      label: Before you continue
+      options:
+        - label: I read SECURITY.md, and this request keeps every documented boundary intact.
+          required: true
+        - label: This request adds no CMD, PowerShell, shell, arbitrary process, MCP, or generic tool execution reachable from Telegram.
+          required: true
+        - label: This request does not ask for hidden reasoning, tool calls, tool results, context, or token-to-token streaming to reach Telegram.
+          required: true
+        - label: This request does not ask the bridge to open a listening port, accept a webhook, or reach any host other than Telegram's fixed API origin.
+          required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem are you trying to solve?
+      description: Describe the situation, not the solution. What are you doing today, and where does it break down?
+      placeholder: I want to ... but right now ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What would you like to happen instead?
+      description: The behavior you want, described in user-visible terms.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: What have you already tried?
+      description: Optional. List the workarounds or alternatives you considered and why they fall short.
+    validations:
+      required: false
+
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Which surface would this change?
+      description: The README, the launcher and the beginner copy are contract-tested, so changes there need the most care.
+      options:
+        - Beginner setup or the README
+        - The /tg command inside Pi
+        - The Telegram chat experience
+        - Documentation only
+        - Something else (explain above)
+    validations:
+      required: true
+
+  - type: input
+    id: versions
+    attributes:
+      label: Versions
+      description: Provide sanitized Windows, Node.js, Pi, and pi-telegram-bridge versions only. Do not include tokens, Telegram identifiers, or pairing data.
+      placeholder: Windows 11; Node 24.x; Pi x.y; bridge x.y
+    validations:
+      required: false
