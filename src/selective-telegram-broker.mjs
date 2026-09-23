@@ -1238,12 +1238,12 @@ export class SelectiveTelegramBroker {
       }
       const outcome = await this.#sendChunks(rendered.text, rendered.replyMarkup);
       if (outcome !== 'sent') {
-        // The throttle record is written exactly once by #sendChunks at the
-        // edge of the episode; repeating it here would double-count a single
-        // denial and log once per poll cycle for a persistent throttle.
-        if (outcome !== 'rate_limited') {
-          this.#log(outcome === 'uncertain' ? 'send_uncertain' : 'send_failed');
-        }
+        // Every non-sent outcome is already recorded exactly once by
+        // #sendChunks at the site that knows why it failed: the throttle
+        // record at the edge of the episode, and the failure records where
+        // the send failed. Repeating them here would double-count a single
+        // send attempt, and for a throttle it would additionally log once per
+        // poll cycle for as long as the throttle lasts.
         return;
       }
       this.#store.acknowledgeTuiEvents({ eventIds: [event.eventId] });

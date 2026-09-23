@@ -2283,4 +2283,31 @@ describe('SelectiveTelegramBroker: one honest outbound throttle record per episo
       assert.equal(throttleRecords(logs).length, 1, 'the recovery itself must not log');
     } finally { fx.close(); }
   });
+
+  // The same one-record invariant, on the failure path. This lived here
+  // because the caller duplicated every non-sent outcome it saw, so the
+  // defect was one family: a throttle record and a failure record were each
+  // written twice for a single send attempt.
+  test('a failed send records exactly one failure record', async () => {
+    const fx = makeFixture();
+    try {
+      fx.connectA();
+      clearTransport(fx);
+      const api = makeFakeApi();
+      // A generic transport error is not a TelegramApiError, so it is
+      // classified as send_failed rather than as an uncertain send.
+      api.failNextSends(1);
+      const { broker, logs } = newBroker(fx, api, BROKER_CONFIG);
+      assert.equal(fx.clientA.publishFinalOutput({ ...A, text: 'DOOMED' }).ok, true);
+      await broker.drainTuiEvents();
+      const failures = logs.filter((e) => e.code === 'send_failed' || e.code === 'send_uncertain');
+      assert.equal(failures.length, 1,
+        `a single failed send must produce exactly one record, saw ${failures.length}`);
+      assert.equal(failures[0].code, 'send_failed',
+        'a generic transport error is a definite failure, not an uncertain one');
+      assert.equal(api.sent.length, 0, 'a failed send transports nothing');
+      assert.equal(pendingEvents(fx).length, 1, 'the failed event stays pending for retry');
+      assert.equal(throttleRecords(logs).length, 0, 'a failure is not a throttle');
+    } finally { fx.close(); }
+  });
 });
