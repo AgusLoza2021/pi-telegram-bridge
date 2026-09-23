@@ -18,9 +18,12 @@ const SWITCH_SCRIPT = join(ROOT, 'scripts', 'telegram.ps1');
 const LAUNCHER = join(ROOT, 'telegram.cmd');
 const COMMON = join(ROOT, 'scripts', 'broker-service-common.ps1');
 
-const COMMON_SOURCE = readFileSync(COMMON, 'utf8');
-const SWITCH_SOURCE = readFileSync(SWITCH_SCRIPT, 'utf8');
-const LAUNCHER_SOURCE = readFileSync(LAUNCHER, 'utf8');
+// Read as text and normalise line endings: the repo is checked out with CRLF
+// under core.autocrlf=true on Windows, while every assertion below anchors on
+// LF-separated source lines.
+const COMMON_SOURCE = readFileSync(COMMON, 'utf8').replaceAll('\r\n', '\n');
+const SWITCH_SOURCE = readFileSync(SWITCH_SCRIPT, 'utf8').replaceAll('\r\n', '\n');
+const LAUNCHER_SOURCE = readFileSync(LAUNCHER, 'utf8').replaceAll('\r\n', '\n');
 
 // Slices one `function Name {` block up to its closing brace at column 0.
 function sliceFunction(source, name) {
