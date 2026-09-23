@@ -18,6 +18,7 @@ import { join, dirname } from 'node:path';
 import { tmpdir } from 'node:os';
 import { randomBytes } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
+import { userOnlyAclSkipReason } from './privileged.mjs';
 
 import {
   CredentialStoreError,
@@ -250,7 +251,7 @@ describe('credential blob: default live root gate (win32 only)', () => {
 import { assertTtyGuard } from '../src/dpapi-credentials.mjs';
 
 describe('credential blob: real DPAPI round trip (integration, win32 only)', () => {
-  test('synthetic secrets survive a real PowerShell 5.1 DPAPI cycle', { skip: process.platform !== 'win32' }, async () => {
+  test('synthetic secrets survive a real PowerShell 5.1 DPAPI cycle', { skip: process.platform !== 'win32' || userOnlyAclSkipReason }, async () => {
     const runRoot = join(MODULE_ROOT, '.local', 'test-runs', `dpapi-${Date.now()}-${randomBytes(4).toString('hex')}`);
     mkdirSync(runRoot, { recursive: true });
     // The real gate demands the marker SID to BE the current user and the

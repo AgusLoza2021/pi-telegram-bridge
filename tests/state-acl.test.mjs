@@ -15,6 +15,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, symlin
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { platform } from 'node:process';
+import { userOnlyAclSkipReason } from './privileged.mjs';
 
 import {
   writeStateRootCapability,
@@ -126,6 +127,9 @@ describe('state-acl: real Windows ACL (win32 only)', () => {
 
   before(async function () {
     if (!IS_WIN) this.skip();
+    // A hosted runner session cannot hold a user-only state root at all:
+    // skip with the environment reason instead of failing the invariant.
+    if (userOnlyAclSkipReason) this.skip(userOnlyAclSkipReason);
     // Resolve the CURRENT user's SID the same way the scripts do.
     const { execFile } = await import('node:child_process');
     const { promisify } = await import('node:util');
@@ -191,6 +195,9 @@ describe('state-acl: live identity + fresh ACL gate before credentials (win32 on
 
   before(async function () {
     if (!IS_WIN) this.skip();
+    // Same environment gate as the real-ACL suite above: the live gate
+    // demands a state root locked down to the invoking user alone.
+    if (userOnlyAclSkipReason) this.skip(userOnlyAclSkipReason);
     const { execFile } = await import('node:child_process');
     const { promisify } = await import('node:util');
     const run = promisify(execFile);
@@ -236,6 +243,23 @@ describe('state-acl: live identity + fresh ACL gate before credentials (win32 on
     await assert.rejects(
       () => requireStateRootForBlob({ blobPath: join(root, 'credentials.bin') }),
       (error) => error.code === 'acl_inheritance_enabled',
+    );
+  });
+});
+
+describe('state-acl: privileged probe run-value contract', () => {
+  test('userOnlyAclSkipReason is exactly false or a non-empty reason, never null/undefined', () => {
+    // Node's test runner skips a test for ANY `skip` value that is not
+    // exactly `false` — including `null` and `undefined`. The probe's
+    // run-value therefore must be `false`, or every call site passing it
+    // straight into `skip:` would silently skip the very tests it exists
+    // to protect while the suite still reads green.
+    const value = userOnlyAclSkipReason;
+    const ok = value === false
+      || (typeof value === 'string' && value.length > 0);
+    assert.ok(
+      ok,
+      `userOnlyAclSkipReason must be exactly false or a non-empty string, got ${JSON.stringify(value) ?? String(value)}: any non-false value makes the test runner skip the guarded tests`,
     );
   });
 });

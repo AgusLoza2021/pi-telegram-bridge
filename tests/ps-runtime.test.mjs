@@ -12,6 +12,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, exist
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { platform } from 'node:process';
+import { userOnlyAclSkipReason } from './privileged.mjs';
 
 const run = promisify(execFile);
 const MODULE_ROOT = fileURLToPath(new URL('..', import.meta.url));
@@ -54,7 +55,10 @@ describe('ps-runtime: setup -PrepareOnly (real PS 5.1, unique dirs)', () => {
 
   // T06: selective live-TUI mode is the DEFAULT, so prepare-only writes the
   // selective shape (no pi discovery, no followups flag) and nothing else.
-  test('prepare-only writes the default selective runtime shape, locks the ACL and the capability — and never touches credentials', async () => {
+  test('prepare-only writes the default selective runtime shape, locks the ACL and the capability — and never touches credentials', async function () {
+    // The real setup run must lock the state root down to the invoking user
+    // alone, which a hosted runner session cannot hold (tests/privileged.mjs).
+    if (userOnlyAclSkipReason) this.skip(userOnlyAclSkipReason);
     const stateDir = uniqueDir('prep');
     const { stdout } = await powershell('setup.ps1', [
       '-PrepareOnly', '-StateDirectory', stateDir,
@@ -82,7 +86,8 @@ describe('ps-runtime: setup -PrepareOnly (real PS 5.1, unique dirs)', () => {
     assert.ok(!existsSync(join(stateDir, 'credentials.bin')), 'prepare-only must never touch credentials');
   });
 
-  test('prepare-only is idempotent: re-running takes a dated backup of runtime.json, keeps the instance id and the selective shape', async () => {
+  test('prepare-only is idempotent: re-running takes a dated backup of runtime.json, keeps the instance id and the selective shape', async function () {
+    if (userOnlyAclSkipReason) this.skip(userOnlyAclSkipReason);
     const stateDir = uniqueDir('prep2');
     await powershell('setup.ps1', ['-PrepareOnly', '-StateDirectory', stateDir]);
     const first = JSON.parse(readFileSync(join(stateDir, 'runtime.json'), 'utf8'));
@@ -100,7 +105,8 @@ describe('ps-runtime: setup -PrepareOnly (real PS 5.1, unique dirs)', () => {
 
   // T06: -LegacyHeadless is the explicit fallback; the pre-T06 runtime shape
   // (pi CLI/workspace + followups flag, no mode key) must stay protected.
-  test('-LegacyHeadless -PrepareOnly keeps the legacy headless runtime shape', async () => {
+  test('-LegacyHeadless -PrepareOnly keeps the legacy headless runtime shape', async function () {
+    if (userOnlyAclSkipReason) this.skip(userOnlyAclSkipReason);
     const stateDir = uniqueDir('prep3');
     const fixtures = makePiFixtures();
     const { stdout } = await powershell('setup.ps1', [
@@ -120,7 +126,8 @@ describe('ps-runtime: setup -PrepareOnly (real PS 5.1, unique dirs)', () => {
     assert.ok(!existsSync(join(stateDir, 'credentials.bin')), 'prepare-only must never touch credentials');
   });
 
-  test('default prepare-only migrates an existing legacy runtime.json to the selective shape without losing the instance id', async () => {
+  test('default prepare-only migrates an existing legacy runtime.json to the selective shape without losing the instance id', async function () {
+    if (userOnlyAclSkipReason) this.skip(userOnlyAclSkipReason);
     const stateDir = uniqueDir('prep4');
     const fixtures = makePiFixtures();
     await powershell('setup.ps1', [
@@ -167,6 +174,9 @@ describe('ps-runtime: setup -PrepareOnly (real PS 5.1, unique dirs)', () => {
 describe('ps-runtime: start.ps1 forwards the exact state root to prerequisites', () => {
   before(async function () {
     if (!IS_WIN) this.skip();
+    // Both members prepare a real state root first, so they inherit the
+    // same hosted-runner limitation as the prepare-only suite.
+    if (userOnlyAclSkipReason) this.skip(userOnlyAclSkipReason);
   });
 
   const DOT_SOURCE_LINE = ". (Join-Path $PSScriptRoot 'common.ps1')";

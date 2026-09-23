@@ -28,6 +28,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test.ps1
 
 These commands exercise unit, integration, static PowerShell, launcher, and security-boundary tests. Ordinary contributors should **not** run setup, enrollment, service-install, service-start, or Telegram smoke scripts as part of automated verification; those commands mutate real user state and belong to explicit manual acceptance.
 
+The ACL, DPAPI, scheduled-task, and `setup.ps1` integration tests need an ordinary Windows desktop session whose user is not an administrator, because the bridge state root must be lockable down to the invoking user alone. A hosted CI runner cannot satisfy that user-only ACL requirement, so those tests skip themselves there and print the environment reason in the log. For the complete gate, run `scripts/test.ps1` on a real machine where the invariant holds.
+
 Before changing public behavior, read the [architecture](docs/ARCHITECTURE.md), [advanced operating guide](docs/ADVANCED.md), and exact [beginner UX contract](docs/BEGINNER_UX.md).
 
 ## Change rules
