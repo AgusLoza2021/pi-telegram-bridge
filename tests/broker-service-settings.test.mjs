@@ -10,7 +10,7 @@ const COMMON = join(ROOT, 'scripts', 'broker-service-common.ps1');
 const INSTALLER = join(ROOT, 'scripts', 'install-broker-service.ps1');
 // Normalise once so multi-line literal searches work on CRLF checkouts too.
 const COMMON_SOURCE = readFileSync(COMMON, 'utf8').replaceAll('\r\n', '\n');
-const INSTALLER_SOURCE = readFileSync(INSTALLER, 'utf8');
+const INSTALLER_SOURCE = readFileSync(INSTALLER, 'utf8').replaceAll('\r\n', '\n');
 const IS_WIN = process.platform === 'win32';
 
 function ps(command) {
@@ -163,5 +163,44 @@ describe('broker service task settings', () => {
       'the installer must build its trigger through the single-source helper');
     assert.ok(register >= 0 && exportTask > register && assertTask > exportTask,
       'registration must be followed by XML readback and fail-closed verification');
+  });
+
+  test('installer disables the freshly registered task as a top-level statement and starts it only from an indented statement inside the -Start block', () => {
+    // Text-level proof: this check matches installer source text and does not
+    // execute PowerShell. In this installer top-level statements sit at
+    // column 0 and the -Start block body is indented, so the line-anchored
+    // matches below prove the disable is unconditional (a conditional wrap
+    // would indent it) and that the single start call is an indented
+    // statement inside the block guarded by the -Start switch.
+    assert.match(INSTALLER_SOURCE, /\[switch\]\$Start/,
+      'the installer must declare the explicit -Start switch');
+    assert.match(INSTALLER_SOURCE, /^Disable-ScheduledTask -TaskName \$taskName \| Out-Null$/m,
+      'Disable-ScheduledTask must be a column-0 top-level statement: wrapping it in a conditional would indent it');
+    const disable = INSTALLER_SOURCE.indexOf('Disable-ScheduledTask -TaskName $taskName');
+    const startBranch = INSTALLER_SOURCE.indexOf('if ($Start) {');
+    assert.ok(startBranch >= 0 && disable < startBranch,
+      'the disable must precede the -Start guard');
+    assert.match(INSTALLER_SOURCE,
+      /^if \(\$Start\) \{[ \t]*\n(?:[^\n]*\n){0,20}?[ \t]+Start-BrokerServiceTask -TaskName \$taskName/m,
+      'Start-BrokerServiceTask must be an indented statement inside the block guarded by if ($Start)');
+    assert.equal((INSTALLER_SOURCE.match(/Start-BrokerServiceTask/g) ?? []).length, 1,
+      'Start-BrokerServiceTask must be called exactly once, inside the -Start block');
+  });
+
+  test('installer disables the task before the XML readback, so a failed readback cannot leave the task enabled', () => {
+    // Text-level proof: Disable-ScheduledTask must precede both
+    // Export-ScheduledTask and Assert-BrokerServiceTaskXml. The task is
+    // registered ENABLED, so if the disable came after the readback, a
+    // throw inside the readback (empty XML, failed settings pattern) would
+    // abort the installer under $ErrorActionPreference = 'Stop' before the
+    // disable ever ran, leaving the task enabled at every sign-in.
+    const disable = INSTALLER_SOURCE.indexOf('Disable-ScheduledTask -TaskName $taskName');
+    const exportTask = INSTALLER_SOURCE.indexOf('Export-ScheduledTask');
+    const assertTask = INSTALLER_SOURCE.indexOf('Assert-BrokerServiceTaskXml');
+    assert.ok(disable >= 0, 'Disable-ScheduledTask must be present');
+    assert.ok(disable < exportTask,
+      'the disable must run before the XML readback (Export-ScheduledTask)');
+    assert.ok(disable < assertTask,
+      'the disable must run before the fail-closed verification (Assert-BrokerServiceTaskXml)');
   });
 });

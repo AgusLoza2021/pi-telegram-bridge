@@ -168,4 +168,145 @@ describe('public repository hygiene', () => {
       assert.doesNotMatch(text, /repository-url/, `${document} must not keep a pre-publication placeholder`);
     }
   });
+
+  test('the Beginner plan never starts the connection and setup starts it at most once behind a guarded (y/N) offer', () => {
+    const setup = read('scripts/setup.ps1');
+    // The Beginner plan slice: from its marker line up to the post-enrollment
+    // offers region. Adding the start script to the Beginner $componentScripts
+    // array makes this fail.
+    const beginnerPlanStart = setup.indexOf("Write-Host 'Finishing setup...'");
+    const offersStart = setup.indexOf('# --- post-enrollment offers', beginnerPlanStart);
+    assert.ok(beginnerPlanStart >= 0 && offersStart > beginnerPlanStart,
+      'the Beginner plan slice and the post-enrollment offers region must both exist');
+    const beginnerPlan = setup.slice(beginnerPlanStart, offersStart);
+    assert.doesNotMatch(beginnerPlan, /['"]start-broker-service\.ps1['"']/,
+      'the Beginner plan must contain no start-script reference in any quoting style: the Beginner path can never start the connection');
+    // Wherever setup.ps1 invokes the start script, that invocation must sit
+    // after an explicit `-match '^[yY]'` answer test behind a `(y/N)` prompt,
+    // never behind the old Enter-means-yes `-notmatch '^[nN]'` default.
+    const startCall = setup.indexOf("-ScriptName 'start-broker-service.ps1'");
+    assert.ok(startCall >= 0, 'the advanced start offer must invoke the dedicated start script');
+    assert.equal((setup.match(/-ScriptName 'start-broker-service\.ps1'/g) ?? []).length, 1,
+      'setup must invoke the start script exactly once, inside the single guarded (y/N) offer');
+    assert.match(setup, /Turn the connection on now \(it starts at sign-in until you run "telegram off"\)\? \(y\/N\)/,
+      'the start offer prompt must name the sign-in behavior and default to No');
+    const promptSuffix = setup.lastIndexOf('(y/N)', startCall);
+    const yesTest = setup.lastIndexOf("-match '^[yY]'", startCall);
+    assert.ok(promptSuffix >= 0 && promptSuffix < startCall, 'the start offer prompt must end in (y/N) before the start call');
+    const legacyDefaultYes = setup.indexOf("-notmatch '^[nN]'", promptSuffix);
+    assert.ok(legacyDefaultYes < 0 || legacyDefaultYes > startCall,
+      'the old Enter-means-yes default must not sit between the start prompt and the start call');
+    assert.ok(yesTest >= 0 && yesTest < startCall, 'the start call must follow an explicit yes answer test');
+    assert.ok(promptSuffix < yesTest, 'the start offer prompt must end in (y/N) before the yes answer test');
+    assert.doesNotMatch(setup, /Start the broker now\?/, 'the old unconditional start prompt must not survive in setup');
+  });
+
+  test('the setup summary states the connection state and the enable/disable switch semantics', () => {
+    const setup = read('scripts/setup.ps1');
+    assert.match(setup, /The connection is OFF and nothing starts at sign-in\./,
+      'the summary must tell the owner when the connection was left off');
+    assert.match(setup, /The connection is ON and starts at sign-in until you run "telegram off"\./,
+      'the summary must tell the owner when the start offer turned the connection on');
+    assert.match(setup, /runs at sign-in only while enabled/,
+      'the summary must state the conditional sign-in lifecycle');
+    assert.match(setup, /"telegram on" enables and starts it, "telegram off" stops and disables it/,
+      'the summary must state the enable/disable switch semantics');
+  });
+
+  test('the docs state the per-path connection lifecycle and no stale auto-start claim survives', () => {
+    const advanced = read('docs/ADVANCED.md');
+    assert.match(advanced,
+      /registered \*\*disabled\*\* by whichever setup path registers it: the Beginner path never enables or starts it, and the advanced path only asks once at the end/,
+      'ADVANCED must scope the disabled registration and the per-path start behavior');
+    assert.match(advanced, /with No as the default/,
+      'ADVANCED must state the advanced start offer default (No)');
+    assert.match(advanced,
+      /Nothing starts at a sign-in unless you turn it on: with `telegram on`, or by answering yes to that single setup question/,
+      'ADVANCED must state that nothing starts at sign-in unless the owner turns it on');
+    assert.match(advanced, /`telegram on`[^.]*enables and starts/,
+      'ADVANCED must document telegram on as enable + start');
+    assert.match(advanced, /`telegram off`[^.]*stops it and clears/,
+      'ADVANCED must document telegram off as stop + disable');
+    assert.match(advanced, /stays off across sign-ins and restarts/,
+      'ADVANCED must keep the stays-off-across-restarts behavior');
+
+    const architecture = read('docs/ARCHITECTURE.md');
+    assert.match(architecture,
+      /registered disabled initially: the Beginner path never enables or starts it, the advanced path asks once at the end \(default No\)/,
+      'ARCHITECTURE must scope the task model per path (Beginner never, advanced asks once with default No)');
+    assert.match(architecture,
+      /once turned off with `telegram off`[^;]*sign-in stays off until the owner runs `telegram on` again/,
+      'ARCHITECTURE must state the post-off sign-in behavior');
+
+    const readme = read('README.md');
+    const glossaryRow = readme.split('\n').find((line) => line.includes('**The background connection**'));
+    assert.ok(glossaryRow, 'the README glossary must keep the background connection row');
+    assert.match(glossaryRow, /beginner setup registers it DISABLED and leaves it off/,
+      'the README glossary must scope the disabled-and-off promise to the beginner setup');
+    assert.match(glossaryRow, /advanced setup asks once at the end.*with No as the default/,
+      'the README glossary must state the advanced start offer and its No default');
+    assert.match(glossaryRow, /nothing starts at a sign-in unless you turn it on/,
+      'the README glossary must state that nothing starts at sign-in unless the owner turns it on');
+
+    // Stale claims this fix removed must not survive in any of these files.
+    for (const [document, text] of [
+      ['README.md', readme],
+      ['QUICKSTART.es.md', read('QUICKSTART.es.md')],
+      ['docs/ADVANCED.md', advanced],
+      ['docs/ARCHITECTURE.md', architecture],
+    ]) {
+      assert.doesNotMatch(text, /choose \*\*Yes\*\* to start now/,
+        `${document} must not claim a Yes answer starts the connection now`);
+      assert.doesNotMatch(text, /It then asks whether to start the connection now/,
+        `${document} must not claim setup asks whether to start the connection now`);
+      assert.doesNotMatch(text, /Start the broker now\?/,
+        `${document} must not keep the old start prompt`);
+      assert.doesNotMatch(text, /Setup turns it on in one of two ways/,
+        `${document} must not keep the two-ways auto-start claim`);
+    }
+    assert.doesNotMatch(read('QUICKSTART.es.md'), /no arranca nada hasta que la prend\u00e9s con `telegram on`/,
+      'QUICKSTART.es must not keep the old glossary auto-start claim');
+  });
+
+  test('the Spanish glossary row keeps the turn-on/turn-off semantics', () => {
+    const quickstart = read('QUICKSTART.es.md');
+    const glossaryRow = quickstart.split('\n').find((line) => line.includes('**La conexi\u00f3n de fondo**'));
+    assert.ok(glossaryRow, 'the Spanish glossary must keep the background connection row');
+    assert.match(glossaryRow, /`telegram on`[^.]*la habilita y la arranca/,
+      'the Spanish row must document telegram on as enable + start');
+    assert.match(glossaryRow, /`telegram off`[^.]*la detiene y la deshabilita/,
+      'the Spanish row must document telegram off as stop + disable');
+    assert.match(glossaryRow, /sigue apagada despu\u00e9s de reiniciar/,
+      'the Spanish row must keep the restart behavior');
+  });
+
+  test('the README quick-start step 5 turns the connection on before sending the reader to /tg', () => {
+    const readme = read('README.md');
+    const step5 = readme.split('\n').find((line) => /^5\. /.test(line));
+    assert.ok(step5, 'the README quick-start must keep a step 5');
+    assert.match(step5, /run `telegram on` there, then open Pi, run `\/tg`/,
+      'step 5 must sequence `telegram on` before opening Pi and /tg');
+    assert.doesNotMatch(readme, /^5\. Open Pi, run `\/tg`, choose \*\*Connect\*\*/m,
+      'the old bare step 5 (which never turned the connection on) must not survive');
+  });
+
+  test('the Spanish quick-start step 7 states the connection is left off and bans the auto-start claim', () => {
+    const quickstart = read('QUICKSTART.es.md');
+    const step7 = quickstart.split('\n').find((line) => /^7\. /.test(line));
+    assert.ok(step7, 'the Spanish quick-start must keep a step 7');
+    assert.match(step7, /pero \*\*la deja apagada\*\*/,
+      'step 7 must state setup leaves the background connection off');
+    assert.doesNotMatch(quickstart, /la inicia por ti/,
+      'the old auto-start claim must not survive in the Spanish quick-start');
+  });
+
+  test('the advanced stage 4 states registration never enables the connection and bans the start-the-broker claim', () => {
+    const advanced = read('docs/ADVANCED.md');
+    const stage4 = advanced.split('\n').find((line) => /^4\. \*\*Offer local installation\.\*\*/.test(line));
+    assert.ok(stage4, 'the advanced lifecycle must keep stage 4');
+    assert.match(stage4, /registration never enables it, and setup asks once at the end whether to turn the connection on, with No as the default/,
+      'stage 4 must state registration never enables the connection and the end-of-setup offer defaults to No');
+    assert.doesNotMatch(advanced, /\(always registered disabled\), and start the broker/i,
+      'the old start-the-broker claim must not survive in ADVANCED');
+  });
 });

@@ -35,6 +35,8 @@ const NPM_CAPTURE_LINE = 'set "NPM_EXIT=%ERRORLEVEL%"';
 const NPM_CI_LINE = 'npm ci --ignore-scripts --omit=dev --no-audit --no-fund';
 const NPM_LOG_REDIRECT = '>".local\\logs\\setup-dependencies.log" 2>&1';
 const SUCCESS_COPY = 'Setup complete.';
+const SUCCESS_OFF_COPY = 'The phone connection is OFF. Nothing starts by itself when you sign in.';
+const SUCCESS_TURNON_COPY = 'To turn it on when you want it, open a Command Prompt in this folder and type: telegram on';
 const SUCCESS_ACTION_COPY = 'Open or restart Pi, type /tg, choose Connect, then send a normal Telegram message.';
 const FAILURE_COPY = 'Setup stopped before it could finish.';
 const FAILURE_KEPT_COPY = 'Your existing link and settings were kept safe.';
@@ -384,7 +386,7 @@ describe('launcher: exit-code capture and propagation order', () => {
 
   test('setup success, failure and pause copy all come after the capture', () => {
     const captureIdx = LINES.findIndex((l) => l.trim() === CAPTURE_LINE);
-    for (const marker of [SUCCESS_COPY, SUCCESS_ACTION_COPY, FAILURE_COPY, FAILURE_KEPT_COPY, PAUSE_COPY]) {
+    for (const marker of [SUCCESS_COPY, SUCCESS_OFF_COPY, SUCCESS_TURNON_COPY, SUCCESS_ACTION_COPY, FAILURE_COPY, FAILURE_KEPT_COPY, PAUSE_COPY]) {
       const idx = LINES.findIndex((l, i) => i > captureIdx && l.includes(marker));
       assert.ok(idx > captureIdx, `"${marker}" must appear in the setup tail after the capture`);
     }
@@ -407,11 +409,15 @@ describe('launcher: exit-code capture and propagation order', () => {
 });
 
 describe('launcher: beginner copy', () => {
-  test('success copy is exactly two adjacent beginner lines', () => {
+  test('success copy is exactly four adjacent beginner lines', () => {
     const first = LINES.findIndex((line) => line.trim() === `echo ${SUCCESS_COPY}`);
     assert.ok(first >= 0, 'the first success line must exist');
-    assert.equal(LINES[first + 1].trim(), `echo ${SUCCESS_ACTION_COPY}`,
-      'the action line must immediately follow the success line');
+    assert.equal(LINES[first + 1].trim(), `echo ${SUCCESS_OFF_COPY}`,
+      'the OFF-state line must immediately follow the success line');
+    assert.equal(LINES[first + 2].trim(), `echo ${SUCCESS_TURNON_COPY}`,
+      'the turn-on instruction must follow the OFF-state line');
+    assert.equal(LINES[first + 3].trim(), `echo ${SUCCESS_ACTION_COPY}`,
+      'the action line must follow the turn-on instruction');
   });
 
   test('setup failure copy reassures and points at the README Fix problems section', () => {

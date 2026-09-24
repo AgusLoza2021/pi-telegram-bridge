@@ -56,7 +56,7 @@ Una ruta simple como `C:\pi-telegram-bridge` funciona bien.
 4. Cuando te lo pida, **pega el token del Paso 2**. La ventana oculta lo que pegas. El token queda en tu PC, guardado de forma cifrada (protegido para tu cuenta de Windows), y nunca se escribe ni se muestra en ningún otro lado.
 5. La ventana muestra un **código QR**. Abre la cámara del teléfono, apúntala al código; Telegram abre tu bot y tocas **Start**. El código contiene solo el nombre del bot y un código de emparejamiento de un solo uso — nunca el token.
 6. La ventana espera hasta un minuto. Cuando reconoce tu teléfono, te pide escribir **ENROLL** para confirmar. Nada se guarda hasta que lo hagas.
-7. Después de confirmar, la ventana instala un auxiliar dentro de Pi (queda inactivo hasta que tú vincules una ventana en el Paso 4), configura la conexión de fondo y la inicia por ti. A partir de ahí la manejás vos: el archivo `telegram` de tu carpeta la prende (`telegram on`), la apaga (`telegram off`) o te muestra cómo está (`telegram status`). Si la apagás, queda apagada incluso si reiniciás Windows.
+7. Después de confirmar, la ventana instala un auxiliar dentro de Pi (queda inactivo hasta que tú vincules una ventana en el Paso 4) y configura la conexión de fondo, pero **la deja apagada**: no arranca nada al iniciar sesión. Cuando la quieras usar, abrí un Símbolo del sistema en esta carpeta y escribí `telegram on`. A partir de ahí la manejás vos: `telegram off` la apaga y `telegram status` te muestra cómo está. Si la apagás, queda apagada incluso si reiniciás Windows; la prendés de nuevo con `telegram on`.
 
 Si algo falla, tu configuración anterior queda intacta y no se guarda nada a medias. Mira la sección "Los fallos más comunes" más abajo.
 
@@ -100,7 +100,7 @@ Para más síntomas y soluciones, mira la sección [Fix problems del README](REA
 | **`/tg`** | El comando que escribes dentro de una ventana de Pi para vincularla a tu teléfono (o desvincularla, con `/tg off`). |
 | **Ventana de Pi** | Una copia de Pi corriendo en una terminal. Puedes tener varias; cada una se vincula por separado. |
 | **Sesión / workspace** | Una sesión es una ventana de Pi viva que el puente conoce; el workspace es la carpeta de proyecto en la que esa ventana trabaja. El nombre de esa carpeta se convierte en la etiqueta legible que ves en el teléfono, como `Pi · mi-proyecto`. |
-| **La conexión de fondo** | Un programa pequeño que corre en silencio en tu PC y transporta mensajes entre Telegram y Pi. Está registrado como tarea programada de Windows, pero no arranca nada hasta que la prendés con `telegram on`; si la apagás con `telegram off`, sigue apagada después de reiniciar. Se comunica con Telegram mediante long polling. |
+| **La conexión de fondo** | Un programa pequeño que corre en silencio en tu PC y transporta mensajes entre Telegram y Pi. Está registrado como tarea programada de Windows, pero la configuración la registra deshabilitada y no la arranca: el modo Beginner nunca la habilita ni la arranca, y el modo avanzado te pregunta una vez al final y por defecto es No, así que no arranca nada al iniciar sesión si no la prendés vos: con `telegram on`, que la habilita y la arranca, o respondiendo que sí a esa única pregunta. Después la controlás vos: `telegram off` la detiene y la deshabilita, y una vez apagada sigue apagada después de reiniciar hasta que la prendés de nuevo. Se comunica con Telegram mediante long polling. |
 
 ## Saber más
 

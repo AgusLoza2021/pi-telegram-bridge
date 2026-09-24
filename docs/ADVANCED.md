@@ -50,7 +50,7 @@ The advanced flow performs these stages:
 1. **Protect the state directory.** It creates `.local/state/`, applies a user-only Windows ACL, and verifies the result before any secret exists.
 2. **Write nonsecret runtime identity.** It writes `runtime.json` with the validated instance ID and selective bridge mode. Existing configuration is backed up before replacement.
 3. **Enroll.** It reads the token with hidden input, validates the bot, refuses active webhooks, and pairs through a locally rendered QR code by default. The QR contains only the validated bot username and a fresh 128-bit nonce. Manual numeric ID entry is available as an advanced fallback. An explicit `ENROLL` confirmation is required before the atomic DPAPI credential commit.
-4. **Offer local installation.** It can install the global Pi extension, register the current-user scheduled task (always registered disabled), and start the broker. Unlike the beginner launcher, these choices are presented individually.
+4. **Offer local installation.** It can install the global Pi extension and register the current-user scheduled task (always registered disabled); registration never enables it, and setup asks once at the end whether to turn the connection on, with No as the default. Unlike the beginner launcher, these choices are presented individually.
 
 Abort before confirmation and the previous credentials and configuration remain unchanged.
 
@@ -75,7 +75,7 @@ The QR renderer is local-only computation. It does not call an online QR service
 
 The dedicated scheduled task is named `PiTelegramBridgeBroker`. It runs as the current interactive user with limited privileges, stores no Windows password, and pins the exact Node.js executable and repository paths captured at installation.
 
-The task is registered **disabled**. That enable bit is the connection switch: nothing runs at a sign-in until `telegram on`, and `telegram off` clears the bit again, so the connection stays off across restarts.
+The task is registered **disabled** by whichever setup path registers it: the Beginner path never enables or starts it, and the advanced path only asks once at the end whether to turn the connection on, with No as the default. Nothing starts at a sign-in unless you turn it on: with `telegram on`, or by answering yes to that single setup question. The enable bit is the connection switch: `telegram on` enables and starts the task, `telegram off` stops it and clears the bit again, and once it is off it stays off across sign-ins and restarts until you turn it on again.
 
 Once enabled, the task:
 

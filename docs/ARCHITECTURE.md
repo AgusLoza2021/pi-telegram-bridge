@@ -135,7 +135,7 @@ A generated `index.ts` binds that installation to the selected local state direc
 
 `PiTelegramBridgeBroker` runs as the current interactive user with limited privileges. The registered settings are verified after installation:
 
-- registered disabled: the on/off switch owns the enable bit, so a sign-in starts nothing until the owner turns the connection on;
+- registered disabled initially: the Beginner path never enables or starts it, the advanced path asks once at the end (default No), and the on/off switch owns the enable bit — once turned off with `telegram off`, a sign-in stays off until the owner runs `telegram on` again;
 - logon trigger for the current user;
 - no stop-on-idle or battery termination;
 - unlimited execution duration;

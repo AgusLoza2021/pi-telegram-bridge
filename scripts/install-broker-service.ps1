@@ -66,16 +66,21 @@ $action = New-ScheduledTaskAction -Execute $nodeExe `
 Register-ScheduledTask -TaskName $taskName -Trigger $trigger -Principal $principal `
     -Settings $settings -Action $action -Force | Out-Null
 
-# Read back what Task Scheduler actually persisted. A successful cmdlet call
-# must never hide an idle-stop/restart policy regression.
+# On-demand default: disable the freshly registered task immediately after
+# registering it, so a sign-in starts nothing even if the readback below
+# fails. Register-then-disable is the only route on PowerShell 5.1, and the
+# readback then observes a disabled task, which is the intended state.
+# Only an explicit owner action enables it again - the telegram switch, or
+# this installer's -Start - which is also why a missing credential can no
+# longer produce a logon failure loop: nothing runs at logon unless the
+# owner asked for it.
+Disable-ScheduledTask -TaskName $taskName | Out-Null
+
+# Read back what Task Scheduler actually persisted. A successful cmdlet
+# call must never hide an idle-stop/restart policy regression.
 $registeredTaskXml = Export-ScheduledTask -TaskName $taskName
 Assert-BrokerServiceTaskXml -TaskXml $registeredTaskXml | Out-Null
 
-# On-demand default: disable the freshly registered task so a sign-in
-# starts nothing. The switch is the only thing that enables it again,
-# which is also why a missing credential can no longer produce a logon
-# failure loop - nothing runs at logon unless the owner asked for it.
-Disable-ScheduledTask -TaskName $taskName | Out-Null
 $taskEnabled = $false
 
 $manifest = Write-BrokerServiceManifest -TaskName $taskName -NodeExe $nodeExe -ModuleRoot $moduleRoot `

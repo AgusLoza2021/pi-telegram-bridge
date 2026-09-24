@@ -295,12 +295,14 @@ function Copy-SelectiveDirectoryContents {
 <#
 .SYNOPSIS
 Shared reload/inert notice printed by install and uninstall: running Pi
-instances must /reload; NEW Pi instances auto-discover the extension
-but stay disconnected until a local /tg.
+instances must /reload; NEW Pi instances auto-discover the extension and
+start disconnected until the owner turns the phone connection on and
+links the window with /tg.
 #>
 function Write-SelectiveReloadNotice {
     Write-Host ''
     Write-Host 'NOTE: already-running Pi instances need /reload to pick up this change.'
     Write-Host 'New Pi instances auto-discover the extension and start DISCONNECTED:'
-    Write-Host 'nothing starts the broker or connects to Telegram until /tg is run locally.'
+    Write-Host 'nothing connects to Telegram until you turn the phone connection on, either with "telegram on" or with the start offer at the end of an advanced setup,'
+    Write-Host 'and /tg links this window once it is on.'
 }
