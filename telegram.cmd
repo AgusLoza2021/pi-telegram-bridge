@@ -10,11 +10,22 @@ rem
 rem   telegram on      connect now, for when you leave home
 rem   telegram off     disconnect and stay off, even after a restart
 rem   telegram status  show whether the connection is on
-powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "scripts\telegram.ps1" %*
+rem   (double-click)   open the interactive menu in scripts\telegram.ps1
+
+rem An explicit argument keeps the plain forwarding behavior, including the
+rem exit code.
+if not "%~1"=="" goto forward
+
+rem A double-click (no argument) opens the interactive menu instead.
+powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "scripts\telegram.ps1" -Menu
 set "SWITCH_EXIT=%ERRORLEVEL%"
 
-rem Started with no argument (a double-click) the switch prints the current
-rem state; pause so the window stays readable.
-if "%~1"=="" pause
+rem Pause so the window stays readable after the menu is quit.
+pause
+exit /b %SWITCH_EXIT%
+
+:forward
+powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "scripts\telegram.ps1" %*
+set "SWITCH_EXIT=%ERRORLEVEL%"
 
 exit /b %SWITCH_EXIT%
