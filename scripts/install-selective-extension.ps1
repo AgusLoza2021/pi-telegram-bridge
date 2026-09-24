@@ -26,7 +26,8 @@
 #   no credentials.
 # - The installed extension stays INERT: this script starts no process,
 #   never touches the broker or the scheduled task, and the extension
-#   connects nothing until /tg is run locally.
+#   connects nothing until the owner turns the phone connection on with
+#   "telegram on".
 
 param(
     [string]$StateDirectory

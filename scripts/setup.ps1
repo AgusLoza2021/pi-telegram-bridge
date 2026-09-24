@@ -15,7 +15,9 @@
 # declines the QR or pairing fails. After a SUCCESSFUL selective
 # enrollment it OFFERS - locally, via explicit prompts - the dedicated
 # installers for the global (inert) Pi extension and the current-user
-# broker scheduled task, and optionally starts the broker.
+# broker scheduled task; the task is always registered DISABLED, and the
+# start offer that follows defaults to No, so a bare Enter never starts
+# the connection.
 # -PrepareOnly never installs or starts anything.
 #
 # -LegacyHeadless: the pre-T06 headless flow, preserved verbatim as an
@@ -43,9 +45,12 @@
 #                    followups flag + legacy runtime.json shape); with
 #                    -PrepareOnly it keeps the old prepare-only behavior.
 #
-# The script never writes .env files, never autostarts anything by
-# itself, and never sends anything to Telegram except
-# getMe/getWebhookInfo/getUpdates. No credential is ever passed as an
+# The script never writes .env files, and never sends anything to Telegram except
+# getMe/getWebhookInfo/getUpdates. The Beginner path never starts, enables or
+# schedules the phone connection: it only registers the task, which stays
+# DISABLED. The advanced path never starts anything by itself either: only an
+# explicit y at its single start offer starts the connection. Turning it on is
+# always a separate, explicit owner action ("telegram on"). No credential is ever passed as an
 # argument: the token travels through stdin pipes only. The QR payload
 # is username+nonce ONLY and never contains the bot token; the nonce is
 # generated locally and never sent anywhere except inside the deep link
@@ -621,8 +626,10 @@ if ($Beginner) {
     $beginnerPiMissing = ($null -eq $piCommand -and -not (Test-Path -LiteralPath $piAgentDir))
 }
 
-# The double-click Beginner path performs the three dedicated component steps
-# only after explicit ENROLL. Child output is confined to the already locked,
+# The double-click Beginner path performs the two dedicated component steps
+# only after explicit ENROLL: it installs the extension and registers the
+# broker task DISABLED, and it never starts or enables the connection. Child
+# output is confined to the already locked,
 # ignored local state tree; only paths are passed to the child scripts, never
 # credentials or enrollment values. Stop on the first failure.
 if ($Beginner) {
@@ -635,8 +642,7 @@ if ($Beginner) {
     $componentLog = Join-Path $stateRoot 'logs\setup-components.log'
     $componentScripts = @(
         'install-selective-extension.ps1',
-        'install-broker-service.ps1',
-        'start-broker-service.ps1'
+        'install-broker-service.ps1'
     )
     foreach ($componentScript in $componentScripts) {
         $code = Invoke-SetupSubscript -ScriptName $componentScript `
@@ -650,9 +656,11 @@ if ($Beginner) {
 
 # --- post-enrollment offers (LOCAL prompts only; nothing automatic) ----------
 # Calls go through the dedicated scripts with PATH-ONLY arguments; no
-# credential ever appears in an argument, env var or file. -PrepareOnly
-# never reaches this point, so a prepare-only run can never install or
-# start anything globally.
+# credential ever appears in an argument, env var or file. Nothing here
+# runs on its own: the Beginner plan exits above and -PrepareOnly exits
+# before this point, so neither can ever install or start anything
+# globally. The start offer below is the only way setup starts the
+# connection, and it defaults to No.
 Write-Host ''
 Write-Host 'Optional local installation (you can also run these scripts later):'
 
@@ -679,16 +687,27 @@ if ($serviceAnswer -notmatch '^[nN]') {
     Write-Host 'Skipped. Install later with scripts/install-broker-service.ps1.'
 }
 
+# The start offer is the only automatic-adjacent choice setup makes, and it
+# defaults to No: a bare Enter or any non-y answer leaves the connection off.
+$brokerStarted = $false
 if ($serviceInstalled) {
-    $startAnswer = Read-Host 'Start the broker now? (Y/n)'
-    if ($startAnswer -notmatch '^[nN]') {
+    $startAnswer = Read-Host 'Turn the connection on now (it starts at sign-in until you run "telegram off")? (y/N)'
+    if ($startAnswer -match '^[yY]') {
         $code = Invoke-SetupSubscript -ScriptName 'start-broker-service.ps1' -ScriptStateDirectory $stateRoot
-        if ($code -ne 0) {
-            Write-Warning "the start script exited with code $code; run scripts/start-broker-service.ps1 manually later."
+        if ($code -eq 0) {
+            $brokerStarted = $true
+        } else {
+            Write-Warning "the start script exited with code $code; run `"telegram on`" later."
         }
     } else {
-        Write-Host 'Not started. Turn the connection on later with "telegram on" (or scripts/start-broker-service.ps1).'
+        Write-Host 'Skipped. Turn the connection on later with "telegram on".'
     }
+}
+
+if ($brokerStarted) {
+    Write-Host 'The connection is ON and starts at sign-in until you run "telegram off".'
+} else {
+    Write-Host 'The connection is OFF and nothing starts at sign-in. Turn it on when you want it with "telegram on".'
 }
 
 # --- summary -------------------------------------------------------------------
@@ -704,7 +723,7 @@ Write-Host '  - From the authorized Telegram chat: /sessions, /use <shortId>,'
 Write-Host '    /status, /send, /steer, /followup, /abort, /disconnect.'
 Write-Host '    Plain text prompts the selected TUI; final outputs only.'
 Write-Host '  - Phone connection on demand: telegram on | telegram off | telegram status'
-Write-Host '    (nothing connects at sign-in until you run "telegram on").'
+Write-Host '    (the task runs at sign-in only while enabled: "telegram on" enables and starts it, "telegram off" stops and disables it).'
 Write-Host '  - Service lifecycle: scripts/status-broker-service.ps1,'
 Write-Host '    start-broker-service.ps1, stop-broker-service.ps1,'
 Write-Host '    uninstall-broker-service.ps1.'

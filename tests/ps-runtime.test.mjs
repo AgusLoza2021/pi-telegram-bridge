@@ -620,7 +620,7 @@ describe('ps-runtime: launcher-only Beginner setup contract', () => {
       'the Beginner guard exits before the advanced numeric-id prompts');
   });
 
-  test('ENROLL and protected save precede the exact installer-task-start plan', () => {
+  test('ENROLL and protected save precede the exact installer-task plan', () => {
     const enroll = setupSource.indexOf("Read-Host 'Type ENROLL to save it on this PC");
     const protect = setupSource.indexOf("'src\\dpapi-credentials.mjs'", enroll);
     const beginnerPlan = setupSource.indexOf("if ($Beginner) {\n    Write-Host ''\n    Write-Host 'Finishing setup...'", protect);
@@ -630,9 +630,10 @@ describe('ps-runtime: launcher-only Beginner setup contract', () => {
     const plan = setupSource.slice(beginnerPlan, planEnd);
     const extension = plan.indexOf("'install-selective-extension.ps1'");
     const task = plan.indexOf("'install-broker-service.ps1'");
-    const start = plan.indexOf("'start-broker-service.ps1'");
-    assert.ok(extension >= 0 && task > extension && start > task,
-      'components must run in installer -> task -> start order');
+    assert.ok(extension >= 0 && task > extension,
+      'the Beginner plan must run the installer before the task registration');
+    assert.doesNotMatch(plan, /['"]start-broker-service\.ps1['"]/, 
+      'the Beginner plan must not contain the start script in any quoting style: setup never starts the connection');
     assert.match(plan, /-QuietLogPath \$componentLog/);
     assert.match(plan, /if \(\$code -ne 0\)[\s\S]*exit \$code/,
       'the plan stops on the first failing child');
@@ -662,11 +663,38 @@ describe('ps-runtime: launcher-only Beginner setup contract', () => {
     assert.match(setupSource, /\/telegram-disconnect and \/telegram-status/);
   });
 
+  test("the advanced start offer is guarded by $serviceInstalled, its prompt ends in (y/N), and the start call follows an explicit -match '^[yY]' test", () => {
+    const startCall = setupSource.indexOf("-ScriptName 'start-broker-service.ps1'");
+    assert.ok(startCall >= 0,
+      'the advanced offer must invoke the dedicated start script');
+    const guard = setupSource.lastIndexOf('if ($serviceInstalled)', startCall);
+    const promptSuffix = setupSource.lastIndexOf('(y/N)', startCall);
+    const yesTest = setupSource.lastIndexOf("-match '^[yY]'", startCall);
+    assert.ok(guard >= 0 && guard < promptSuffix,
+      'the offer must be guarded by $serviceInstalled so it is never reached when the task was not registered');
+    assert.ok(promptSuffix >= 0 && promptSuffix < yesTest,
+      'the prompt must end in (y/N) before the answer test, so a bare Enter leaves the connection off');
+    assert.ok(yesTest >= 0 && yesTest < startCall,
+      "the start call must sit inside the -match '^[yY]' branch, so only an explicit yes reaches it");
+    assert.match(setupSource,
+      /Turn the connection on now \(it starts at sign-in until you run "telegram off"\)\? \(y\/N\)/,
+      'the offer prompt must name the sign-in behavior and default to No');
+    assert.doesNotMatch(setupSource.slice(promptSuffix, startCall), /-notmatch '\^\[nN\]'/,
+      'the start branch must not use the old Enter-means-yes default');
+    assert.match(setupSource, /The connection is ON and starts at sign-in until you run "telegram off"\./,
+      'the summary must state the started case');
+  });
+
   test('installed-extension guidance promotes /tg while preserving advanced registration', () => {
     assert.match(installerSource, /inert until local \/tg/);
     assert.doesNotMatch(installerSource, /inert until local \/telegram-connect/);
     assert.match(commonSource, /registers \/tg plus the advanced/);
     assert.match(commonSource, /\/telegram-connect, \/telegram-disconnect and \/telegram-status/);
-    assert.match(commonSource, /until \/tg is run locally/);
+    assert.match(commonSource, /Write-Host 'nothing connects to Telegram until you turn the phone connection on, either with "telegram on" or with the start offer at the end of an advanced setup,'/,
+      'the printed guidance must name both ways to turn the phone connection on');
+    assert.match(commonSource, /Write-Host 'and \/tg links this window once it is on\.'/,
+      'the printed guidance must still tell the owner that /tg links the window');
+    assert.doesNotMatch(commonSource, /until \/tg is run locally/,
+      'the removed /tg-only notice line must not come back');
   });
 });

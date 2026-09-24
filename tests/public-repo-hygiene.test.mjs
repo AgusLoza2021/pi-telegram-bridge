@@ -168,4 +168,263 @@ describe('public repository hygiene', () => {
       assert.doesNotMatch(text, /repository-url/, `${document} must not keep a pre-publication placeholder`);
     }
   });
+
+  test('the Beginner plan never starts the connection and the single start call sits inside the guarded (y/N) offer, with block containment proven by statement-line indentation', () => {
+    const setup = read('scripts/setup.ps1');
+    // The Beginner plan slice: from its marker line up to the post-enrollment
+    // offers region. Adding the start script to the Beginner $componentScripts
+    // array makes this fail.
+    const beginnerPlanStart = setup.indexOf("Write-Host 'Finishing setup...'");
+    const offersStart = setup.indexOf('# --- post-enrollment offers', beginnerPlanStart);
+    assert.ok(beginnerPlanStart >= 0 && offersStart > beginnerPlanStart,
+      'the Beginner plan slice and the post-enrollment offers region must both exist');
+    const beginnerPlan = setup.slice(beginnerPlanStart, offersStart);
+    // Strongest honest textual ban: any split or partially quoted reference
+    // still leaves the fragment 'start-broker' inside at least one literal
+    // token (e.g. ('start-broker' + '-service.ps1')), so the ban is
+    // case-insensitive on that fragment instead of the whole filename.
+    // Residual evasion a textual guard cannot close: a split where no single
+    // token contains 'start-broker' (e.g. ('start-br' + 'oker-service.ps1'))
+    // or a name assembled from variables/format strings.
+    assert.doesNotMatch(beginnerPlan, /start-broker/i,
+      'the Beginner plan must not reference the start script by any fragment containing start-broker (a split literal must fail): the Beginner path can never start the connection');
+    // Wherever setup.ps1 invokes the start script, that invocation must sit
+    // after an explicit `-match '^[yY]'` answer test behind a `(y/N)` prompt,
+    // never behind the old Enter-means-yes `-notmatch '^[nN]'` default.
+    // Quote-agnostic exactly-once count: single quotes, double quotes, any
+    // whitespace after -ScriptName, any casing. A second invocation in
+    // another quoting style must fail this just like a duplicated single-
+    // quoted one.
+    const startCallMatches = [...setup.matchAll(/-ScriptName\s+(['"])start-broker-service\.ps1\1/gi)];
+    assert.equal(startCallMatches.length, 1,
+      'setup must invoke the start script exactly once, in any quoting style, inside the single guarded (y/N) offer');
+    const startCall = startCallMatches[0].index;
+    assert.match(setup, /Turn the connection on now \(it starts at sign-in until you run "telegram off"\)\? \(y\/N\)/,
+      'the start offer prompt must name the sign-in behavior and default to No');
+    const promptSuffix = setup.lastIndexOf('(y/N)', startCall);
+    const yesTest = setup.lastIndexOf("-match '^[yY]'", startCall);
+    assert.ok(promptSuffix >= 0 && promptSuffix < startCall, 'the start offer prompt must end in (y/N) before the start call');
+    const legacyDefaultYes = setup.indexOf("-notmatch '^[nN]'", promptSuffix);
+    assert.ok(legacyDefaultYes < 0 || legacyDefaultYes > startCall,
+      'the old Enter-means-yes default must not sit between the start prompt and the start call');
+    assert.ok(yesTest >= 0 && yesTest < startCall, 'the start call must follow an explicit yes answer test');
+    assert.ok(promptSuffix < yesTest, 'the start offer prompt must end in (y/N) before the yes answer test');
+    assert.doesNotMatch(setup, /Start the broker now\?/, 'the old unconditional start prompt must not survive in setup');
+    // Containment proof (indentation-based). The ordering checks above prove
+    // only that the prompt, the yes test and the start call appear in that
+    // order; the unchanged start call moved AFTER the answer-test block's
+    // closing brace still satisfies every one of them. Prove block
+    // containment through this file's own indentation style instead: the
+    // start call line must be indented strictly deeper than the
+    // `if ($startAnswer -match '^[yY]')` line, which in turn must be
+    // indented strictly deeper than the `if ($serviceInstalled) {` line, so
+    // a call moved outside either block fails. Leading-whitespace width
+    // only (tabs count as four columns); no brace matching. Residual a
+    // textual guard cannot close: a deliberately misindented unguarded call
+    // outside the block would still pass this containment proof.
+    const lines = setup.split(/\r?\n/);
+    const lineIndexOf = (charIndex) => setup.slice(0, charIndex).split(/\r?\n/).length - 1;
+    const indentWidth = (line) => ((line.match(/^[ \t]*/) ?? [''])[0].replaceAll('\t', '    ')).length;
+    const startCallLineIndex = lineIndexOf(startCall);
+    const answerLineIndex = lineIndexOf(yesTest);
+    const serviceGuardLineIndex = lines
+      .slice(0, answerLineIndex)
+      .findLastIndex((line) => /^\s*if \(\$serviceInstalled\) \{/.test(line));
+    assert.ok(serviceGuardLineIndex >= 0,
+      "the guarded offer must sit inside an 'if ($serviceInstalled)' block");
+    assert.ok(indentWidth(lines[answerLineIndex]) > indentWidth(lines[serviceGuardLineIndex]),
+      "the 'if ($startAnswer -match ^[yY])' line must be indented strictly deeper than the 'if ($serviceInstalled)' line: containment is proven by indentation width only, and a deliberately misindented unguarded call would still pass");
+    assert.ok(indentWidth(lines[startCallLineIndex]) > indentWidth(lines[answerLineIndex]),
+      "the start call line must be indented strictly deeper than the 'if ($startAnswer -match ^[yY])' line, i.e. inside the answer-test block: containment is proven by indentation width only, and a deliberately misindented unguarded call would still pass");
+    // The answer variable must be assigned exactly once in the region that
+    // starts at the live prompt statement and ends at the start call, so
+    // inserting `$startAnswer = 'y'` immediately before the call (a silent
+    // default-yes override) is caught here.
+    const promptLineIndex = lines
+      .findIndex((line) => /^\s*\$startAnswer\s*=\s*Read-Host 'Turn the connection on now /.test(line));
+    assert.ok(promptLineIndex >= 0 && promptLineIndex < startCallLineIndex,
+      'the live prompt statement must precede the start call');
+    const offerRegion = lines.slice(promptLineIndex, startCallLineIndex + 1).join('\n');
+    const assignmentCount = (offerRegion.match(/\$startAnswer\s*=/g) ?? []).length;
+    assert.equal(assignmentCount, 1,
+      "$startAnswer must be assigned exactly once between the live prompt statement and the start call, so an inserted $startAnswer = 'y' default-yes override cannot slip through");
+  });
+
+  test('the start offer is live code, not a comment: the prompt and the default-No answer test must be real statement lines with no default-yes form between prompt and start call', () => {
+    const setup = read('scripts/setup.ps1');
+    const startCallMatches = [...setup.matchAll(/-ScriptName\s+(['"])start-broker-service\.ps1\1/gi)];
+    assert.equal(startCallMatches.length, 1,
+      'setup must invoke the start script exactly once, in any quoting style');
+    const startCall = startCallMatches[0].index;
+    // The live prompt must be a real statement line. A whole-file text search
+    // is satisfied by a commented-out copy of the sentence, so anchor the
+    // match to the start of the $startAnswer assignment itself: a commented
+    // copy begins with '#' and cannot match.
+    const promptStatement = /^[ \t]*\$startAnswer\s*=\s*Read-Host 'Turn the connection on now \(it starts at sign-in until you run "telegram off"\)\? \(y\/N\)'[ \t]*$/m.exec(setup);
+    assert.ok(promptStatement,
+      'the live prompt must be a real $startAnswer = Read-Host statement line ending in (y/N); a commented copy of the sentence does not count');
+    // The answer test must be a real if statement line (block-opening brace
+    // allowed on the same line), so a reworded live test such as
+    // "-eq '' -or -match '^[yY]'" cannot masquerade as the default-No guard.
+    const answerStatement = /^[ \t]*if \(\$startAnswer -match '\^\[yY\]'\)[ \t]*\{?[ \t]*$/m.exec(setup);
+    assert.ok(answerStatement,
+      'the answer test must be a real line-initial if ($startAnswer -match ^[yY]) statement so a bare Enter cannot start the broker');
+    assert.ok(promptStatement.index < answerStatement.index && answerStatement.index < startCall,
+      'the prompt statement must precede the default-No answer test, which must precede the single start call');
+    // Between the prompt and the single start call, ban every default-yes
+    // form: each of these keeps a bare Enter (or a non-y answer) starting the
+    // broker while the screen still shows (y/N).
+    const guardedSlice = setup.slice(promptStatement.index, startCall);
+    for (const [pattern, label] of [
+      [/-notmatch/i, "-notmatch (the Enter-means-yes default)"],
+      [/-eq\s*(''|"")/, "-eq '' (the empty-answer-means-yes default)"],
+      [/-or\b/, '-or (a combined yes-default condition)'],
+      [/-and\b/, '-and (a combined condition)'],
+      [/-notin\b/i, '-notin'],
+      [/IsNullOrEmpty/i, 'IsNullOrEmpty (the empty-answer-means-yes default)'],
+      [/\[string\]::/i, 'a [string]:: helper'],
+      [/!\s*\(\s*\$startAnswer/, 'a negated $startAnswer condition'],
+      [/if \(\$startAnswer -match '\^\[nN\]'\)/, "a positive -match '^[nN]' gate (its else branch would start on a bare Enter)"],
+    ]) {
+      assert.doesNotMatch(guardedSlice, pattern,
+        `the guarded offer must not contain ${label} between the prompt and the start call`);
+    }
+  });
+
+  test('every post-enrollment offer invocation names its script with a quoted literal', () => {
+    // Evasion closed here: a SECOND start invocation that assigns the script
+    // name to a variable first (e.g. $startBrokerScript =
+    // 'start-broker-service.ps1' ... -ScriptName $startBrokerScript) keeps
+    // the exactly-once quoted-literal count for the start script at 1 while
+    // starting the connection with no prompt. In the post-enrollment offers
+    // region, every Invoke-SetupSubscript call occurrence must name its
+    // script with a quoted literal: the number of call occurrences must
+    // equal the number of quoted-literal -ScriptName arguments. A variable
+    // or computed argument cannot satisfy this count.
+    const setup = read('scripts/setup.ps1');
+    const offersStart = setup.indexOf('# --- post-enrollment offers');
+    const summaryStart = setup.indexOf('# --- summary', offersStart);
+    assert.ok(offersStart >= 0 && summaryStart > offersStart,
+      'the post-enrollment offers region and the summary marker must both exist');
+    const offers = setup.slice(offersStart, summaryStart);
+    const callCount = (offers.match(/Invoke-SetupSubscript/g) ?? []).length;
+    const literalCount = (offers.match(/-ScriptName\s+(['"])[^'"]*\1/g) ?? []).length;
+    assert.ok(callCount > 0, 'the offers region must invoke the dedicated subscript helper');
+    assert.equal(callCount, literalCount,
+      "every Invoke-SetupSubscript call in the post-enrollment offers region must name its script with a quoted literal (-ScriptName '...'): a variable or computed argument cannot satisfy this count, so a second start invocation through a variable fails here");
+  });
+
+  test('the setup summary states the connection state and the enable/disable switch semantics', () => {
+    const setup = read('scripts/setup.ps1');
+    // Statement-line anchors (same anchoring style as the live start-offer
+    // prompt above): a whole-file text search is satisfied by commenting out
+    // the live summary line and printing different wording, so both summary
+    // lines must be real `Write-Host '...'` statement lines with the exact
+    // shipped wording. A commented-out copy starts with '#' and cannot match.
+    assert.match(setup, /^[ \t]*Write-Host 'The connection is OFF and nothing starts at sign-in\. Turn it on when you want it with "telegram on"\.'[ \t]*$/m,
+      'the OFF summary must be a real Write-Host statement line (a commented-out copy or a reworded live line does not count): the summary must tell the owner when the connection was left off');
+    assert.match(setup, /^[ \t]*Write-Host 'The connection is ON and starts at sign-in until you run "telegram off"\.'[ \t]*$/m,
+      'the ON summary must be a real Write-Host statement line (a commented-out copy or a reworded live line does not count): the summary must tell the owner when the start offer turned the connection on');
+    assert.match(setup, /runs at sign-in only while enabled/,
+      'the summary must state the conditional sign-in lifecycle');
+    assert.match(setup, /"telegram on" enables and starts it, "telegram off" stops and disables it/,
+      'the summary must state the enable/disable switch semantics');
+  });
+
+  test('the docs state the per-path connection lifecycle and no stale auto-start claim survives', () => {
+    const advanced = read('docs/ADVANCED.md');
+    assert.match(advanced,
+      /registered \*\*disabled\*\* by whichever setup path registers it: the Beginner path never enables or starts it, and the advanced path only asks once at the end/,
+      'ADVANCED must scope the disabled registration and the per-path start behavior');
+    assert.match(advanced, /with No as the default/,
+      'ADVANCED must state the advanced start offer default (No)');
+    assert.match(advanced,
+      /Nothing starts at a sign-in unless you turn it on: with `telegram on`, or by answering yes to that single setup question/,
+      'ADVANCED must state that nothing starts at sign-in unless the owner turns it on');
+    assert.match(advanced, /`telegram on`[^.]*enables and starts/,
+      'ADVANCED must document telegram on as enable + start');
+    assert.match(advanced, /`telegram off`[^.]*stops it and clears/,
+      'ADVANCED must document telegram off as stop + disable');
+    assert.match(advanced, /stays off across sign-ins and restarts/,
+      'ADVANCED must keep the stays-off-across-restarts behavior');
+
+    const architecture = read('docs/ARCHITECTURE.md');
+    assert.match(architecture,
+      /registered disabled initially: the Beginner path never enables or starts it, the advanced path asks once at the end \(default No\)/,
+      'ARCHITECTURE must scope the task model per path (Beginner never, advanced asks once with default No)');
+    assert.match(architecture,
+      /once turned off with `telegram off`[^;]*sign-in stays off until the owner runs `telegram on` again/,
+      'ARCHITECTURE must state the post-off sign-in behavior');
+
+    const readme = read('README.md');
+    const glossaryRow = readme.split('\n').find((line) => line.includes('**The background connection**'));
+    assert.ok(glossaryRow, 'the README glossary must keep the background connection row');
+    assert.match(glossaryRow, /beginner setup registers it DISABLED and leaves it off/,
+      'the README glossary must scope the disabled-and-off promise to the beginner setup');
+    assert.match(glossaryRow, /advanced setup asks once at the end.*with No as the default/,
+      'the README glossary must state the advanced start offer and its No default');
+    assert.match(glossaryRow, /nothing starts at a sign-in unless you turn it on/,
+      'the README glossary must state that nothing starts at sign-in unless the owner turns it on');
+
+    // Stale claims this fix removed must not survive in any of these files.
+    for (const [document, text] of [
+      ['README.md', readme],
+      ['QUICKSTART.es.md', read('QUICKSTART.es.md')],
+      ['docs/ADVANCED.md', advanced],
+      ['docs/ARCHITECTURE.md', architecture],
+    ]) {
+      assert.doesNotMatch(text, /choose \*\*Yes\*\* to start now/,
+        `${document} must not claim a Yes answer starts the connection now`);
+      assert.doesNotMatch(text, /It then asks whether to start the connection now/,
+        `${document} must not claim setup asks whether to start the connection now`);
+      assert.doesNotMatch(text, /Start the broker now\?/,
+        `${document} must not keep the old start prompt`);
+      assert.doesNotMatch(text, /Setup turns it on in one of two ways/,
+        `${document} must not keep the two-ways auto-start claim`);
+    }
+    assert.doesNotMatch(read('QUICKSTART.es.md'), /no arranca nada hasta que la prend\u00e9s con `telegram on`/,
+      'QUICKSTART.es must not keep the old glossary auto-start claim');
+  });
+
+  test('the Spanish glossary row keeps the turn-on/turn-off semantics', () => {
+    const quickstart = read('QUICKSTART.es.md');
+    const glossaryRow = quickstart.split('\n').find((line) => line.includes('**La conexi\u00f3n de fondo**'));
+    assert.ok(glossaryRow, 'the Spanish glossary must keep the background connection row');
+    assert.match(glossaryRow, /`telegram on`[^.]*la habilita y la arranca/,
+      'the Spanish row must document telegram on as enable + start');
+    assert.match(glossaryRow, /`telegram off`[^.]*la detiene y la deshabilita/,
+      'the Spanish row must document telegram off as stop + disable');
+    assert.match(glossaryRow, /sigue apagada despu\u00e9s de reiniciar/,
+      'the Spanish row must keep the restart behavior');
+  });
+
+  test('the README quick-start step 5 turns the connection on before sending the reader to /tg', () => {
+    const readme = read('README.md');
+    const step5 = readme.split('\n').find((line) => /^5\. /.test(line));
+    assert.ok(step5, 'the README quick-start must keep a step 5');
+    assert.match(step5, /run `telegram on` there, then open Pi, run `\/tg`/,
+      'step 5 must sequence `telegram on` before opening Pi and /tg');
+    assert.doesNotMatch(readme, /^5\. Open Pi, run `\/tg`, choose \*\*Connect\*\*/m,
+      'the old bare step 5 (which never turned the connection on) must not survive');
+  });
+
+  test('the Spanish quick-start step 7 states the connection is left off and bans the auto-start claim', () => {
+    const quickstart = read('QUICKSTART.es.md');
+    const step7 = quickstart.split('\n').find((line) => /^7\. /.test(line));
+    assert.ok(step7, 'the Spanish quick-start must keep a step 7');
+    assert.match(step7, /pero \*\*la deja apagada\*\*/,
+      'step 7 must state setup leaves the background connection off');
+    assert.doesNotMatch(quickstart, /la inicia por ti/,
+      'the old auto-start claim must not survive in the Spanish quick-start');
+  });
+
+  test('the advanced stage 4 states registration never enables the connection and bans the start-the-broker claim', () => {
+    const advanced = read('docs/ADVANCED.md');
+    const stage4 = advanced.split('\n').find((line) => /^4\. \*\*Offer local installation\.\*\*/.test(line));
+    assert.ok(stage4, 'the advanced lifecycle must keep stage 4');
+    assert.match(stage4, /registration never enables it, and setup asks once at the end whether to turn the connection on, with No as the default/,
+      'stage 4 must state registration never enables the connection and the end-of-setup offer defaults to No');
+    assert.doesNotMatch(advanced, /\(always registered disabled\), and start the broker/i,
+      'the old start-the-broker claim must not survive in ADVANCED');
+  });
 });
