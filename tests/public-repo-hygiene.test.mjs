@@ -179,15 +179,26 @@ describe('public repository hygiene', () => {
     assert.ok(beginnerPlanStart >= 0 && offersStart > beginnerPlanStart,
       'the Beginner plan slice and the post-enrollment offers region must both exist');
     const beginnerPlan = setup.slice(beginnerPlanStart, offersStart);
-    assert.doesNotMatch(beginnerPlan, /['"]start-broker-service\.ps1['"']/,
-      'the Beginner plan must contain no start-script reference in any quoting style: the Beginner path can never start the connection');
+    // Strongest honest textual ban: any split or partially quoted reference
+    // still leaves the fragment 'start-broker' inside at least one literal
+    // token (e.g. ('start-broker' + '-service.ps1')), so the ban is
+    // case-insensitive on that fragment instead of the whole filename.
+    // Residual evasion a textual guard cannot close: a split where no single
+    // token contains 'start-broker' (e.g. ('start-br' + 'oker-service.ps1'))
+    // or a name assembled from variables/format strings.
+    assert.doesNotMatch(beginnerPlan, /start-broker/i,
+      'the Beginner plan must not reference the start script by any fragment containing start-broker (a split literal must fail): the Beginner path can never start the connection');
     // Wherever setup.ps1 invokes the start script, that invocation must sit
     // after an explicit `-match '^[yY]'` answer test behind a `(y/N)` prompt,
     // never behind the old Enter-means-yes `-notmatch '^[nN]'` default.
-    const startCall = setup.indexOf("-ScriptName 'start-broker-service.ps1'");
-    assert.ok(startCall >= 0, 'the advanced start offer must invoke the dedicated start script');
-    assert.equal((setup.match(/-ScriptName 'start-broker-service\.ps1'/g) ?? []).length, 1,
-      'setup must invoke the start script exactly once, inside the single guarded (y/N) offer');
+    // Quote-agnostic exactly-once count: single quotes, double quotes, any
+    // whitespace after -ScriptName, any casing. A second invocation in
+    // another quoting style must fail this just like a duplicated single-
+    // quoted one.
+    const startCallMatches = [...setup.matchAll(/-ScriptName\s+(['"])start-broker-service\.ps1\1/gi)];
+    assert.equal(startCallMatches.length, 1,
+      'setup must invoke the start script exactly once, in any quoting style, inside the single guarded (y/N) offer');
+    const startCall = startCallMatches[0].index;
     assert.match(setup, /Turn the connection on now \(it starts at sign-in until you run "telegram off"\)\? \(y\/N\)/,
       'the start offer prompt must name the sign-in behavior and default to No');
     const promptSuffix = setup.lastIndexOf('(y/N)', startCall);
@@ -199,6 +210,47 @@ describe('public repository hygiene', () => {
     assert.ok(yesTest >= 0 && yesTest < startCall, 'the start call must follow an explicit yes answer test');
     assert.ok(promptSuffix < yesTest, 'the start offer prompt must end in (y/N) before the yes answer test');
     assert.doesNotMatch(setup, /Start the broker now\?/, 'the old unconditional start prompt must not survive in setup');
+  });
+
+  test('the start offer is live code, not a comment: the prompt and the default-No answer test must be real statement lines with no default-yes form between prompt and start call', () => {
+    const setup = read('scripts/setup.ps1');
+    const startCallMatches = [...setup.matchAll(/-ScriptName\s+(['"])start-broker-service\.ps1\1/gi)];
+    assert.equal(startCallMatches.length, 1,
+      'setup must invoke the start script exactly once, in any quoting style');
+    const startCall = startCallMatches[0].index;
+    // The live prompt must be a real statement line. A whole-file text search
+    // is satisfied by a commented-out copy of the sentence, so anchor the
+    // match to the start of the $startAnswer assignment itself: a commented
+    // copy begins with '#' and cannot match.
+    const promptStatement = /^[ \t]*\$startAnswer\s*=\s*Read-Host 'Turn the connection on now \(it starts at sign-in until you run "telegram off"\)\? \(y\/N\)'[ \t]*$/m.exec(setup);
+    assert.ok(promptStatement,
+      'the live prompt must be a real $startAnswer = Read-Host statement line ending in (y/N); a commented copy of the sentence does not count');
+    // The answer test must be a real if statement line (block-opening brace
+    // allowed on the same line), so a reworded live test such as
+    // "-eq '' -or -match '^[yY]'" cannot masquerade as the default-No guard.
+    const answerStatement = /^[ \t]*if \(\$startAnswer -match '\^\[yY\]'\)[ \t]*\{?[ \t]*$/m.exec(setup);
+    assert.ok(answerStatement,
+      'the answer test must be a real line-initial if ($startAnswer -match ^[yY]) statement so a bare Enter cannot start the broker');
+    assert.ok(promptStatement.index < answerStatement.index && answerStatement.index < startCall,
+      'the prompt statement must precede the default-No answer test, which must precede the single start call');
+    // Between the prompt and the single start call, ban every default-yes
+    // form: each of these keeps a bare Enter (or a non-y answer) starting the
+    // broker while the screen still shows (y/N).
+    const guardedSlice = setup.slice(promptStatement.index, startCall);
+    for (const [pattern, label] of [
+      [/-notmatch/i, "-notmatch (the Enter-means-yes default)"],
+      [/-eq\s*(''|"")/, "-eq '' (the empty-answer-means-yes default)"],
+      [/-or\b/, '-or (a combined yes-default condition)'],
+      [/-and\b/, '-and (a combined condition)'],
+      [/-notin\b/i, '-notin'],
+      [/IsNullOrEmpty/i, 'IsNullOrEmpty (the empty-answer-means-yes default)'],
+      [/\[string\]::/i, 'a [string]:: helper'],
+      [/!\s*\(\s*\$startAnswer/, 'a negated $startAnswer condition'],
+      [/if \(\$startAnswer -match '\^\[nN\]'\)/, "a positive -match '^[nN]' gate (its else branch would start on a bare Enter)"],
+    ]) {
+      assert.doesNotMatch(guardedSlice, pattern,
+        `the guarded offer must not contain ${label} between the prompt and the start call`);
+    }
   });
 
   test('the setup summary states the connection state and the enable/disable switch semantics', () => {

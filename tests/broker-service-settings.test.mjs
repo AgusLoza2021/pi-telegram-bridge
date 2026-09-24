@@ -203,4 +203,33 @@ describe('broker service task settings', () => {
     assert.ok(disable < assertTask,
       'the disable must run before the fail-closed verification (Assert-BrokerServiceTaskXml)');
   });
+
+  test('installer never enables or starts the task by itself: no Enable-/Start-ScheduledTask anywhere and the single Start-BrokerServiceTask call sits positionally inside the if ($Start) block', () => {
+    // Text-level proof. The Beginner plan runs this installer WITHOUT -Start,
+    // so the disable-then-maybe-start design only holds if the helper
+    // Start-BrokerServiceTask (which enables AND starts) is reachable from
+    // inside the if ($Start) block alone. A direct Enable-ScheduledTask or
+    // Start-ScheduledTask call anywhere in the file would reintroduce a
+    // logon-enabled task after the Beginner path, so both cmdlet names are
+    // banned in any casing or quoting style (a quoted or differently cased
+    // invocation still contains the cmdlet name verbatim).
+    const lowered = INSTALLER_SOURCE.toLowerCase();
+    assert.ok(!lowered.includes('enable-scheduledtask'),
+      'the installer must never call Enable-ScheduledTask: it would re-enable the task the Beginner path must leave off');
+    assert.ok(!lowered.includes('start-scheduledtask'),
+      'the installer must never call Start-ScheduledTask directly: only Start-BrokerServiceTask inside the -Start guard may start the task');
+    const callMatches = [...INSTALLER_SOURCE.matchAll(/Start-BrokerServiceTask/g)];
+    assert.equal(callMatches.length, 1,
+      'Start-BrokerServiceTask must appear exactly once in the installer');
+    const callIndex = callMatches[0].index;
+    const blockStart = INSTALLER_SOURCE.indexOf('if ($Start) {');
+    assert.ok(blockStart >= 0 && callIndex > blockStart,
+      'the Start-BrokerServiceTask call must sit after the if ($Start) line');
+    // Positional containment: the first column-0 '}' after the guard opens is
+    // the end of that block (the block body is indented), so the call must sit
+    // before it, not merely somewhere after the guard line.
+    const blockEnd = blockStart + INSTALLER_SOURCE.slice(blockStart).search(/^}/m);
+    assert.ok(blockEnd > callIndex,
+      'the Start-BrokerServiceTask call must sit inside the if ($Start) block, before its closing brace');
+  });
 });
