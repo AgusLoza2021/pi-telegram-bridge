@@ -18,6 +18,11 @@ param(
     [ValidateSet('on', 'off', 'status')]
     [string]$Action = 'status',
 
+    # Turns a double-click into an interactive menu. It never changes the
+    # on/off semantics: every menu action re-invokes this same script as a
+    # child process, so the switch below stays the only implementation.
+    [switch]$Menu,
+
     [string]$StateDirectory
 )
 
@@ -28,6 +33,10 @@ $ErrorActionPreference = 'Stop'
 
 $stateRoot = Resolve-BridgeStateDirectory -StateDirectory $StateDirectory
 $taskName = Get-BrokerServiceTaskName
+
+# The menu always opens with the current state: it routes through the real
+# status path below instead of carrying a second status implementation.
+if ($Menu) { $Action = 'status' }
 
 if ($Action -eq 'status') {
     $switchTask = Get-BrokerServiceTask -TaskName $taskName
@@ -103,4 +112,30 @@ if ($Action -eq 'off') {
     }
     Write-Host 'CONNECTION: OFF - the broker stopped and the task is disabled; nothing will start at sign-in.'
     exit 0
+}
+
+if ($Menu) {
+    if ([Console]::IsInputRedirected) {
+        # A redirected caller cannot answer a prompt: the status report above
+        # is the whole interaction, so leave instead of spinning on input
+        # that will never arrive.
+        exit 0
+    }
+    while ($true) {
+        Write-Host ''
+        Write-Host 'What do you want to do?'
+        Write-Host '  1 - turn the connection ON'
+        Write-Host '  2 - turn the connection OFF'
+        Write-Host '  3 - show the connection status'
+        Write-Host '  4 - quit'
+        $choice = Read-Host 'Choose 1-4'
+        if ($choice -eq '1' -or $choice -eq '2' -or $choice -eq '3') {
+            $childAction = @{ '1' = 'on'; '2' = 'off'; '3' = 'status' }[$choice]
+            & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $PSCommandPath $childAction
+            Write-Host "(that action finished with exit code $LASTEXITCODE)"
+        } elseif ($choice -eq '4') {
+            exit 0
+        }
+        # An empty or invalid answer simply falls back to the prompt above.
+    }
 }

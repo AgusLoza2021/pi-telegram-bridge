@@ -89,6 +89,7 @@ Once enabled, the task:
 telegram on                           # enable the task and start the broker; fails closed if credentials are missing
 telegram off                          # graceful stop, then disable, so the connection stays off across sign-ins
 telegram status                       # read-only: is the connection on, and is the broker live?
+telegram.cmd (double-click)           # opens an interactive menu: the state first, then turn on/off, status, quit
 scripts/status-broker-service.ps1     # task state and credential-free broker health; add -Json for scripts
 scripts/start-broker-service.ps1      # enable and start; wait for a fresh heartbeat; reuse a live broker
 scripts/stop-broker-service.ps1       # request graceful instance-bound shutdown, then disable; never kill an arbitrary PID
