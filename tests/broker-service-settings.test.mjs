@@ -212,12 +212,23 @@ describe('broker service task settings', () => {
     // Start-ScheduledTask call anywhere in the file would reintroduce a
     // logon-enabled task after the Beginner path, so both cmdlet names are
     // banned in any casing or quoting style (a quoted or differently cased
-    // invocation still contains the cmdlet name verbatim).
+    // invocation still contains the cmdlet name verbatim). Residual a
+    // text-level ban cannot close: a cmdlet name assembled at runtime (for
+    // example & ('Enable-' + 'ScheduledTask')) never contains the banned
+    // substring in the source text.
     const lowered = INSTALLER_SOURCE.toLowerCase();
     assert.ok(!lowered.includes('enable-scheduledtask'),
       'the installer must never call Enable-ScheduledTask: it would re-enable the task the Beginner path must leave off');
     assert.ok(!lowered.includes('start-scheduledtask'),
       'the installer must never call Start-ScheduledTask directly: only Start-BrokerServiceTask inside the -Start guard may start the task');
+    // The same evasion through an external tool: appending e.g.
+    // `schtasks.exe /Change /TN $taskName /ENABLE` (or /Run) re-enables or
+    // starts the task while every cmdlet ban above still passes. The
+    // external tool name is banned in any casing; the ScheduledTasks module
+    // is the only supported route to enable, run or start the task in this
+    // file.
+    assert.ok(!lowered.includes('schtasks'),
+      'the installer must never invoke schtasks in any casing: the ScheduledTasks module is the only supported route to enable or start the task there');
     const callMatches = [...INSTALLER_SOURCE.matchAll(/Start-BrokerServiceTask/g)];
     assert.equal(callMatches.length, 1,
       'Start-BrokerServiceTask must appear exactly once in the installer');

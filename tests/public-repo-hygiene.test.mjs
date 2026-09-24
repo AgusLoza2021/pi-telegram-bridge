@@ -169,7 +169,7 @@ describe('public repository hygiene', () => {
     }
   });
 
-  test('the Beginner plan never starts the connection and setup starts it at most once behind a guarded (y/N) offer', () => {
+  test('the Beginner plan never starts the connection and the single start call sits inside the guarded (y/N) offer, with block containment proven by statement-line indentation', () => {
     const setup = read('scripts/setup.ps1');
     // The Beginner plan slice: from its marker line up to the post-enrollment
     // offers region. Adding the start script to the Beginner $componentScripts
@@ -210,6 +210,44 @@ describe('public repository hygiene', () => {
     assert.ok(yesTest >= 0 && yesTest < startCall, 'the start call must follow an explicit yes answer test');
     assert.ok(promptSuffix < yesTest, 'the start offer prompt must end in (y/N) before the yes answer test');
     assert.doesNotMatch(setup, /Start the broker now\?/, 'the old unconditional start prompt must not survive in setup');
+    // Containment proof (indentation-based). The ordering checks above prove
+    // only that the prompt, the yes test and the start call appear in that
+    // order; the unchanged start call moved AFTER the answer-test block's
+    // closing brace still satisfies every one of them. Prove block
+    // containment through this file's own indentation style instead: the
+    // start call line must be indented strictly deeper than the
+    // `if ($startAnswer -match '^[yY]')` line, which in turn must be
+    // indented strictly deeper than the `if ($serviceInstalled) {` line, so
+    // a call moved outside either block fails. Leading-whitespace width
+    // only (tabs count as four columns); no brace matching. Residual a
+    // textual guard cannot close: a deliberately misindented unguarded call
+    // outside the block would still pass this containment proof.
+    const lines = setup.split(/\r?\n/);
+    const lineIndexOf = (charIndex) => setup.slice(0, charIndex).split(/\r?\n/).length - 1;
+    const indentWidth = (line) => ((line.match(/^[ \t]*/) ?? [''])[0].replaceAll('\t', '    ')).length;
+    const startCallLineIndex = lineIndexOf(startCall);
+    const answerLineIndex = lineIndexOf(yesTest);
+    const serviceGuardLineIndex = lines
+      .slice(0, answerLineIndex)
+      .findLastIndex((line) => /^\s*if \(\$serviceInstalled\) \{/.test(line));
+    assert.ok(serviceGuardLineIndex >= 0,
+      "the guarded offer must sit inside an 'if ($serviceInstalled)' block");
+    assert.ok(indentWidth(lines[answerLineIndex]) > indentWidth(lines[serviceGuardLineIndex]),
+      "the 'if ($startAnswer -match ^[yY])' line must be indented strictly deeper than the 'if ($serviceInstalled)' line: containment is proven by indentation width only, and a deliberately misindented unguarded call would still pass");
+    assert.ok(indentWidth(lines[startCallLineIndex]) > indentWidth(lines[answerLineIndex]),
+      "the start call line must be indented strictly deeper than the 'if ($startAnswer -match ^[yY])' line, i.e. inside the answer-test block: containment is proven by indentation width only, and a deliberately misindented unguarded call would still pass");
+    // The answer variable must be assigned exactly once in the region that
+    // starts at the live prompt statement and ends at the start call, so
+    // inserting `$startAnswer = 'y'` immediately before the call (a silent
+    // default-yes override) is caught here.
+    const promptLineIndex = lines
+      .findIndex((line) => /^\s*\$startAnswer\s*=\s*Read-Host 'Turn the connection on now /.test(line));
+    assert.ok(promptLineIndex >= 0 && promptLineIndex < startCallLineIndex,
+      'the live prompt statement must precede the start call');
+    const offerRegion = lines.slice(promptLineIndex, startCallLineIndex + 1).join('\n');
+    const assignmentCount = (offerRegion.match(/\$startAnswer\s*=/g) ?? []).length;
+    assert.equal(assignmentCount, 1,
+      "$startAnswer must be assigned exactly once between the live prompt statement and the start call, so an inserted $startAnswer = 'y' default-yes override cannot slip through");
   });
 
   test('the start offer is live code, not a comment: the prompt and the default-No answer test must be real statement lines with no default-yes form between prompt and start call', () => {
@@ -253,12 +291,40 @@ describe('public repository hygiene', () => {
     }
   });
 
+  test('every post-enrollment offer invocation names its script with a quoted literal', () => {
+    // Evasion closed here: a SECOND start invocation that assigns the script
+    // name to a variable first (e.g. $startBrokerScript =
+    // 'start-broker-service.ps1' ... -ScriptName $startBrokerScript) keeps
+    // the exactly-once quoted-literal count for the start script at 1 while
+    // starting the connection with no prompt. In the post-enrollment offers
+    // region, every Invoke-SetupSubscript call occurrence must name its
+    // script with a quoted literal: the number of call occurrences must
+    // equal the number of quoted-literal -ScriptName arguments. A variable
+    // or computed argument cannot satisfy this count.
+    const setup = read('scripts/setup.ps1');
+    const offersStart = setup.indexOf('# --- post-enrollment offers');
+    const summaryStart = setup.indexOf('# --- summary', offersStart);
+    assert.ok(offersStart >= 0 && summaryStart > offersStart,
+      'the post-enrollment offers region and the summary marker must both exist');
+    const offers = setup.slice(offersStart, summaryStart);
+    const callCount = (offers.match(/Invoke-SetupSubscript/g) ?? []).length;
+    const literalCount = (offers.match(/-ScriptName\s+(['"])[^'"]*\1/g) ?? []).length;
+    assert.ok(callCount > 0, 'the offers region must invoke the dedicated subscript helper');
+    assert.equal(callCount, literalCount,
+      "every Invoke-SetupSubscript call in the post-enrollment offers region must name its script with a quoted literal (-ScriptName '...'): a variable or computed argument cannot satisfy this count, so a second start invocation through a variable fails here");
+  });
+
   test('the setup summary states the connection state and the enable/disable switch semantics', () => {
     const setup = read('scripts/setup.ps1');
-    assert.match(setup, /The connection is OFF and nothing starts at sign-in\./,
-      'the summary must tell the owner when the connection was left off');
-    assert.match(setup, /The connection is ON and starts at sign-in until you run "telegram off"\./,
-      'the summary must tell the owner when the start offer turned the connection on');
+    // Statement-line anchors (same anchoring style as the live start-offer
+    // prompt above): a whole-file text search is satisfied by commenting out
+    // the live summary line and printing different wording, so both summary
+    // lines must be real `Write-Host '...'` statement lines with the exact
+    // shipped wording. A commented-out copy starts with '#' and cannot match.
+    assert.match(setup, /^[ \t]*Write-Host 'The connection is OFF and nothing starts at sign-in\. Turn it on when you want it with "telegram on"\.'[ \t]*$/m,
+      'the OFF summary must be a real Write-Host statement line (a commented-out copy or a reworded live line does not count): the summary must tell the owner when the connection was left off');
+    assert.match(setup, /^[ \t]*Write-Host 'The connection is ON and starts at sign-in until you run "telegram off"\.'[ \t]*$/m,
+      'the ON summary must be a real Write-Host statement line (a commented-out copy or a reworded live line does not count): the summary must tell the owner when the start offer turned the connection on');
     assert.match(setup, /runs at sign-in only while enabled/,
       'the summary must state the conditional sign-in lifecycle');
     assert.match(setup, /"telegram on" enables and starts it, "telegram off" stops and disables it/,
