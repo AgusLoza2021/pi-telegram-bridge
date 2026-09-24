@@ -36,6 +36,7 @@ Before changing public behavior, read the [architecture](docs/ARCHITECTURE.md), 
 
 - Preserve exact user-and-chat authorization, private-chat-only routing, outbound polling, DPAPI CurrentUser, ACL confinement, and process-local `/tg` opt-in.
 - Remote input may call only typed Pi operations. Never add CMD, PowerShell, shell, arbitrary process, MCP, or generic tool execution from Telegram.
+- The one Git exception stays exactly as narrow as documented in [SECURITY.md](SECURITY.md): closed typed `/commit` and `/push` operations with one-use, snapshot-bound approval cards; a staged-only commit with the fixed message; a push limited to the current branch's configured upstream with an explicit refspec, no force, no tag expansion, and `--atomic`. Never widen the argv, accept a command string, or bypass the drift revalidation.
 - Send only finalized assistant text. Never forward hidden reasoning, tool calls/results, context, or token deltas.
 - Never place tokens, IDs, QR/nonces, prompts, outputs, credentials, databases, logs, manifests, or real absolute user paths in source, fixtures, issues, screenshots, or commits.
 - Keep dependency versions locked. New dependencies need a concrete reason, license review, and install-script review.

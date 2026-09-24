@@ -55,6 +55,19 @@
 //   Uncertain deliveries stay unacknowledged and are retried whole (a
 //   duplicate notice is acceptable; lost output is not), and a delivery
 //   failure is never converted into another command.
+// - Git proposal approvals (G2) are memory-only and one-use: the broker
+//   holds at most ONE pending approval behind an opaque random token that
+//   binds BOTH its buttons (v1:g:<token> approves, v1:X:<token> cancels);
+//   a restart, a newer proposal, or a single tap of either button
+//   invalidates every earlier approval callback, and a stale callback
+//   dispatches nothing. Consuming a token ALSO acknowledges its exact
+//   proposal event inside the same store transaction, so an uncertain
+//   Telegram send can never leave a consumed proposal alive as a
+//   re-renderable event. Only the
+//   closed typed git_commit/git_push request/execute command kinds and
+//   the git_proposal event kind cross the store — never a command string
+//   or Git argv. Commit and push are separate approvals, and the automatic
+//   commit text is shown exactly on the approval card.
 // - No credentials, tokens, URLs or raw payloads are ever logged: logging
 //   is bounded, code-only.
 
@@ -91,6 +104,13 @@ const CALLBACK_DISCONNECT_ASK_RE = /^v1:d:([a-z0-9]{3,32})$/;
 const CALLBACK_DISCONNECT_CONFIRM_RE = /^v1:D:([a-z0-9]{3,32})$/;
 const CALLBACK_CHOOSER_RE = /^v1:c$/;
 const CALLBACK_CANCEL_RE = /^v1:C$/;
+// G2 one-use Git approval callbacks: the opaque token stands in for the
+// whole proposal (operation, proposal id, message); it never carries them.
+// The SAME token binds both buttons — v1:g: approves, v1:X: cancels and
+// consumes — so a cancel tap can only ever clear the proposal it was
+// rendered with, never a newer one.
+const CALLBACK_GIT_APPROVE_RE = /^v1:g:([0-9a-f]{16,64})$/;
+const CALLBACK_GIT_CANCEL_RE = /^v1:X:([0-9a-f]{16,64})$/;
 const CALLBACK_MAX_DATA_BYTES = 64;
 const REFRESH_BUTTON_TEXT = 'Refresh';
 // T03b busy-decision button labels: readable outcomes only; short ids stay
@@ -138,6 +158,10 @@ function parseCallbackData(data) {
   }
   const discard = CALLBACK_DISCARD_RE.exec(data);
   if (discard !== null) return { action: 'discard', pendingId: discard[1] };
+  const gitApprove = CALLBACK_GIT_APPROVE_RE.exec(data);
+  if (gitApprove !== null) return { action: 'git_approve', token: gitApprove[1] };
+  const gitCancel = CALLBACK_GIT_CANCEL_RE.exec(data);
+  if (gitCancel !== null) return { action: 'git_cancel', token: gitCancel[1] };
   const status = CALLBACK_STATUS_RE.exec(data);
   if (status !== null) return { action: 'status_cb', shortId: status[1] };
   const stop = CALLBACK_STOP_RE.exec(data);
@@ -172,6 +196,8 @@ const ACK_TEXT = {
   followup: 'Follow-up queued.',
   abort: 'Abort queued.',
   disconnect: 'Disconnect requested.',
+  git_commit_request: 'Commit requested.',
+  git_push_request: 'Push requested.',
 };
 
 const MULTIPLE_LIVE_SESSIONS_NOTICE =
@@ -288,6 +314,12 @@ export class SelectiveTelegramBroker {
   #pendingReplies = [];
   /** Broker-memory pending prompt {pendingId, text}; a restart loses it fail-closed. */
   #pendingPrompt = null;
+  /**
+   * Broker-memory pending Git approval {token, operation, proposalId,
+   * message, trackingId, eventId}; a restart loses it fail-closed. The
+   * token is the ONLY thing that ever rides in callback_data.
+   */
+  #pendingGitApproval = null;
   /** Bounded callback ids waiting for a best-effort answerCallbackQuery. */
   #pendingAnswers = [];
 
@@ -465,6 +497,14 @@ export class SelectiveTelegramBroker {
             }
           }
           if (plan.reply !== null) this.#queueReply(plan.reply);
+          if (Array.isArray(plan.acknowledgeEventIds) && plan.acknowledgeEventIds.length > 0) {
+            // G2 one-use durability: consuming an approval or cancel token
+            // retires its exact proposal event in THIS transaction, so no
+            // later drain or restart can re-render it with a fresh token.
+            // A stale token never reaches this field, so a newer proposal
+            // is never acknowledged by someone else's tap.
+            this.#store.acknowledgeTuiEvents({ eventIds: plan.acknowledgeEventIds });
+          }
         }
       } else if (type === 'message') {
         try {
@@ -640,6 +680,10 @@ export class SelectiveTelegramBroker {
         return this.#planBusyAbortPrompt(parsed, answerId);
       case 'discard':
         return this.#planBusyDiscard(parsed, answerId);
+      case 'git_approve':
+        return this.#planGitApprove(parsed, answerId);
+      case 'git_cancel':
+        return this.#planGitCancel(parsed, answerId);
       case 'status_cb':
         return this.#planSidCommand(parsed, 'status', answerId);
       case 'stop':
@@ -768,6 +812,78 @@ export class SelectiveTelegramBroker {
         },
       ],
       clearPending: true,
+    };
+  }
+
+  /**
+   * v1:X — the proposal-scoped cancel tap. It consumes the pending
+   * approval ONLY when its token still matches the CURRENT one: a stale
+   * cancel (older card, pre-restart) never invalidates a newer proposal.
+   * No command is ever enqueued; the generic v1:C cancel keeps its
+   * non-consuming behavior for every other card.
+   */
+  #planGitCancel(parsed, answerId) {
+    const pending = this.#pendingGitApproval;
+    if (pending === null || pending.token !== parsed.token) {
+      this.#log('callback_git_cancel_stale');
+      return { answerId, reply: { text: copy.gitApprovalStale }, command: null };
+    }
+    this.#pendingGitApproval = null;
+    this.#log('callback_git_cancelled');
+    return {
+      answerId,
+      reply: { text: copy.CANCEL_NOTICE },
+      acknowledgeEventIds: [pending.eventId],
+      command: null,
+    };
+  }
+
+  /**
+   * v1:g — the one-use Git approval tap. Unknown, consumed, replaced or
+   * pre-restart tokens dispatch NOTHING. A matching token is consumed
+   * before anything else happens (one-use), then the closed typed execute
+   * command (proposalId payload only) is enqueued to the still-live
+   * proposing session; a dead proposing session fails closed because its
+   * snapshot-bound proposal can never execute.
+   */
+  #planGitApprove(parsed, answerId) {
+    const pending = this.#pendingGitApproval;
+    if (pending === null || pending.token !== parsed.token) {
+      this.#log('callback_git_approval_stale');
+      return { answerId, reply: { text: copy.gitApprovalStale }, command: null };
+    }
+    // One-use: consume the approval first, so a concurrent or repeated tap
+    // can never dispatch the proposal twice.
+    this.#pendingGitApproval = null;
+    const session = this.#liveByTrackingId(pending.trackingId);
+    if (session === null) {
+      this.#log('callback_git_target_not_live');
+      // The matching token was consumed, so the exact proposal event is
+      // retired in this transaction too: an uncertain original send can
+      // never be re-rendered as a fresh approval. No command is dispatched.
+      return {
+        answerId,
+        reply: { text: copy.gitApprovalStale },
+        acknowledgeEventIds: [pending.eventId],
+        command: null,
+      };
+    }
+    const commit = pending.operation === 'commit';
+    return {
+      answerId,
+      reply: null,
+      acknowledgeEventIds: [pending.eventId],
+      command: {
+        trackingId: pending.trackingId,
+        kind: commit ? 'git_commit_execute' : 'git_push_execute',
+        payload: { proposalId: pending.proposalId },
+        ackReply: {
+          text: commit
+            ? copy.gitApprovedCommit(session.label)
+            : copy.gitApprovedPush(session.label),
+        },
+        staleReply: { text: copy.sessionGone(session.label) },
+      },
     };
   }
 
@@ -922,6 +1038,10 @@ export class SelectiveTelegramBroker {
         return this.#planRouted(args, 'abort');
       case 'disconnect':
         return this.#planRouted(args, 'disconnect');
+      case 'commit':
+        return this.#planRouted(args, 'git_commit_request');
+      case 'push':
+        return this.#planRouted(args, 'git_push_request');
       default:
         // MSG-E4: an unknown slash command is friendly guidance, never a
         // stack trace or jargon (BEGINNER_UX.md section 11).
@@ -1462,6 +1582,49 @@ export class SelectiveTelegramBroker {
         return {
           text: copy.eventCommandResult(label, ok, payload.resultCode),
           replyMarkup: null,
+        };
+      }
+      case 'git_proposal': {
+        const operation = payload.operation === 'commit' || payload.operation === 'push'
+          ? payload.operation
+          : null;
+        const proposalId = typeof payload.proposalId === 'string' ? payload.proposalId : null;
+        // G3: optional for push (snapshot summary), required for commit
+        // (the exact automatic commit text).
+        const message = typeof payload.message === 'string'
+          ? clip(payload.message, MAX_TEXT_CHARS)
+          : null;
+        if (operation === null || proposalId === null || (operation === 'commit' && message === null)) {
+          // Malformed proposals are acknowledged without being sent; the
+          // store contract should have rejected them long before.
+          return null;
+        }
+        // Latest proposal wins: a fresh event replaces any pending
+        // approval, which makes every earlier token stale. A re-render of
+        // the SAME event (uncertain send, retried whole) keeps its token,
+        // so an already-delivered card never goes stale on retry.
+        if (
+          this.#pendingGitApproval === null
+          || this.#pendingGitApproval.eventId !== event.eventId
+        ) {
+          this.#pendingGitApproval = {
+            token: randomBytes(16).toString('hex'),
+            operation,
+            proposalId,
+            message,
+            trackingId: event.trackingId,
+            eventId: event.eventId,
+          };
+        }
+        const pending = this.#pendingGitApproval;
+        return {
+          text: pending.operation === 'commit'
+            ? copy.gitApprovalCommitCard(label, pending.message)
+            : copy.gitApprovalPushCard(label, pending.message),
+          replyMarkup: { inline_keyboard: [[
+            { text: copy.BUTTON_APPROVE, callback_data: `v1:g:${pending.token}` },
+            { text: copy.CANCEL_BUTTON, callback_data: `v1:X:${pending.token}` },
+          ]] },
         };
       }
       default:

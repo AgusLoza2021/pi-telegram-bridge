@@ -38,9 +38,18 @@ const ACTIVE_STATES = Object.freeze(['running', 'waiting_decision', 'resuming'])
 export const TUI_SESSION_STATES = Object.freeze(['connected', 'busy', 'waiting']);
 export const TUI_COMMAND_KINDS = Object.freeze([
   'prompt', 'steer', 'followup', 'abort', 'status', 'disconnect',
+  // Git approval protocol (G2): two closed typed operations, each with a
+  // request phase (owner-initiated proposal) and an execute phase (one-use
+  // approval dispatch). Payloads carry only the opaque proposalId — never
+  // a command string, argv or any Git argument.
+  'git_commit_request', 'git_commit_execute', 'git_push_request', 'git_push_execute',
 ]);
 export const TUI_EVENT_KINDS = Object.freeze([
   'connected', 'disconnected', 'status', 'final_output', 'command_result',
+  // A proposal published by the extension for the owner's one-use Telegram
+  // approval. Payload: { operation: 'commit'|'push', proposalId } plus the
+  // EXACT automatic commit message for a commit proposal, nothing else.
+  'git_proposal',
 ]);
 
 // Allowed forward transitions; everything else fails closed.
@@ -142,6 +151,18 @@ function assertTuiCode(value, name) {
   return value;
 }
 
+// Git approval protocol (G2): the proposalId is an opaque slug minted by
+// the extension, carried verbatim between the proposal event and the
+// execute command. It is never a command, path or argument — only this
+// closed hex shape is accepted.
+const GIT_PROPOSAL_ID_RE = /^[0-9a-f]{16,64}$/;
+
+function assertGitProposalId(value) {
+  if (typeof value !== 'string' || !GIT_PROPOSAL_ID_RE.test(value)) {
+    throw new TypeError('proposalId must match /^[0-9a-f]{16,64}$/');
+  }
+}
+
 function assertTuiCommandPayload(kind, payload) {
   switch (kind) {
     case 'prompt':
@@ -159,6 +180,21 @@ function assertTuiCommandPayload(kind, payload) {
     case 'status':
       if (payload === null) return;
       assertPlainObject(payload, 'payload');
+      return;
+    case 'git_commit_request':
+    case 'git_push_request':
+      // Closed request: no fields at all — anything else fails closed.
+      if (payload !== null) {
+        throw new TypeError('git request command payload must be null');
+      }
+      return;
+    case 'git_commit_execute':
+    case 'git_push_execute':
+      assertPlainObject(payload, 'payload');
+      if (Object.keys(payload).length !== 1) {
+        throw new TypeError('git execute payload must carry exactly one field: proposalId');
+      }
+      assertGitProposalId(payload.proposalId);
       return;
     default:
       throw new TypeError('unknown tui command kind');
@@ -185,6 +221,34 @@ function assertTuiEventPayload(kind, payload) {
       if (payload.text !== undefined) assertTuiText(payload.text, 'payload.text');
       if (payload.resultCode !== undefined) assertTuiCode(payload.resultCode, 'payload.resultCode');
       return;
+    case 'git_proposal': {
+      assertPlainObject(payload, 'payload');
+      const fields = Object.keys(payload).sort().join(',');
+      if (payload.operation === 'commit') {
+        if (fields !== 'message,operation,proposalId') {
+          throw new TypeError(
+            'a commit proposal carries exactly operation, proposalId and message',
+          );
+        }
+        assertGitProposalId(payload.proposalId);
+        assertTuiText(payload.message, 'payload.message');
+        return;
+      }
+      if (payload.operation === 'push') {
+        // G3: the message is OPTIONAL on push proposals; when present it is
+        // the bounded snapshot summary (branch, upstream, HEAD, fingerprint)
+        // shown on the approval card — never a command or argv.
+        if (fields !== 'operation,proposalId' && fields !== 'message,operation,proposalId') {
+          throw new TypeError(
+            "a push proposal carries exactly operation and proposalId, plus an optional message",
+          );
+        }
+        assertGitProposalId(payload.proposalId);
+        if (payload.message !== undefined) assertTuiText(payload.message, 'payload.message');
+        return;
+      }
+      throw new TypeError("payload.operation must be 'commit' or 'push'");
+    }
     default:
       throw new TypeError('unknown tui event kind');
   }

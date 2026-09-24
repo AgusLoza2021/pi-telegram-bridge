@@ -18,6 +18,9 @@ const MAX_TEXT_CHARS = 4000;
 const MAX_EVENTS_PER_POLL = 32;
 const MAX_COMMANDS_PER_POLL = 8;
 const DEFAULT_STALE_AFTER_MS = 30000;
+// Closed Git proposal id shape (G2): the store enforces the same regex,
+// validated here too so the extension gets an immediate, local TypeError.
+const GIT_PROPOSAL_ID_RE = /^[0-9a-f]{16,64}$/;
 
 export class TuiBridgeClient {
   /**
@@ -107,6 +110,41 @@ export class TuiBridgeClient {
     return this.#store.appendTuiEvent({
       trackingId,
       kind: 'status',
+      payload,
+      connectionId,
+    });
+  }
+
+  /**
+   * Publish one bounded Git proposal event (G2 closed contract): a typed
+   * operation ('commit' | 'push') with an opaque proposal id and, for a
+   * commit, the EXACT automatic commit message the owner must see on the
+   * approval card. G3: a push proposal may carry an optional bounded
+   * snapshot summary (branch, upstream, HEAD, fingerprint) shown on its
+   * card. No command string, argv or Git argument ever crosses this
+   * boundary; every malformed shape throws before persistence.
+   */
+  publishGitProposal({ trackingId, connectionId, operation, proposalId, message }) {
+    if (operation !== 'commit' && operation !== 'push') {
+      throw new TypeError("operation must be 'commit' or 'push'");
+    }
+    if (typeof proposalId !== 'string' || !GIT_PROPOSAL_ID_RE.test(proposalId)) {
+      throw new TypeError('proposalId must match /^[0-9a-f]{16,64}$/');
+    }
+    const payload = { operation, proposalId };
+    if (message !== undefined) {
+      if (typeof message !== 'string' || message.length === 0 || message.length > MAX_TEXT_CHARS) {
+        throw new TypeError(
+          `message must be a non-empty string of at most ${MAX_TEXT_CHARS} chars`,
+        );
+      }
+      payload.message = message;
+    } else if (operation === 'commit') {
+      throw new TypeError('commit proposals must carry the exact commit message');
+    }
+    return this.#store.appendTuiEvent({
+      trackingId,
+      kind: 'git_proposal',
       payload,
       connectionId,
     });

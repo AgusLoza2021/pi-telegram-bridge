@@ -49,17 +49,29 @@ const msgC3Unavailable = (bareLabel) =>
   `This Pi is linked as 'Pi · ${bareLabel}', but the phone connection on this PC isn't running right now. Run ".\\telegram on" in the Pi Telegram folder, then try again.`;
 const TEST_INSTANCE_ID = 'a'.repeat(32);
 
-/** Duck-typed ExtensionAPI: records commands, events, sends and tools. */
+/** Duck-typed ExtensionAPI: records commands, events, sends, tools and exec. */
 function makePi() {
   const commands = new Map();
   const eventHandlers = new Map();
   const sentMessages = [];
   const toolRegistrations = [];
-  return {
+  const execCalls = [];
+  const pi = {
     commands,
     eventHandlers,
     sentMessages,
     toolRegistrations,
+    execCalls,
+    /** Per-test fake Git implementation; absent impl makes pi.exec throw. */
+    execImpl: null,
+    /** The ONLY process-spawning surface; tests must never hit real Git. */
+    async exec(command, args, options) {
+      execCalls.push({ command, args, options });
+      if (typeof pi.execImpl !== 'function') {
+        throw new Error('fake pi.exec called without an execImpl');
+      }
+      return pi.execImpl(command, args, options);
+    },
     registerCommand(name, definition) { commands.set(name, definition); },
     registerTool(tool) { toolRegistrations.push(tool); },
     on(event, handler) {
@@ -72,6 +84,7 @@ function makePi() {
       }
     },
   };
+  return pi;
 }
 
 /**
@@ -133,7 +146,7 @@ function writeBrokerHealthFixture(stateDirectory, state = 'live') {
  * context. Cleanup is idempotent: the advanced disconnect is invoked (a
  * no-op when not connected) and the process-global opt-in flag is cleared.
  */
-function makeFixture({ credentials = true, brokerState = 'live', cwd, idle, selectAnswer } = {}) {
+function makeFixture({ credentials = true, brokerState = 'live', cwd, idle, selectAnswer, gitProposalTtlMs } = {}) {
   const dir = mkdtempSync(join(TEST_RUNS, 'ext-t05-'));
   const stateDirectory = join(dir, 'state');
   if (credentials) {
@@ -141,7 +154,7 @@ function makeFixture({ credentials = true, brokerState = 'live', cwd, idle, sele
     writeFileSync(join(stateDirectory, 'credentials.bin'), 'presence-only-placeholder');
     writeBrokerHealthFixture(stateDirectory, brokerState);
   }
-  const extension = new SelectiveTuiBridgeExtension(stateDirectory);
+  const extension = new SelectiveTuiBridgeExtension(stateDirectory, { gitProposalTtlMs });
   const pi = makePi();
   extension.register(pi);
   const context = makeCtx({ cwd, idle, selectAnswer });
@@ -774,5 +787,833 @@ describe('no model involvement and factory wiring', () => {
     } finally {
       delete globalThis[OPT_IN_KEY];
     }
+  });
+});
+
+// --- G3: remote Git commit/push (snapshot-bound, fixed argv, fail closed) ----
+
+const FIXED_COMMIT_MESSAGE = 'chore: update project files';
+const GIT_PROPOSAL_ID_RE = /^[0-9a-f]{16,64}$/;
+
+/**
+ * Fake Git: answers ONLY the fixed read-only snapshot shapes the extension
+ * is allowed to run. Anything else returns success with empty output, so
+ * unexpected argv is still visible in execCalls. No real Git process is
+ * ever spawned.
+ */
+function gitScript(overrides = {}) {
+  const o = {
+    toplevel: 'C:/proj/demo-project\n',
+    branch: 'main\n',
+    head: 'a'.repeat(40) + '\n',
+    // Repo state AFTER the modeled mutation: the new commit's parent is the
+    // approved head, its subject is the fixed message, and the upstream
+    // tracking ref resolves to the approved head. Overrides model drift.
+    parentSha: 'a'.repeat(40) + '\n',
+    subject: FIXED_COMMIT_MESSAGE + '\n',
+    remoteRefSha: 'a'.repeat(40) + '\n',
+    patch: 'diff --git a/x.txt b/x.txt\nindex 111..222 100644\n',
+    shortstat: ' 1 file changed, 1 insertion(+)\n',
+    upstream: 'origin/main\n',
+    ahead: '2\n',
+    // Full staged-index listing as `git ls-files --stage -z` would report
+    // it; overrides model a different staged index (blob id / mode / path).
+    indexListing: `100644 ${'1'.repeat(40)} 0\tx.txt\0`,
+    ...overrides,
+  };
+  return async (_command, args) => {
+    const a = args.join(' ');
+    const out = (stdout) => ({ code: 0, stdout, stderr: '', killed: false });
+    const fail = () => ({ code: 128, stdout: '', stderr: 'fatal: fake', killed: false });
+    if (a === 'rev-parse --show-toplevel') return o.toplevel === null ? fail() : out(o.toplevel);
+    if (a === 'rev-parse --abbrev-ref HEAD') return o.branch === null ? fail() : out(o.branch);
+    if (a === 'rev-parse HEAD') return o.head === null ? fail() : out(o.head);
+    if (a === 'rev-parse HEAD^') return o.parentSha === null ? fail() : out(o.parentSha);
+    if (a === 'log -1 --pretty=%s HEAD') return o.subject === null ? fail() : out(o.subject);
+    if (a === 'rev-parse refs/remotes/origin/main') {
+      return o.remoteRefSha === null ? fail() : out(o.remoteRefSha);
+    }
+    if (a === 'ls-files --stage -z') {
+      return o.indexListing === null ? fail() : out(o.indexListing);
+    }
+    if (args[0] === 'diff' && args.includes('--shortstat')) {
+      return o.shortstat === null ? fail() : out(o.shortstat);
+    }
+    if (args[0] === 'diff' && args.includes('--cached')) {
+      return o.patch === null ? fail() : out(o.patch);
+    }
+    if (a === 'rev-parse --abbrev-ref --symbolic-full-name @{u}') {
+      return o.upstream === null ? fail() : out(o.upstream);
+    }
+    if (a === 'rev-list @{u}..HEAD --count') return o.ahead === null ? fail() : out(o.ahead);
+    return out('');
+  };
+}
+
+/** Connect via /tg, wire the fake Git impl, and return the session row. */
+async function connectGitFixture({ idle = true, execImpl = gitScript(), gitProposalTtlMs } = {}) {
+  const fx = makeFixture({ selectAnswer: 'Connect', idle, gitProposalTtlMs });
+  await fx.run('tg', '');
+  const p = fx.probe();
+  const session = p.sessions()[0];
+  p.close();
+  fx.pi.execImpl = execImpl;
+  return { fx, session };
+}
+
+function enqueueGitCommand(fx, session, kind, payload = null) {
+  const p = fx.probe();
+  const res = p.store.enqueueTuiCommand({ trackingId: session.trackingId, kind, payload });
+  p.close();
+  assert.equal(res.ok, true);
+}
+
+function pendingEvents(fx, kind) {
+  const p = fx.probe();
+  const events = p.store.listPendingBrokerTuiEvents({ limit: 128 }).filter((e) => e.kind === kind);
+  p.close();
+  return events;
+}
+
+function commandResults(fx) {
+  return pendingEvents(fx, 'command_result').map((e) => e.payload);
+}
+
+function latestProposalId(fx) {
+  const events = pendingEvents(fx, 'git_proposal');
+  return events.length > 0 ? events[events.length - 1].payload.proposalId : null;
+}
+
+describe('G3: /commit request builds a snapshot-bound commit proposal', () => {
+  test('the proposal message leads with the exact fixed commit message and the snapshot lines', async () => {
+    const { fx, session } = await connectGitFixture();
+    try {
+      enqueueGitCommand(fx, session, 'git_commit_request');
+      await fx.extension.pollOnce();
+      const proposals = pendingEvents(fx, 'git_proposal');
+      assert.equal(proposals.length, 1);
+      const payload = proposals[0].payload;
+      assert.equal(payload.operation, 'commit');
+      assert.match(payload.proposalId, GIT_PROPOSAL_ID_RE);
+      assert.ok(
+        payload.message.startsWith(FIXED_COMMIT_MESSAGE),
+        'the automatic commit text must lead the card body exactly',
+      );
+      assert.ok(payload.message.includes('Branch: main'));
+      assert.ok(payload.message.includes('1 file changed, 1 insertion(+)'));
+      assert.match(payload.message, /Fingerprint: [0-9a-f]{16}/);
+      const results = commandResults(fx);
+      assert.equal(results.length, 1, 'exactly one terminal result per command');
+      assert.equal(results[0].ok, true);
+    } finally { await fx.cleanup(); }
+  });
+
+  test('every Git call goes through pi.exec as argv with a bounded timeout and the connection cwd', async () => {
+    const { fx, session } = await connectGitFixture();
+    try {
+      enqueueGitCommand(fx, session, 'git_commit_request');
+      await fx.extension.pollOnce();
+      assert.ok(fx.pi.execCalls.length > 0);
+      for (const call of fx.pi.execCalls) {
+        assert.equal(call.command, 'git');
+        assert.ok(Array.isArray(call.args));
+        assert.equal(call.options.cwd, 'C:/proj/demo-project');
+        assert.equal(typeof call.options.timeout, 'number');
+        assert.ok(call.options.timeout > 0 && call.options.timeout <= 60_000);
+      }
+    } finally { await fx.cleanup(); }
+  });
+
+  test('every diff invocation explicitly forbids external diff/textconv helpers and the index is read via ls-files --stage -z', async () => {
+    const { fx, session } = await connectGitFixture();
+    try {
+      enqueueGitCommand(fx, session, 'git_commit_request');
+      await fx.extension.pollOnce();
+      assert.ok(fx.pi.execCalls.length > 0);
+      let sawListing = false;
+      for (const call of fx.pi.execCalls) {
+        assert.equal(call.command, 'git');
+        assert.equal(call.args.includes('-c'), false, 'no per-invocation config overrides');
+        assert.equal(call.args.includes('--ext-diff'), false);
+        assert.equal(call.args.includes('--textconv'), false);
+        if (call.args[0] === 'diff') {
+          assert.ok(call.args.includes('--no-ext-diff'),
+            'a configured external diff driver must never run');
+          assert.ok(call.args.includes('--no-textconv'),
+            'a configured textconv filter must never run');
+        }
+        if (call.args[0] === 'ls-files') {
+          sawListing = true;
+          assert.deepEqual(call.args, ['ls-files', '--stage', '-z'],
+            'the staged index must be captured as a compact deterministic listing');
+        }
+      }
+      assert.equal(sawListing, true, 'the snapshot must capture the staged index listing');
+    } finally { await fx.cleanup(); }
+  });
+
+  test('a staged binary blob change with identical diff output still produces drift', async () => {
+    const binaryDiff = 'Binary files a/shader.bin and b/shader.bin differ\n';
+    const base = gitScript({ patch: binaryDiff });
+    const listing = (blobId) =>
+      `100644 ${blobId} 0\tshader.bin\0`;
+    const { fx, session } = await connectGitFixture({
+      execImpl: async (command, args, options) => {
+        if (args.join(' ') === 'ls-files --stage -z') {
+          return { code: 0, stdout: listing('1'.repeat(40)), stderr: '', killed: false };
+        }
+        return base(command, args, options);
+      },
+    });
+    try {
+      enqueueGitCommand(fx, session, 'git_commit_request');
+      await fx.extension.pollOnce();
+      const proposalId = latestProposalId(fx);
+      // Between approval and execution the binary blob is replaced with a
+      // DIFFERENT object id, while `git diff --cached` and --shortstat
+      // render EXACTLY the same (binary blobs both print the same line).
+      fx.pi.execImpl = async (command, args, options) => {
+        if (args.join(' ') === 'ls-files --stage -z') {
+          return { code: 0, stdout: listing('2'.repeat(40)), stderr: '', killed: false };
+        }
+        return base(command, args, options);
+      };
+      enqueueGitCommand(fx, session, 'git_commit_execute', { proposalId });
+      await fx.extension.pollOnce();
+      const results = commandResults(fx);
+      assert.equal(results[1].ok, false,
+        'a changed binary blob is a different staged index and must not execute');
+      assert.equal(results[1].resultCode, 'git_drift');
+      assert.equal(fx.pi.execCalls.some((c) => c.args[0] === 'commit'), false,
+        'drift must mean zero mutating calls');
+    } finally { await fx.cleanup(); }
+  });
+
+  test('nothing staged: the request fails closed without a proposal or a commit call', async () => {
+    const { fx, session } = await connectGitFixture({ execImpl: gitScript({ patch: '' }) });
+    try {
+      enqueueGitCommand(fx, session, 'git_commit_request');
+      await fx.extension.pollOnce();
+      assert.equal(pendingEvents(fx, 'git_proposal').length, 0);
+      const results = commandResults(fx);
+      assert.equal(results.length, 1);
+      assert.equal(results[0].ok, false);
+      assert.equal(results[0].resultCode, 'nothing_staged');
+      assert.equal(
+        fx.pi.execCalls.some((c) => c.args[0] === 'commit'),
+        false,
+        'no mutating Git call may happen',
+      );
+    } finally { await fx.cleanup(); }
+  });
+
+  test('busy TUI: the request is refused before any Git call', async () => {
+    const { fx, session } = await connectGitFixture({ idle: false });
+    try {
+      enqueueGitCommand(fx, session, 'git_commit_request');
+      await fx.extension.pollOnce();
+      assert.equal(fx.pi.execCalls.length, 0, 'no Git may run while Pi is busy');
+      assert.equal(pendingEvents(fx, 'git_proposal').length, 0);
+      const results = commandResults(fx);
+      assert.equal(results.length, 1);
+      assert.equal(results[0].ok, false);
+      assert.equal(results[0].resultCode, 'pi_busy');
+    } finally { await fx.cleanup(); }
+  });
+
+  test('not a repository: the request fails closed without a proposal', async () => {
+    const { fx, session } = await connectGitFixture({ execImpl: gitScript({ toplevel: null }) });
+    try {
+      enqueueGitCommand(fx, session, 'git_commit_request');
+      await fx.extension.pollOnce();
+      assert.equal(pendingEvents(fx, 'git_proposal').length, 0);
+      const results = commandResults(fx);
+      assert.equal(results.length, 1);
+      assert.equal(results[0].ok, false);
+      assert.equal(results[0].resultCode, 'not_a_repository');
+    } finally { await fx.cleanup(); }
+  });
+
+  test('detached HEAD is refused before a proposal is published', async () => {
+    const { fx, session } = await connectGitFixture({ execImpl: gitScript({ branch: 'HEAD\n' }) });
+    try {
+      enqueueGitCommand(fx, session, 'git_commit_request');
+      await fx.extension.pollOnce();
+      assert.equal(pendingEvents(fx, 'git_proposal').length, 0);
+      const results = commandResults(fx);
+      assert.equal(results.length, 1);
+      assert.equal(results[0].ok, false);
+      assert.equal(results[0].resultCode, 'detached_head');
+    } finally { await fx.cleanup(); }
+  });
+});
+
+describe('G3: approved commit execution revalidates and uses fixed argv', () => {
+  async function approvedFixture({ execImpl = gitScript(), gitProposalTtlMs } = {}) {
+    const { fx, session } = await connectGitFixture({ execImpl, gitProposalTtlMs });
+    enqueueGitCommand(fx, session, 'git_commit_request');
+    await fx.extension.pollOnce();
+    const proposalId = latestProposalId(fx);
+    assert.ok(proposalId);
+    return { fx, session, proposalId };
+  }
+
+  test('execute runs exactly `git commit -m <fixed message>` with hooks honored', async () => {
+    const { fx, session, proposalId } = await approvedFixture();
+    try {
+      enqueueGitCommand(fx, session, 'git_commit_execute', { proposalId });
+      await fx.extension.pollOnce();
+      const commitCalls = fx.pi.execCalls.filter((c) => c.args[0] === 'commit');
+      assert.equal(commitCalls.length, 1);
+      assert.deepEqual(commitCalls[0].args, ['commit', '-m', FIXED_COMMIT_MESSAGE]);
+      const flattened = JSON.stringify(fx.pi.execCalls.map((c) => c.args));
+      assert.ok(!flattened.includes('--no-verify'), 'hooks must never be skipped');
+      assert.ok(!flattened.includes('core.hooksPath'), 'hook configuration must never be overridden');
+      assert.ok(!flattened.includes('"-c"'), 'no git -c config overrides are allowed');
+      const results = commandResults(fx);
+      assert.equal(results.length, 2);
+      assert.equal(results[1].ok, true);
+    } finally { await fx.cleanup(); }
+  });
+
+  test('HEAD drift between approval and execution refuses the commit', async () => {
+    const { fx, session, proposalId } = await approvedFixture();
+    try {
+      fx.pi.execImpl = gitScript({ head: 'b'.repeat(40) + '\n' });
+      enqueueGitCommand(fx, session, 'git_commit_execute', { proposalId });
+      await fx.extension.pollOnce();
+      const results = commandResults(fx);
+      assert.equal(results.length, 2);
+      assert.equal(results[1].ok, false);
+      assert.equal(results[1].resultCode, 'git_drift');
+      assert.equal(fx.pi.execCalls.some((c) => c.args[0] === 'commit'), false);
+    } finally { await fx.cleanup(); }
+  });
+
+  test('index drift (staged content changed) refuses the commit', async () => {
+    const { fx, session, proposalId } = await approvedFixture();
+    try {
+      // The staged index changed between approval and execution: a
+      // different blob object id in the listing. Diff output is also
+      // different, but the listing is what the fingerprint binds.
+      fx.pi.execImpl = gitScript({
+        patch: 'diff --git a/y.txt b/y.txt\n',
+        indexListing: `100644 ${'2'.repeat(40)} 0\tx.txt\0`,
+      });
+      enqueueGitCommand(fx, session, 'git_commit_execute', { proposalId });
+      await fx.extension.pollOnce();
+      const results = commandResults(fx);
+      assert.equal(results[1].ok, false);
+      assert.equal(results[1].resultCode, 'git_drift');
+      assert.equal(fx.pi.execCalls.some((c) => c.args[0] === 'commit'), false);
+    } finally { await fx.cleanup(); }
+  });
+
+  test('branch drift refuses the commit', async () => {
+    const { fx, session, proposalId } = await approvedFixture();
+    try {
+      fx.pi.execImpl = gitScript({ branch: 'feature/x\n' });
+      enqueueGitCommand(fx, session, 'git_commit_execute', { proposalId });
+      await fx.extension.pollOnce();
+      const results = commandResults(fx);
+      assert.equal(results[1].resultCode, 'git_drift');
+      assert.equal(fx.pi.execCalls.some((c) => c.args[0] === 'commit'), false);
+    } finally { await fx.cleanup(); }
+  });
+
+  test('an unknown proposal id (malicious or stale payload) dispatches nothing', async () => {
+    const { fx, session } = await approvedFixture();
+    try {
+      enqueueGitCommand(fx, session, 'git_commit_execute', { proposalId: 'f'.repeat(16) });
+      await fx.extension.pollOnce();
+      const results = commandResults(fx);
+      assert.equal(results[1].ok, false);
+      assert.equal(results[1].resultCode, 'stale_proposal');
+      assert.equal(fx.pi.execCalls.some((c) => c.args[0] === 'commit'), false);
+    } finally { await fx.cleanup(); }
+  });
+
+  test('a duplicate execute for the same proposal runs the commit exactly once', async () => {
+    const { fx, session, proposalId } = await approvedFixture();
+    try {
+      enqueueGitCommand(fx, session, 'git_commit_execute', { proposalId });
+      enqueueGitCommand(fx, session, 'git_commit_execute', { proposalId });
+      await fx.extension.pollOnce();
+      const commitCalls = fx.pi.execCalls.filter((c) => c.args[0] === 'commit');
+      assert.equal(commitCalls.length, 1, 'one-use: the proposal executes at most once');
+      const results = commandResults(fx);
+      assert.equal(results.length, 3);
+      assert.equal(results[1].ok, true);
+      assert.equal(results[2].ok, false);
+      assert.equal(results[2].resultCode, 'stale_proposal');
+    } finally { await fx.cleanup(); }
+  });
+
+  test('an expired proposal fails closed even with a matching id', async () => {
+    const { fx, session, proposalId } = await approvedFixture({ gitProposalTtlMs: 1 });
+    try {
+      await new Promise((resolveTimer) => setTimeout(resolveTimer, 5));
+      enqueueGitCommand(fx, session, 'git_commit_execute', { proposalId });
+      await fx.extension.pollOnce();
+      const results = commandResults(fx);
+      assert.equal(results[1].ok, false);
+      assert.equal(results[1].resultCode, 'stale_proposal');
+      assert.equal(fx.pi.execCalls.some((c) => c.args[0] === 'commit'), false);
+    } finally { await fx.cleanup(); }
+  });
+
+  test('an uncertain commit outcome (timeout/kill) reports unknown, never definite failure', async () => {
+    const base = gitScript();
+    const { fx, session, proposalId } = await approvedFixture({ execImpl: base });
+    try {
+      // Snapshots succeed; only the mutating commit is killed by its
+      // timeout — the real uncertain case: it may or may not have run.
+      fx.pi.execImpl = async (command, args, options) => {
+        if (args[0] === 'commit') {
+          return { code: null, stdout: '', stderr: '', killed: true };
+        }
+        return base(command, args, options);
+      };
+      enqueueGitCommand(fx, session, 'git_commit_execute', { proposalId });
+      await fx.extension.pollOnce();
+      const results = commandResults(fx);
+      assert.equal(results[1].ok, false);
+      assert.equal(results[1].resultCode, 'git_unknown');
+      assert.notEqual(results[1].resultCode, 'git_failed');
+    } finally { await fx.cleanup(); }
+  });
+
+  test('a definite non-hook Git failure reports git_failed without leaking stderr', async () => {
+    const base = gitScript();
+    const { fx, session, proposalId } = await approvedFixture({ execImpl: base });
+    try {
+      fx.pi.execImpl = async (command, args, options) => {
+        if (args[0] === 'commit') {
+          return { code: 1, stdout: '', stderr: 'fatal: secret hook output', killed: false };
+        }
+        // Unchanged repo: the parent lookup fails and no fixed-subject
+        // commit exists, so the post-check proves NO mutation happened.
+        if (args[0] === 'rev-parse' && args[1] === 'HEAD^') {
+          return { code: 128, stdout: '', stderr: 'fatal: fake', killed: false };
+        }
+        if (args.join(' ') === 'log -1 --pretty=%s HEAD') {
+          return { code: 0, stdout: 'old subject\n', stderr: '', killed: false };
+        }
+        return base(command, args, options);
+      };
+      enqueueGitCommand(fx, session, 'git_commit_execute', { proposalId });
+      await fx.extension.pollOnce();
+      const results = commandResults(fx);
+      assert.equal(results[1].ok, false);
+      assert.equal(results[1].resultCode, 'git_failed');
+      assert.ok(
+        !JSON.stringify(results).includes('secret hook output'),
+        'raw Git stderr must never reach Telegram',
+      );
+    } finally { await fx.cleanup(); }
+  });
+
+  test('a commit exit of 0 is success only when verification proves the approved mutation', async () => {
+    const base = gitScript();
+    const { fx, session, proposalId } = await approvedFixture({ execImpl: base });
+    try {
+      // The wrapper maps external signal termination to code 0 — the false
+      // success the wrapper may produce. Repo state says NO approved commit
+      // exists (HEAD's parent is not the approved head).
+      fx.pi.execImpl = async (command, args, options) => {
+        if (args[0] === 'commit') return { code: 0, stdout: '', stderr: '', killed: false };
+        if (args.join(' ') === 'rev-parse HEAD^') {
+          return { code: 0, stdout: 'c'.repeat(40) + '\n', stderr: '', killed: false };
+        }
+        return base(command, args, options);
+      };
+      enqueueGitCommand(fx, session, 'git_commit_execute', { proposalId });
+      await fx.extension.pollOnce();
+      const results = commandResults(fx);
+      assert.equal(results[1].ok, false);
+      assert.equal(results[1].resultCode, 'git_unknown',
+        'an unproven mutation must be classified unknown, never success');
+    } finally { await fx.cleanup(); }
+  });
+
+  test('a verified commit in a SHA-256 repo (64-hex HEAD) reports success', async () => {
+    const sha64 = 'a'.repeat(64);
+    const { fx, session, proposalId } = await approvedFixture({
+      execImpl: gitScript({ head: sha64 + '\n', parentSha: sha64 + '\n' }),
+    });
+    try {
+      enqueueGitCommand(fx, session, 'git_commit_execute', { proposalId });
+      await fx.extension.pollOnce();
+      const results = commandResults(fx);
+      assert.equal(results[1].ok, true,
+        'a snapshot-valid 64-hex repo that verifies must not be reported unknown');
+      assert.equal(results[1].resultCode, 'git_commit_completed');
+    } finally { await fx.cleanup(); }
+  });
+
+  test('an exception after the mutation reports git_unknown, never internal_error', async () => {
+    const base = gitScript();
+    const { fx, session, proposalId } = await approvedFixture({ execImpl: base });
+    try {
+      let commitDone = false;
+      fx.pi.execImpl = async (command, args, options) => {
+        const result = await base(command, args, options);
+        if (args[0] === 'commit') commitDone = true;
+        return result;
+      };
+      // Poison pi.exec with a throwing getter AFTER the mutating call: the
+      // runtime surface breaks following a real mutation, so the catch must
+      // classify UNCERTAIN — manual inspection before any retry.
+      const execDescriptor = Object.getOwnPropertyDescriptor(fx.pi, 'exec');
+      Object.defineProperty(fx.pi, 'exec', {
+        configurable: true,
+        get() {
+          if (commitDone) throw new Error('simulated runtime failure');
+          return execDescriptor.value;
+        },
+      });
+      enqueueGitCommand(fx, session, 'git_commit_execute', { proposalId });
+      await fx.extension.pollOnce();
+      const results = commandResults(fx);
+      assert.equal(results[1].ok, false);
+      assert.equal(results[1].resultCode, 'git_unknown',
+        'an exception following a mutation must be uncertain, never internal_error');
+    } finally { await fx.cleanup(); }
+  });
+
+  test('execute-time snapshot failure reports git_unavailable, not git_drift', async () => {
+    const base = gitScript();
+    const { fx, session, proposalId } = await approvedFixture({ execImpl: base });
+    try {
+      // The execute-phase revalidation cannot read repository state: that
+      // is an availability failure, not proof of drift.
+      fx.pi.execImpl = async (command, args, options) => {
+        if (args.join(' ') === 'rev-parse HEAD') {
+          return { code: 128, stdout: '', stderr: 'fatal: fake', killed: false };
+        }
+        return base(command, args, options);
+      };
+      enqueueGitCommand(fx, session, 'git_commit_execute', { proposalId });
+      await fx.extension.pollOnce();
+      const results = commandResults(fx);
+      assert.equal(results[1].ok, false);
+      assert.equal(results[1].resultCode, 'git_unavailable',
+        'an unreadable repository state must not be reported as drift');
+      assert.equal(fx.pi.execCalls.some((c) => c.args[0] === 'commit'), false);
+    } finally { await fx.cleanup(); }
+  });
+
+  test('a killed commit whose repo state proves the mutation still reports unknown', async () => {
+    const base = gitScript();
+    const { fx, session, proposalId } = await approvedFixture({ execImpl: base });
+    try {
+      // Signal kill during commit, but the repo state shows a commit with
+      // the approved parent and subject: the mutation DID land.
+      fx.pi.execImpl = async (command, args, options) => {
+        if (args[0] === 'commit') return { code: null, stdout: '', stderr: '', killed: true };
+        return base(command, args, options);
+      };
+      enqueueGitCommand(fx, session, 'git_commit_execute', { proposalId });
+      await fx.extension.pollOnce();
+      const results = commandResults(fx);
+      assert.equal(results[1].ok, false);
+      assert.equal(results[1].resultCode, 'git_unknown');
+    } finally { await fx.cleanup(); }
+  });
+
+  test('a successful commit reports exactly one terminal result per command', async () => {
+    const { fx, session, proposalId } = await approvedFixture();
+    try {
+      enqueueGitCommand(fx, session, 'git_commit_execute', { proposalId });
+      await fx.extension.pollOnce();
+      assert.equal(commandResults(fx).length, 2, 'exactly one result per command, no duplicates');
+    } finally { await fx.cleanup(); }
+  });
+});
+
+describe('G3: approved push execution targets the configured upstream only', () => {
+  async function pushApprovedFixture({ execImpl = gitScript() } = {}) {
+    const { fx, session } = await connectGitFixture({ execImpl });
+    enqueueGitCommand(fx, session, 'git_push_request');
+    await fx.extension.pollOnce();
+    const proposalId = latestProposalId(fx);
+    assert.ok(proposalId);
+    const proposals = pendingEvents(fx, 'git_proposal');
+    return { fx, session, proposalId, proposalPayload: proposals[0].payload };
+  }
+
+  test('the push proposal card body shows branch, upstream, HEAD and fingerprint', async () => {
+    const { fx, proposalPayload } = await pushApprovedFixture();
+    try {
+      assert.equal(proposalPayload.operation, 'push');
+      assert.match(proposalPayload.proposalId, GIT_PROPOSAL_ID_RE);
+      assert.ok(proposalPayload.message.includes('Branch: main → origin/main'));
+      assert.ok(proposalPayload.message.includes('Ahead: 2 commits'));
+      assert.ok(proposalPayload.message.includes(`HEAD: ${'a'.repeat(40)}`));
+      assert.match(proposalPayload.message, /Fingerprint: [0-9a-f]{16}/);
+    } finally { await fx.cleanup(); }
+  });
+
+  test('execute pushes the configured upstream only: tag-scope-proof argv, no force', async () => {
+    const { fx, session, proposalId } = await pushApprovedFixture();
+    try {
+      enqueueGitCommand(fx, session, 'git_push_execute', { proposalId });
+      await fx.extension.pollOnce();
+      const pushCalls = fx.pi.execCalls.filter((c) => c.args[0] === 'push');
+      assert.equal(pushCalls.length, 1);
+      // Explicit HEAD refspec + --no-follow-tags + --atomic: configured
+      // push.followTags can never expand what leaves the repository.
+      assert.deepEqual(
+        pushCalls[0].args,
+        ['push', '--no-follow-tags', '--atomic', 'origin', 'HEAD:refs/heads/main'],
+      );
+      const flattened = JSON.stringify(fx.pi.execCalls.map((c) => c.args));
+      assert.ok(!flattened.includes('--force'), 'force push must never be possible');
+      assert.ok(!flattened.includes('"-f"'), 'force push must never be possible');
+      assert.ok(!flattened.includes('--follow-tags'), 'follow-tags must be explicitly disabled');
+      const results = commandResults(fx);
+      assert.equal(results.length, 2);
+      assert.equal(results[1].ok, true);
+    } finally { await fx.cleanup(); }
+  });
+
+  test('a push exit of 0 is success only when the upstream ref resolves to the approved HEAD', async () => {
+    const base = gitScript();
+    const { fx, session, proposalId } = await pushApprovedFixture({ execImpl: base });
+    try {
+      fx.pi.execImpl = async (command, args, options) => {
+        if (args[0] === 'push') return { code: 0, stdout: '', stderr: '', killed: false };
+        if (args.join(' ') === 'rev-parse refs/remotes/origin/main') {
+          return { code: 0, stdout: 'e'.repeat(40) + '\n', stderr: '', killed: false };
+        }
+        return base(command, args, options);
+      };
+      enqueueGitCommand(fx, session, 'git_push_execute', { proposalId });
+      await fx.extension.pollOnce();
+      const results = commandResults(fx);
+      assert.equal(results[1].ok, false);
+      assert.equal(results[1].resultCode, 'git_unknown');
+    } finally { await fx.cleanup(); }
+  });
+
+  test('a verified push in a SHA-256 repo (64-hex HEAD) reports success', async () => {
+    const sha64 = 'a'.repeat(64);
+    const { fx, session, proposalId } = await pushApprovedFixture({
+      execImpl: gitScript({ head: sha64 + '\n', remoteRefSha: sha64 + '\n' }),
+    });
+    try {
+      enqueueGitCommand(fx, session, 'git_push_execute', { proposalId });
+      await fx.extension.pollOnce();
+      const results = commandResults(fx);
+      assert.equal(results[1].ok, true,
+        'a snapshot-valid 64-hex repo whose upstream resolves to the approved HEAD must verify');
+      assert.equal(results[1].resultCode, 'git_push_completed');
+    } finally { await fx.cleanup(); }
+  });
+
+  test('upstream drift between approval and execution refuses the push', async () => {
+    const { fx, session, proposalId } = await pushApprovedFixture();
+    try {
+      fx.pi.execImpl = gitScript({ upstream: 'origin/other\n' });
+      enqueueGitCommand(fx, session, 'git_push_execute', { proposalId });
+      await fx.extension.pollOnce();
+      const results = commandResults(fx);
+      assert.equal(results[1].ok, false);
+      assert.equal(results[1].resultCode, 'git_drift');
+      assert.equal(fx.pi.execCalls.some((c) => c.args[0] === 'push'), false);
+    } finally { await fx.cleanup(); }
+  });
+
+  test('no configured upstream fails the request closed', async () => {
+    const { fx, session } = await connectGitFixture({ execImpl: gitScript({ upstream: null }) });
+    try {
+      enqueueGitCommand(fx, session, 'git_push_request');
+      await fx.extension.pollOnce();
+      assert.equal(pendingEvents(fx, 'git_proposal').length, 0);
+      const results = commandResults(fx);
+      assert.equal(results.length, 1);
+      assert.equal(results[0].ok, false);
+      assert.equal(results[0].resultCode, 'no_upstream');
+    } finally { await fx.cleanup(); }
+  });
+
+  test('an unsafe upstream shape is never turned into argv', async () => {
+    const { fx, session } = await connectGitFixture({
+      execImpl: gitScript({ upstream: 'origin main\n' }),
+    });
+    try {
+      enqueueGitCommand(fx, session, 'git_push_request');
+      await fx.extension.pollOnce();
+      assert.equal(pendingEvents(fx, 'git_proposal').length, 0);
+      const results = commandResults(fx);
+      assert.equal(results[0].ok, false);
+      assert.equal(results[0].resultCode, 'no_upstream');
+    } finally { await fx.cleanup(); }
+  });
+
+  test('an uncertain push outcome reports unknown rather than failure', async () => {
+    const { fx, session, proposalId } = await pushApprovedFixture();
+    try {
+      const base = gitScript();
+      fx.pi.execImpl = async (command, args) => {
+        if (args[0] === 'push') throw new Error('exec blew up');
+        return base(command, args);
+      };
+      enqueueGitCommand(fx, session, 'git_push_execute', { proposalId });
+      await fx.extension.pollOnce();
+      const results = commandResults(fx);
+      assert.equal(results[1].ok, false);
+      assert.equal(results[1].resultCode, 'git_unknown');
+    } finally { await fx.cleanup(); }
+  });
+});
+
+describe('G4: Git results carry typed operation-specific result codes', () => {
+  test('a commit request reports git_commit_proposal_ready', async () => {
+    const { fx, session } = await connectGitFixture();
+    try {
+      enqueueGitCommand(fx, session, 'git_commit_request');
+      await fx.extension.pollOnce();
+      const results = commandResults(fx);
+      assert.equal(results.length, 1);
+      assert.equal(results[0].ok, true);
+      assert.equal(results[0].resultCode, 'git_commit_proposal_ready');
+    } finally { await fx.cleanup(); }
+  });
+
+  test('a push request reports git_push_proposal_ready', async () => {
+    const { fx, session } = await connectGitFixture();
+    try {
+      enqueueGitCommand(fx, session, 'git_push_request');
+      await fx.extension.pollOnce();
+      const results = commandResults(fx);
+      assert.equal(results.length, 1);
+      assert.equal(results[0].ok, true);
+      assert.equal(results[0].resultCode, 'git_push_proposal_ready');
+    } finally { await fx.cleanup(); }
+  });
+
+  test('a verified commit reports git_commit_completed', async () => {
+    const { fx, session } = await connectGitFixture();
+    try {
+      enqueueGitCommand(fx, session, 'git_commit_request');
+      await fx.extension.pollOnce();
+      const proposalId = latestProposalId(fx);
+      enqueueGitCommand(fx, session, 'git_commit_execute', { proposalId });
+      await fx.extension.pollOnce();
+      const results = commandResults(fx);
+      assert.equal(results[1].ok, true);
+      assert.equal(results[1].resultCode, 'git_commit_completed');
+    } finally { await fx.cleanup(); }
+  });
+
+  test('a verified push reports git_push_completed', async () => {
+    const { fx, session } = await connectGitFixture();
+    try {
+      enqueueGitCommand(fx, session, 'git_push_request');
+      await fx.extension.pollOnce();
+      const proposalId = latestProposalId(fx);
+      enqueueGitCommand(fx, session, 'git_push_execute', { proposalId });
+      await fx.extension.pollOnce();
+      const results = commandResults(fx);
+      assert.equal(results[1].ok, true);
+      assert.equal(results[1].resultCode, 'git_push_completed');
+    } finally { await fx.cleanup(); }
+  });
+});
+
+describe('G3: bounded proposal state, overlap guard and teardown', () => {
+  test('a newer request replaces the pending proposal and makes the older id stale', async () => {
+    const { fx, session } = await connectGitFixture();
+    try {
+      enqueueGitCommand(fx, session, 'git_commit_request');
+      await fx.extension.pollOnce();
+      const oldId = latestProposalId(fx);
+      enqueueGitCommand(fx, session, 'git_commit_request');
+      await fx.extension.pollOnce();
+      const newId = latestProposalId(fx);
+      assert.notEqual(oldId, newId);
+      assert.equal(pendingEvents(fx, 'git_proposal').length, 2);
+      enqueueGitCommand(fx, session, 'git_commit_execute', { proposalId: oldId });
+      await fx.extension.pollOnce();
+      const results = commandResults(fx);
+      assert.equal(results[2].ok, false);
+      assert.equal(results[2].resultCode, 'stale_proposal');
+      assert.equal(fx.pi.execCalls.some((c) => c.args[0] === 'commit'), false);
+    } finally { await fx.cleanup(); }
+  });
+
+  test('async polling cannot overlap an in-flight Git command', async () => {
+    const { fx, session } = await connectGitFixture();
+    try {
+      let release;
+      const gate = new Promise((resolveGate) => { release = resolveGate; });
+      const base = gitScript();
+      fx.pi.execImpl = async (command, args) => {
+        if (args[0] === 'commit') {
+          await gate;
+          return { code: 0, stdout: '', stderr: '', killed: false };
+        }
+        return base(command, args);
+      };
+      enqueueGitCommand(fx, session, 'git_commit_request');
+      await fx.extension.pollOnce();
+      const proposalId = latestProposalId(fx);
+      enqueueGitCommand(fx, session, 'git_commit_execute', { proposalId });
+      const first = fx.extension.pollOnce();
+      // Wait until the commit exec is actually in flight.
+      while (!fx.pi.execCalls.some((c) => c.args[0] === 'commit')) {
+        await new Promise((resolveTick) => setTimeout(resolveTick, 1));
+      }
+      enqueueGitCommand(fx, session, 'git_commit_request');
+      await fx.extension.pollOnce();
+      const second = await fx.extension.pollOnce();
+      assert.equal(
+        fx.pi.execCalls.filter((c) => c.args[0] === 'rev-parse').length,
+        6,
+        'no snapshot for the queued request may run while Git is in flight '
+          + '(3 from the request, 3 from the execute revalidation only)',
+      );
+      release();
+      await first;
+      await fx.extension.pollOnce();
+      const results = commandResults(fx);
+      assert.equal(results.length, 3, 'every command reports exactly once, in order');
+      assert.equal(results[2].ok, true);
+    } finally { await fx.cleanup(); }
+  });
+
+  test('connection teardown clears the proposal and silences polling', async () => {
+    const { fx, session } = await connectGitFixture();
+    try {
+      enqueueGitCommand(fx, session, 'git_commit_request');
+      await fx.extension.pollOnce();
+      const proposalId = latestProposalId(fx);
+      await fx.run('telegram-disconnect', '');
+      // With the connection gone the store refuses commands for the dead
+      // tracking id: nothing can reach the extension after teardown.
+      const p1 = fx.probe();
+      const refused = p1.store.enqueueTuiCommand({
+        trackingId: session.trackingId,
+        kind: 'git_commit_execute',
+        payload: { proposalId },
+      });
+      p1.close();
+      assert.equal(refused.ok, false, 'a dead session must fail closed');
+      await fx.extension.pollOnce();
+      assert.equal(commandResults(fx).length, 1, 'no result after teardown: nothing executed');
+      assert.equal(fx.pi.execCalls.some((c) => c.args[0] === 'commit'), false);
+      // A fresh link in the same process must not inherit the proposal.
+      await fx.run('tg', '');
+      const p = fx.probe();
+      const fresh = p.sessions()[0];
+      p.close();
+      enqueueGitCommand(fx, fresh, 'git_commit_execute', { proposalId });
+      await fx.extension.pollOnce();
+      const results = commandResults(fx);
+      assert.equal(results[1].ok, false);
+      assert.equal(results[1].resultCode, 'stale_proposal');
+      assert.equal(fx.pi.execCalls.some((c) => c.args[0] === 'commit'), false);
+    } finally { await fx.cleanup(); }
   });
 });

@@ -26,11 +26,25 @@ The supported design intentionally provides:
 - Windows DPAPI CurrentUser protection and a user-only ACL for local credentials and state;
 - explicit `/tg` opt-in for every Pi process; a new process starts disconnected;
 - typed Pi prompt, steer, follow-up, abort, and disconnect operations — never a generic shell;
+- one narrow exception: closed typed `/commit` and `/push` operations, each gated by an exact, one-use approval card bound to a local repository snapshot — never a command string or arbitrary argv;
 - finalized assistant text only — no hidden reasoning, tool calls, tool results, context, or token stream;
 - one-time local QR pairing with a fresh nonce; the QR never contains the bot token;
 - no approval or consent fabrication.
 
 Changes that weaken any boundary above are security-sensitive and require explicit tests and review.
+
+### The narrow Git approval exception
+
+The two Git operations are deliberately bounded and fail closed:
+
+- `/commit` is a staged-only commit with the fixed message `chore: update project files` — it commits only the already-staged index and never stages files; the message is shown exactly on the approval card.
+- `/push` pushes only the current branch's configured upstream with an explicit refspec — no force, no tag expansion, and `--atomic` so the ref update is all-or-nothing; a remote that does not support `--atomic` fails closed.
+- The repository snapshot is revalidated immediately before execution: the commit snapshot binds the repository root, branch, HEAD, and the full staged-index listing; the push snapshot binds the repository root, branch, HEAD, and the configured remote/upstream branch and ahead state (never a resolved push URL or Git configuration beyond that). Any snapshot drift refuses the operation.
+- Approvals are one-use and fail closed after expiry, broker restart, connection replacement, or a consumed proposal.
+- Trust is explicit: **local Git hooks, configuration, remote URLs, and credential or transport helpers remain fully trusted** on the PC — an approval authorizes normal hook execution, which may run local programs or alter the resulting commit. Nothing about this feature sandboxes Git.
+- Raw Git diff output, stderr and diagnostics, full remote URLs, credentials, and local paths never reach Telegram. Approval cards intentionally show only the bounded snapshot metadata (staged shortstat, branch, upstream alias, HEAD SHA, fingerprint, and the push card's ahead count); result cards use fixed, mapped copy from a closed result-code table — no other Git-derived data is sent.
+- An uncertain Git outcome requires manual repository inspection before any retry; it is never worded as a definite success or failure and is never replayed automatically.
+- No real remote operation is exercised by the automated tests; they use a fake Git transport only.
 
 ## Supported environment
 

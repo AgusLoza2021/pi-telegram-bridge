@@ -21,6 +21,7 @@ import { Store } from '../src/store.mjs';
 import { TuiBridgeClient } from '../src/tui-bridge-client.mjs';
 import { SelectiveTelegramBroker } from '../src/selective-telegram-broker.mjs';
 import { RuntimeConfigError, loadBrokerRuntimeConfig } from '../src/runtime-config.mjs';
+import { TelegramApiError } from '../src/telegram-api.mjs';
 
 const TEST_RUNS = fileURLToPath(new URL('../.local/test-runs/', import.meta.url));
 mkdirSync(TEST_RUNS, { recursive: true });
@@ -45,6 +46,10 @@ function makeFakeApi() {
   let queued = [];
   let failSends = 0;
   let failAnswers = 0;
+  // Uncertain-send knob: records the chunk BEFORE throwing (Telegram may
+  // have received it), which is exactly the at-least-once uncertainty the
+  // broker must tolerate.
+  let failSendsWith = null;
   let webhookUrl = '';
   return {
     sent,
@@ -52,6 +57,7 @@ function makeFakeApi() {
     queueUpdate(update) { queued.push(update); },
     setWebhook(url) { webhookUrl = url; },
     failNextSends(count) { failSends = count; },
+    failNextSendsWith(count, code) { failSendsWith = { count, code }; },
     failNextAnswers(count) { failAnswers = count; },
     async getUpdates({ offset } = {}) {
       const ready = queued.filter((u) => u.update_id >= (offset ?? 0));
@@ -62,6 +68,11 @@ function makeFakeApi() {
       if (failSends > 0) {
         failSends--;
         throw new Error('simulated transport failure');
+      }
+      if (failSendsWith !== null && failSendsWith.count > 0) {
+        failSendsWith.count--;
+        sent.push({ chatId, text, ...(replyMarkup !== undefined ? { replyMarkup } : {}) });
+        throw new TelegramApiError({ code: failSendsWith.code });
       }
       const record = { chatId, text };
       if (replyMarkup !== undefined) record.replyMarkup = replyMarkup;
@@ -2308,6 +2319,702 @@ describe('SelectiveTelegramBroker: one honest outbound throttle record per episo
       assert.equal(api.sent.length, 0, 'a failed send transports nothing');
       assert.equal(pendingEvents(fx).length, 1, 'the failed event stays pending for retry');
       assert.equal(throttleRecords(logs).length, 0, 'a failure is not a throttle');
+    } finally { fx.close(); }
+  });
+});
+
+describe('SelectiveTelegramBroker: git proposal approval flow (one-use, memory-only, G2)', () => {
+  const PROPOSAL_A = 'ab12cd34ef560172';
+  const PROPOSAL_B = '9988776655443322';
+  const COMMIT_MESSAGE = 'Add tomato bed planting logic';
+
+  /** Fresh store + clients per test, mirroring the T03b busy fixture. */
+  function makeFixture() {
+    const dir = mkdtempSync(join(TEST_RUNS, 'sel-git-'));
+    let t = Date.now();
+    const now = () => t;
+    const store = new Store(join(dir, 'bridge.sqlite'), { now, isProcessAlive: () => true });
+    const clientA = new TuiBridgeClient(store, { staleAfterMs: 30_000 });
+    const clientB = new TuiBridgeClient(store, { staleAfterMs: 30_000 });
+    return {
+      store,
+      clientA,
+      clientB,
+      now,
+      advance(ms) { t += ms; },
+      connectA() {
+        assert.equal(clientA.connect({ ...A, shortId: 'aaa111', label: 'alpha', pid: 1111, cwd: 'C:/proj/alpha' }).ok, true);
+      },
+      connectB() {
+        assert.equal(clientB.connect({ ...B, shortId: 'bbb222', label: 'beta', pid: 2222, cwd: 'C:/proj/beta' }).ok, true);
+      },
+      close() { store.close(); },
+    };
+  }
+
+  function newBroker(fx, api) {
+    return new SelectiveTelegramBroker({ store: fx.store, api, config: BROKER_CONFIG, now: fx.now });
+  }
+
+  async function deliver(broker, api, update) {
+    broker.handleUpdate(update);
+    await broker.flushReplies();
+  }
+
+  function buttonsOf(sentMessage) {
+    return sentMessage.replyMarkup.inline_keyboard.flat();
+  }
+
+  function lastButtons(api) {
+    return buttonsOf(api.sent[api.sent.length - 1]);
+  }
+
+  /** The opaque approval token offered by the latest approval card. */
+  function approvalToken(api) {
+    const button = lastButtons(api).find((b) => b.callback_data.startsWith('v1:g:'));
+    return button.callback_data.slice('v1:g:'.length);
+  }
+
+  /** Drop transport leftovers so every test starts from a quiet store. */
+  function clearTransport(fx) {
+    const pending = fx.store.listPendingBrokerTuiEvents({ limit: 256 });
+    if (pending.length > 0) {
+      fx.store.acknowledgeTuiEvents({ eventIds: pending.map((e) => e.eventId) });
+    }
+    while (fx.store.claimNextTuiCommand({ trackingId: A.trackingId, connectionId: A.connectionId }).ok) {}
+    while (fx.store.claimNextTuiCommand({ trackingId: B.trackingId, connectionId: B.connectionId }).ok) {}
+  }
+
+  test('publishGitProposal accepts only the closed shapes', () => {
+    const fx = makeFixture();
+    try {
+      fx.connectA();
+      clearTransport(fx);
+      assert.equal(
+        fx.clientA.publishGitProposal({ ...A, operation: 'commit', proposalId: PROPOSAL_A, message: 'Add x' }).ok,
+        true,
+      );
+      assert.equal(
+        fx.clientA.publishGitProposal({ ...A, operation: 'push', proposalId: PROPOSAL_A }).ok,
+        true,
+      );
+      // G3: a push proposal may carry the bounded snapshot summary shown on
+      // its approval card (branch, upstream, HEAD, fingerprint).
+      assert.equal(
+        fx.clientA.publishGitProposal({
+          ...A, operation: 'push', proposalId: PROPOSAL_A, message: 'Branch: main → origin/main',
+        }).ok,
+        true,
+      );
+      assert.throws(
+        () => fx.clientA.publishGitProposal({ ...A, operation: 'shell', proposalId: PROPOSAL_A }),
+        TypeError,
+      );
+      assert.throws(
+        () => fx.clientA.publishGitProposal({ ...A, operation: 'commit', proposalId: PROPOSAL_A }),
+        TypeError,
+      );
+      assert.throws(
+        () => fx.clientA.publishGitProposal({ ...A, operation: 'push', proposalId: PROPOSAL_A, message: '' }),
+        TypeError,
+      );
+      assert.throws(
+        () => fx.clientA.publishGitProposal({ ...A, operation: 'push', proposalId: 'BAD!' }),
+        TypeError,
+      );
+    } finally { fx.close(); }
+  });
+
+  test('/commit and /push enqueue exactly one closed request command per authorized message', async () => {
+    const fx = makeFixture();
+    try {
+      fx.connectA();
+      fx.connectB();
+      clearTransport(fx);
+      const api = makeFakeApi();
+      const broker = newBroker(fx, api);
+      await deliver(broker, api, msg('/use aaa111'));
+      await deliver(broker, api, msg('/commit'));
+      assert.match(api.sent[1].text, /Pi · alpha — Commit requested\./);
+      let commands = fx.clientA.poll(A).commands;
+      assert.equal(commands.length, 1);
+      assert.equal(commands[0].kind, 'git_commit_request');
+      assert.equal(commands[0].payload, null);
+      await deliver(broker, api, msg('/push'));
+      assert.match(api.sent[2].text, /Pi · alpha — Push requested\./);
+      commands = fx.clientA.poll(A).commands;
+      assert.equal(commands.length, 1);
+      assert.equal(commands[0].kind, 'git_push_request');
+      assert.equal(commands[0].payload, null);
+      assert.equal(fx.clientB.poll(B).commands.length, 0);
+    } finally { fx.close(); }
+  });
+
+  test('/commit and /push keep the routed fail-closed selection semantics', async () => {
+    const fx = makeFixture();
+    try {
+      fx.connectA();
+      fx.connectB();
+      clearTransport(fx);
+      const api = makeFakeApi();
+      const broker = newBroker(fx, api);
+      await deliver(broker, api, msg('/commit nope99'));
+      assert.match(api.sent[0].text, /No live session with short id "nope99"/);
+      await deliver(broker, api, msg('/push'));
+      assert.equal(fx.clientA.poll(A).commands.length, 0,
+        'an advanced routed command without a selection must enqueue nothing');
+      assert.equal(fx.clientB.poll(B).commands.length, 0);
+      assert.ok(api.sent.some((s) => s.text.includes('No session selected')),
+        'several live sessions and no selection must fail closed');
+    } finally { fx.close(); }
+  });
+
+  test('a redelivered /commit update never enqueues a duplicate request', async () => {
+    const fx = makeFixture();
+    try {
+      fx.connectA();
+      fx.connectB();
+      clearTransport(fx);
+      const api = makeFakeApi();
+      const broker = newBroker(fx, api);
+      await deliver(broker, api, msg('/use aaa111'));
+      const update = msg('/commit');
+      broker.handleUpdate(update);
+      await broker.flushReplies();
+      broker.handleUpdate(update);
+      await broker.flushReplies();
+      const commands = fx.clientA.poll(A).commands;
+      assert.equal(commands.length, 1, 'inbox dedup must make the re-delivery a no-op');
+    } finally { fx.close(); }
+  });
+
+  test('a drained commit proposal renders an approval card with the exact commit message and an opaque one-use token', async () => {
+    const fx = makeFixture();
+    try {
+      fx.connectA();
+      clearTransport(fx);
+      const api = makeFakeApi();
+      const broker = newBroker(fx, api);
+      assert.equal(
+        fx.clientA.publishGitProposal({
+          ...A, operation: 'commit', proposalId: PROPOSAL_A, message: COMMIT_MESSAGE,
+        }).ok,
+        true,
+      );
+      await broker.drainTuiEvents();
+      assert.equal(api.sent.length, 1);
+      const card = api.sent[0];
+      assert.ok(card.text.includes(COMMIT_MESSAGE),
+        'the automatic commit text must be shown exactly');
+      assert.match(card.text, /Ready to commit/);
+      assert.doesNotMatch(card.text, /aaa111/, 'the card text must never expose short ids');
+      const buttons = lastButtons(api);
+      assert.deepEqual(buttons.map((b) => b.text), ['Approve', 'Cancel'],
+        'the approval card offers exactly Approve and Cancel');
+      const token = approvalToken(api);
+      assert.match(token, /^[0-9a-f]{16,64}$/);
+      assert.notEqual(token, PROPOSAL_A, 'the token must be opaque, never the proposal id');
+      const approveButton = buttons.find((b) => b.callback_data.startsWith('v1:g:'));
+      assert.ok(Buffer.byteLength(approveButton.callback_data, 'utf8') <= 64,
+        'the approval callback must fit the 64-byte callback_data limit');
+    } finally { fx.close(); }
+  });
+
+  test('the Approve tap dispatches exactly one execute command and every later tap dispatches nothing', async () => {
+    const fx = makeFixture();
+    try {
+      fx.connectA();
+      clearTransport(fx);
+      const api = makeFakeApi();
+      const broker = newBroker(fx, api);
+      fx.clientA.publishGitProposal({
+        ...A, operation: 'commit', proposalId: PROPOSAL_A, message: COMMIT_MESSAGE,
+      });
+      await broker.drainTuiEvents();
+      const approveData = lastButtons(api).find((b) => b.callback_data.startsWith('v1:g:')).callback_data;
+      await deliver(broker, api, cb(approveData));
+      const commands = fx.clientA.poll(A).commands;
+      assert.equal(commands.length, 1);
+      assert.equal(commands[0].kind, 'git_commit_execute');
+      assert.deepEqual(commands[0].payload, { proposalId: PROPOSAL_A });
+      assert.match(api.sent[api.sent.length - 1].text, /Approved/);
+      // One-use: a second tap of the same button (fresh update id) is stale.
+      await deliver(broker, api, cb(approveData));
+      assert.equal(fx.clientA.poll(A).commands.length, 0,
+        'a consumed approval must never dispatch twice');
+      assert.match(api.sent[api.sent.length - 1].text, /already expired/);
+      // A fabricated token dispatches nothing too.
+      await deliver(broker, api, cb(`v1:g:${'0'.repeat(32)}`));
+      assert.equal(fx.clientA.poll(A).commands.length, 0);
+    } finally { fx.close(); }
+  });
+
+  test('a push proposal approves into git_push_execute and its card carries no commit message', async () => {
+    const fx = makeFixture();
+    try {
+      fx.connectA();
+      clearTransport(fx);
+      const api = makeFakeApi();
+      const broker = newBroker(fx, api);
+      assert.equal(
+        fx.clientA.publishGitProposal({ ...A, operation: 'push', proposalId: PROPOSAL_A }).ok,
+        true,
+      );
+      await broker.drainTuiEvents();
+      const card = api.sent[0];
+      assert.match(card.text, /Ready to push/);
+      assert.doesNotMatch(card.text, /Ready to commit|Add tomato/);
+      const approveData = lastButtons(api).find((b) => b.callback_data.startsWith('v1:g:')).callback_data;
+      await deliver(broker, api, cb(approveData));
+      const commands = fx.clientA.poll(A).commands;
+      assert.equal(commands.length, 1);
+      assert.equal(commands[0].kind, 'git_push_execute');
+      assert.deepEqual(commands[0].payload, { proposalId: PROPOSAL_A });
+    } finally { fx.close(); }
+  });
+
+  test('a push proposal with a snapshot summary shows it on the card (G3)', async () => {
+    const fx = makeFixture();
+    try {
+      fx.connectA();
+      clearTransport(fx);
+      const api = makeFakeApi();
+      const broker = newBroker(fx, api);
+      const SUMMARY = 'Branch: main → origin/main\nAhead: 2 commits\nFingerprint: ab12cd34ef560198';
+      assert.equal(
+        fx.clientA.publishGitProposal({
+          ...A, operation: 'push', proposalId: PROPOSAL_A, message: SUMMARY,
+        }).ok,
+        true,
+      );
+      await broker.drainTuiEvents();
+      const card = api.sent[0];
+      assert.match(card.text, /Ready to push/);
+      assert.ok(card.text.includes(SUMMARY), 'the push snapshot summary must be shown exactly');
+      assert.doesNotMatch(card.text, /Ready to commit|Add tomato/);
+      const approveData = lastButtons(api).find((b) => b.callback_data.startsWith('v1:g:')).callback_data;
+      await deliver(broker, api, cb(approveData));
+      const commands = fx.clientA.poll(A).commands;
+      assert.equal(commands.length, 1);
+      assert.equal(commands[0].kind, 'git_push_execute');
+    } finally { fx.close(); }
+  });
+
+  test('a broker restart invalidates every outstanding approval token', async () => {
+    const fx = makeFixture();
+    try {
+      fx.connectA();
+      clearTransport(fx);
+      const api1 = makeFakeApi();
+      const broker1 = newBroker(fx, api1);
+      fx.clientA.publishGitProposal({
+        ...A, operation: 'commit', proposalId: PROPOSAL_A, message: COMMIT_MESSAGE,
+      });
+      await broker1.drainTuiEvents();
+      const staleData = lastButtons(api1).find((b) => b.callback_data.startsWith('v1:g:')).callback_data;
+      // The old broker instance dies with its memory; a fresh broker on the
+      // same store has no knowledge of the token and must fail closed.
+      const api2 = makeFakeApi();
+      const broker2 = newBroker(fx, api2);
+      await deliver(broker2, api2, cb(staleData));
+      assert.equal(fx.clientA.poll(A).commands.length, 0,
+        'a pre-restart approval must never survive into the new broker');
+      assert.match(api2.sent[0].text, /already expired/);
+      // A pre-restart CANCEL button is stale in exactly the same way.
+      const staleCancel = lastButtons(api1).find((b) => b.callback_data.startsWith('v1:X:')).callback_data;
+      await deliver(broker2, api2, cb(staleCancel));
+      assert.match(api2.sent[api2.sent.length - 1].text, /already expired/);
+      assert.equal(fx.clientA.poll(A).commands.length, 0);
+    } finally { fx.close(); }
+  });
+
+  test('a newer proposal replaces the pending one and makes the earlier token stale', async () => {
+    const fx = makeFixture();
+    try {
+      fx.connectA();
+      clearTransport(fx);
+      const api = makeFakeApi();
+      const broker = newBroker(fx, api);
+      fx.clientA.publishGitProposal({
+        ...A, operation: 'commit', proposalId: PROPOSAL_A, message: COMMIT_MESSAGE,
+      });
+      await broker.drainTuiEvents();
+      const staleData = lastButtons(api).find((b) => b.callback_data.startsWith('v1:g:')).callback_data;
+      fx.clientA.publishGitProposal({
+        ...A, operation: 'push', proposalId: PROPOSAL_B,
+      });
+      await broker.drainTuiEvents();
+      const freshData = lastButtons(api).find((b) => b.callback_data.startsWith('v1:g:')).callback_data;
+      await deliver(broker, api, cb(staleData));
+      assert.equal(fx.clientA.poll(A).commands.length, 0,
+        'the replaced proposal token must dispatch nothing');
+      await deliver(broker, api, cb(freshData));
+      const commands = fx.clientA.poll(A).commands;
+      assert.equal(commands.length, 1);
+      assert.equal(commands[0].kind, 'git_push_execute');
+      assert.deepEqual(commands[0].payload, { proposalId: PROPOSAL_B });
+    } finally { fx.close(); }
+  });
+
+  test('an approval whose session died before the tap dispatches nothing', async () => {
+    const fx = makeFixture();
+    try {
+      fx.connectA();
+      clearTransport(fx);
+      const api = makeFakeApi();
+      const broker = newBroker(fx, api);
+      fx.clientA.publishGitProposal({
+        ...A, operation: 'commit', proposalId: PROPOSAL_A, message: COMMIT_MESSAGE,
+      });
+      await broker.drainTuiEvents();
+      const approveData = lastButtons(api).find((b) => b.callback_data.startsWith('v1:g:')).callback_data;
+      fx.advance(31_000); // alpha's heartbeat ages out of the 30s window
+      await deliver(broker, api, cb(approveData));
+      assert.equal(fx.clientA.poll(A).commands.length, 0,
+        'a dead proposing session must never receive the execute command');
+      assert.match(api.sent[api.sent.length - 1].text, /already expired/);
+    } finally { fx.close(); }
+  });
+
+  test("the proposal card's Cancel button is proposal-scoped (v1:X) and consumes the approval", async () => {
+    const fx = makeFixture();
+    try {
+      fx.connectA();
+      clearTransport(fx);
+      const api = makeFakeApi();
+      const broker = newBroker(fx, api);
+      fx.clientA.publishGitProposal({
+        ...A, operation: 'commit', proposalId: PROPOSAL_A, message: COMMIT_MESSAGE,
+      });
+      await broker.drainTuiEvents();
+      const buttons = lastButtons(api);
+      const approveButton = buttons.find((b) => b.callback_data.startsWith('v1:g:'));
+      const cancelButton = buttons.find((b) => b.callback_data.startsWith('v1:X:'));
+      assert.ok(cancelButton, 'the proposal card cancels through a proposal-scoped v1:X callback');
+      const cancelToken = cancelButton.callback_data.slice('v1:X:'.length);
+      assert.match(cancelToken, /^[0-9a-f]{16,64}$/);
+      assert.equal(cancelToken, approveButton.callback_data.slice('v1:g:'.length),
+        'approve and cancel bind to the SAME opaque proposal token');
+      assert.ok(Buffer.byteLength(cancelButton.callback_data, 'utf8') <= 64);
+      assert.doesNotMatch(cancelButton.callback_data, new RegExp(PROPOSAL_A),
+        'the cancel callback carries no proposal id');
+      await deliver(broker, api, cb(cancelButton.callback_data));
+      assert.match(api.sent[api.sent.length - 1].text, /nothing was changed/);
+      assert.equal(fx.clientA.poll(A).commands.length, 0);
+      await deliver(broker, api, cb(approveButton.callback_data));
+      assert.equal(fx.clientA.poll(A).commands.length, 0,
+        'a consumed approval must never dispatch: cancel invalidates it');
+      assert.match(api.sent[api.sent.length - 1].text, /already expired/);
+    } finally { fx.close(); }
+  });
+
+  test('a stale proposal cancel never invalidates a newer proposal', async () => {
+    const fx = makeFixture();
+    try {
+      fx.connectA();
+      clearTransport(fx);
+      const api = makeFakeApi();
+      const broker = newBroker(fx, api);
+      fx.clientA.publishGitProposal({
+        ...A, operation: 'commit', proposalId: PROPOSAL_A, message: COMMIT_MESSAGE,
+      });
+      await broker.drainTuiEvents();
+      const staleCancelButton = lastButtons(api).find((b) => b.callback_data.startsWith('v1:X:'));
+      fx.clientA.publishGitProposal({
+        ...A, operation: 'push', proposalId: PROPOSAL_B,
+      });
+      await broker.drainTuiEvents();
+      const freshApproveData = lastButtons(api).find((b) => b.callback_data.startsWith('v1:g:')).callback_data;
+      // The old card's cancel button must not touch the newer pending proposal.
+      await deliver(broker, api, cb(staleCancelButton.callback_data));
+      assert.match(api.sent[api.sent.length - 1].text, /already expired/,
+        'a stale cancel answers with the expired notice');
+      assert.equal(fx.clientA.poll(A).commands.length, 0);
+      await deliver(broker, api, cb(freshApproveData));
+      const commands = fx.clientA.poll(A).commands;
+      assert.equal(commands.length, 1,
+        'the newer proposal must still be approvable after a stale cancel');
+      assert.equal(commands[0].kind, 'git_push_execute');
+      assert.deepEqual(commands[0].payload, { proposalId: PROPOSAL_B });
+    } finally { fx.close(); }
+  });
+
+  test('the generic v1:C cancel still only acknowledges and never consumes the approval', async () => {
+    const fx = makeFixture();
+    try {
+      fx.connectA();
+      clearTransport(fx);
+      const api = makeFakeApi();
+      const broker = newBroker(fx, api);
+      fx.clientA.publishGitProposal({
+        ...A, operation: 'commit', proposalId: PROPOSAL_A, message: COMMIT_MESSAGE,
+      });
+      await broker.drainTuiEvents();
+      const approveData = lastButtons(api).find((b) => b.callback_data.startsWith('v1:g:')).callback_data;
+      await deliver(broker, api, cb('v1:C'));
+      assert.match(api.sent[api.sent.length - 1].text, /nothing was changed/);
+      assert.equal(fx.clientA.poll(A).commands.length, 0);
+      await deliver(broker, api, cb(approveData));
+      assert.equal(fx.clientA.poll(A).commands.length, 1,
+        'the generic v1:C cancel is informational: the approval stays available exactly once');
+    } finally { fx.close(); }
+  });
+
+  test('an uncertain approval delivery retried whole keeps the same opaque token', async () => {
+    const fx = makeFixture();
+    try {
+      fx.connectA();
+      clearTransport(fx);
+      const api = makeFakeApi();
+      const broker = newBroker(fx, api);
+      fx.clientA.publishGitProposal({
+        ...A, operation: 'commit', proposalId: PROPOSAL_A, message: COMMIT_MESSAGE,
+      });
+      // First drain: the chunk may have reached Telegram (recorded) but the
+      // outcome is uncertain, so the event stays unacknowledged.
+      api.failNextSendsWith(1, 'timeout');
+      await broker.drainTuiEvents();
+      assert.equal(api.sent.length, 1, 'the uncertain chunk is recorded as possibly delivered');
+      assert.equal(fx.store.listPendingBrokerTuiEvents({ limit: 10 }).length, 1,
+        'an uncertain send must never acknowledge the proposal event');
+      const possiblyDeliveredToken = approvalToken(api);
+      // Retry: the same event renders again and MUST keep the same token,
+      // otherwise the already-delivered card would go stale.
+      await broker.drainTuiEvents();
+      assert.equal(approvalToken(api), possiblyDeliveredToken,
+        'the retried card must reuse the token of the possibly-delivered card');
+      const approveData = lastButtons(api).find((b) => b.callback_data.startsWith('v1:g:')).callback_data;
+      await deliver(broker, api, cb(approveData));
+      assert.equal(fx.clientA.poll(A).commands.length, 1,
+        'the possibly-delivered card stays valid and approves exactly once');
+    } finally { fx.close(); }
+  });
+
+  test('a consumed approval acknowledges its proposal event atomically: no drain or restart can revive it', async () => {
+    const fx = makeFixture();
+    try {
+      fx.connectA();
+      clearTransport(fx);
+      const api = makeFakeApi();
+      const broker = newBroker(fx, api);
+      fx.clientA.publishGitProposal({
+        ...A, operation: 'commit', proposalId: PROPOSAL_A, message: COMMIT_MESSAGE,
+      });
+      // Uncertain send: the card may have reached Telegram, so the event
+      // stays unacknowledged in the store.
+      api.failNextSendsWith(1, 'timeout');
+      await broker.drainTuiEvents();
+      assert.equal(fx.store.listPendingBrokerTuiEvents({ limit: 10 }).length, 1,
+        'the uncertain proposal event must remain pending');
+      const approveData = lastButtons(api).find((b) => b.callback_data.startsWith('v1:g:')).callback_data;
+      await deliver(broker, api, cb(approveData));
+      // poll() claims commands, so the one-use guarantee is asserted
+      // cumulatively: no poll after the approval may ever yield MORE.
+      let dispatched = fx.clientA.poll(A).commands.length;
+      assert.equal(dispatched, 1);
+      const sentAfterApproval = api.sent.length;
+      // The still-pending event must be gone now: a later drain can never
+      // re-render the consumed proposal with a fresh token.
+      await broker.drainTuiEvents();
+      assert.equal(api.sent.length, sentAfterApproval,
+        'a drained consumed proposal must never render a second approval card');
+      dispatched += fx.clientA.poll(A).commands.length;
+      assert.equal(dispatched, 1,
+        'no second execute command may be dispatched for the same proposal');
+      // Even a full broker restart plus drain cannot revive it.
+      const api2 = makeFakeApi();
+      const broker2 = newBroker(fx, api2);
+      await broker2.drainTuiEvents();
+      assert.equal(api2.sent.length, 0,
+        'a restart must not resurrect a consumed proposal as a live approval');
+      dispatched += fx.clientA.poll(A).commands.length;
+      assert.equal(dispatched, 1,
+        'the one-use guarantee survives the restart');
+    } finally { fx.close(); }
+  });
+
+  test('a consumed proposal-scoped cancel acknowledges its proposal event atomically too', async () => {
+    const fx = makeFixture();
+    try {
+      fx.connectA();
+      clearTransport(fx);
+      const api = makeFakeApi();
+      const broker = newBroker(fx, api);
+      fx.clientA.publishGitProposal({
+        ...A, operation: 'commit', proposalId: PROPOSAL_A, message: COMMIT_MESSAGE,
+      });
+      api.failNextSendsWith(1, 'timeout');
+      await broker.drainTuiEvents();
+      const cancelData = lastButtons(api).find((b) => b.callback_data.startsWith('v1:X:')).callback_data;
+      await deliver(broker, api, cb(cancelData));
+      assert.match(api.sent[api.sent.length - 1].text, /nothing was changed/);
+      const sentAfterCancel = api.sent.length;
+      await broker.drainTuiEvents();
+      assert.equal(api.sent.length, sentAfterCancel,
+        'a cancelled proposal must never render a second approval card');
+      assert.equal(fx.clientA.poll(A).commands.length, 0);
+      const api2 = makeFakeApi();
+      const broker2 = newBroker(fx, api2);
+      await broker2.drainTuiEvents();
+      assert.equal(api2.sent.length, 0,
+        'a restart must not resurrect a cancelled proposal as a live approval');
+      assert.equal(fx.clientA.poll(A).commands.length, 0);
+    } finally { fx.close(); }
+  });
+
+  test('a matching approve tap with a dead proposing session still retires the exact proposal event', async () => {
+    const fx = makeFixture();
+    try {
+      fx.connectA();
+      clearTransport(fx);
+      const api = makeFakeApi();
+      const broker = newBroker(fx, api);
+      fx.clientA.publishGitProposal({
+        ...A, operation: 'commit', proposalId: PROPOSAL_A, message: COMMIT_MESSAGE,
+      });
+      // Uncertain send: the card may have reached Telegram, so the event
+      // stays unacknowledged in the store.
+      api.failNextSendsWith(1, 'timeout');
+      await broker.drainTuiEvents();
+      assert.equal(fx.store.listPendingBrokerTuiEvents({ limit: 10 }).length, 1,
+        'the uncertain proposal event must remain pending');
+      const approveData = lastButtons(api).find((b) => b.callback_data.startsWith('v1:g:')).callback_data;
+      // The proposing session ages out BEFORE the owner taps Approve.
+      fx.advance(31_000);
+      await deliver(broker, api, cb(approveData));
+      assert.match(api.sent[api.sent.length - 1].text, /already expired/,
+        'a dead proposing session must get the stale notice, not an approval');
+      let dispatched = fx.clientA.poll(A).commands.length;
+      assert.equal(dispatched, 0, 'a dead proposing session dispatches nothing');
+      // The consumed token must still retire the event: no fresh approval
+      // may be rendered by a later drain or a restart.
+      const sentAfterTap = api.sent.length;
+      await broker.drainTuiEvents();
+      assert.equal(api.sent.length, sentAfterTap,
+        'a consumed proposal on a dead session must never re-render as a live approval');
+      dispatched += fx.clientA.poll(A).commands.length;
+      assert.equal(dispatched, 0, 'no execute command may appear after the re-render window');
+      const api2 = makeFakeApi();
+      const broker2 = newBroker(fx, api2);
+      await broker2.drainTuiEvents();
+      assert.equal(api2.sent.length, 0,
+        'a restart must not resurrect the consumed dead-session proposal');
+      dispatched += fx.clientA.poll(A).commands.length;
+      assert.equal(dispatched, 0, 'the one-use guarantee survives the restart');
+    } finally { fx.close(); }
+  });
+
+  test('git executions report through the existing command_result convention', async () => {
+    const fx = makeFixture();
+    try {
+      fx.connectA();
+      clearTransport(fx);
+      const api = makeFakeApi();
+      const broker = newBroker(fx, api);
+      fx.clientA.publishGitProposal({
+        ...A, operation: 'commit', proposalId: PROPOSAL_A, message: COMMIT_MESSAGE,
+      });
+      await broker.drainTuiEvents();
+      const approveData = lastButtons(api).find((b) => b.callback_data.startsWith('v1:g:')).callback_data;
+      await deliver(broker, api, cb(approveData));
+      const [command] = fx.clientA.poll(A).commands;
+      assert.equal(fx.clientA.reportCommandResult({
+        ...A, commandId: command.commandId, ok: false, resultCode: 'git_drift',
+      }).ok, true);
+      await broker.drainTuiEvents();
+      assert.match(api.sent[api.sent.length - 1].text, /changed since you approved/,
+        'Git failure codes ride the closed fixed-copy mapping, never a raw code echo');
+    } finally { fx.close(); }
+  });
+
+  test('Git result codes render operation-specific Telegram copy (G4)', async () => {
+    const fx = makeFixture();
+    try {
+      fx.connectA();
+      clearTransport(fx);
+      const api = makeFakeApi();
+      const broker = newBroker(fx, api);
+      const cases = [
+        ['git_commit_proposal_ready', /Commit approval ready\./],
+        ['git_push_proposal_ready', /Push approval ready\./],
+        ['git_commit_completed', /Commit completed\./],
+        ['git_push_completed', /Push completed\./],
+      ];
+      const failureCases = [
+        ['git_drift', /changed since you approved/],
+        ['git_failed', /did not complete/],
+        ['git_unavailable', /could not be reached/],
+        ['not_a_repository', /not working inside a Git repository/],
+        ['detached_head', /not on a branch/],
+        ['nothing_staged', /Nothing is prepared to commit/],
+        ['no_upstream', /has no online copy yet/],
+        ['stale_proposal', /no longer current/],
+        ['proposal_failed', /could not be prepared/],
+        ['pi_busy', /Pi is busy/],
+        ['no_cwd', /no folder open/],
+      ];
+      for (const [code, pattern] of cases) {
+        assert.equal(
+          fx.store.enqueueTuiCommand({ trackingId: A.trackingId, kind: 'status', payload: null }).ok,
+          true,
+        );
+        const [command] = fx.clientA.poll(A).commands;
+        assert.equal(
+          fx.clientA.reportCommandResult({ ...A, commandId: command.commandId, ok: true, resultCode: code }).ok,
+          true,
+        );
+        await broker.drainTuiEvents();
+        assert.match(api.sent[api.sent.length - 1].text, pattern,
+          `${code} must render operation-specific copy`);
+      }
+      for (const [code, pattern] of failureCases) {
+        assert.equal(
+          fx.store.enqueueTuiCommand({ trackingId: A.trackingId, kind: 'status', payload: null }).ok,
+          true,
+        );
+        const [command] = fx.clientA.poll(A).commands;
+        assert.equal(
+          fx.clientA.reportCommandResult({ ...A, commandId: command.commandId, ok: false, resultCode: code }).ok,
+          true,
+        );
+        await broker.drainTuiEvents();
+        const text = api.sent[api.sent.length - 1].text;
+        assert.match(text, pattern, `${code} must render its fixed closed failure copy`);
+        assert.doesNotMatch(text, new RegExp(`\\(${code}\\)`),
+          `${code} must never be echoed as raw detail`);
+      }
+      // An unmapped Git-family code never renders arbitrary detail over the
+      // Telegram wire: it falls to the safe generic failure line.
+      assert.equal(
+        fx.store.enqueueTuiCommand({ trackingId: A.trackingId, kind: 'status', payload: null }).ok,
+        true,
+      );
+      const [unknownCommand] = fx.clientA.poll(A).commands;
+      assert.equal(
+        fx.clientA.reportCommandResult({ ...A, commandId: unknownCommand.commandId, ok: false, resultCode: 'git_surprise_123' }).ok,
+        true,
+      );
+      await broker.drainTuiEvents();
+      const unmappedText = api.sent[api.sent.length - 1].text;
+      assert.match(unmappedText, /command failed\.$/,
+        'unmapped Git-family codes must fall to the safe generic line');
+      assert.doesNotMatch(unmappedText, /surprise_123/,
+        'the unmapped code must never be echoed');
+      // The uncertain outcome keeps its distinct inspect-first wording.
+      assert.equal(
+        fx.store.enqueueTuiCommand({ trackingId: A.trackingId, kind: 'status', payload: null }).ok,
+        true,
+      );
+      const [command] = fx.clientA.poll(A).commands;
+      assert.equal(
+        fx.clientA.reportCommandResult({ ...A, commandId: command.commandId, ok: false, resultCode: 'git_unknown' }).ok,
+        true,
+      );
+      await broker.drainTuiEvents();
+      const unknownText = api.sent[api.sent.length - 1].text;
+      assert.match(unknownText, /unknown/i);
+      assert.match(unknownText, /Check your repository before trying again/);
+      assert.doesNotMatch(unknownText, /https?:|credential/i);
     } finally { fx.close(); }
   });
 });

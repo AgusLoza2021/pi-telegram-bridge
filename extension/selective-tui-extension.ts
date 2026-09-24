@@ -17,6 +17,11 @@
 //   module-default <module>/.local/state/bridge.sqlite. No shell, no API
 //   process, no network, no Telegram access, no tool registration: the
 //   broker process is the only side that talks to Telegram.
+// - G3 narrow exception: closed typed remote `git_commit_*`/`git_push_*`
+//   commands run LOCAL Git through pi.exec('git', fixedOrValidatedArgs,
+//   {cwd, timeout}) only — snapshot-bound, one-use, owner-approved,
+//   never force, hooks honored (they may execute local programs or alter
+//   the resulting commit), raw Git stderr never leaves this module.
 // - Forwarded data is deliberately narrow: connection state transitions
 //   (agent_start/agent_settled, ui_prompt_start/ui_prompt_end) and, on
 //   assistant message_end, FINALIZED text blocks only. Thinking/reasoning
@@ -37,6 +42,7 @@
 //   or replaced connection degrades to "disconnected", it never crashes
 //   Pi and never echoes store payloads into the TUI.
 
+import { createHash, randomBytes } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -67,6 +73,138 @@ const POLL_INTERVAL_MS = 500;
 // Rejected prompt-like text: leading whitespace then a slash. This covers
 // extension commands, skills and prompt templates alike.
 const SLASH_PREFIX_RE = /^\s*\//;
+
+// --- G3: remote Git commit/push (snapshot-bound, fail closed) ---------------
+//
+// Boundaries (owner-approved): commits include ONLY what is already
+// staged (no `git add`, no `-a`); the message is FIXED; local Git hooks
+// are honored (they may execute local programs or alter the resulting
+// commit); pushes target ONLY the current branch's configured upstream
+// with an explicit refspec and NEVER force. Every Git invocation goes
+// through pi.exec('git', fixedOrValidatedArgs, { cwd, timeout }) — no
+// command string, path, remote or refspec ever arrives from Telegram.
+//
+// Uncertain outcomes (timeout, kill, exec failure) are reported as
+// `git_unknown`, never replayed, and never reported as definite success
+// or failure: the owner must inspect the repository and reissue.
+//
+// Successes carry typed result codes (`git_commit_proposal_ready`,
+// `git_push_proposal_ready`, `git_commit_completed`, `git_push_completed`)
+// so the Telegram copy names the exact operation instead of a generic
+// "command finished" line.
+//
+// G3 correction: a process exit of 0 is NOT trusted on its own — the
+// pi.exec/child-process wrapper can map external signal termination to
+// `code: 0` with `killed: false`. Every mutating invocation is followed
+// by a bounded READ-ONLY verification with fixed argv, and success is
+// reported only when the repository state proves the exact approved
+// mutation: for a commit, HEAD is a direct child of the approved head on
+// the same branch with the fixed subject; for a push, the configured
+// upstream tracking ref resolves to the approved HEAD. A definite
+// non-zero exit with post-check-proven absence of mutation is a definite
+// failure; everything else is `git_unknown`.
+
+/** The one automatic commit message; shown exactly on the approval card. */
+const FIXED_COMMIT_MESSAGE = 'chore: update project files';
+
+/** Bounded Git timeouts: snapshots are quick; hooks may legitimately take longer. */
+const GIT_SNAPSHOT_TIMEOUT_MS = 10_000;
+const GIT_MUTATING_TIMEOUT_MS = 120_000;
+
+/** Pending proposals are short-lived: execution after this window fails closed. */
+const DEFAULT_GIT_PROPOSAL_TTL_MS = 10 * 60_000;
+
+const GIT_COMMAND_KINDS: ReadonlySet<string> = new Set([
+  'git_commit_request',
+  'git_push_request',
+  'git_commit_execute',
+  'git_push_execute',
+]);
+
+/**
+ * Safe ref tokens for validated argv pieces (branch, remote, upstream).
+ * Rejects option-like values, range dots, whitespace, control characters
+ * and .lock suffixes so a hostile Git state can never become an argument.
+ */
+const GIT_REF_TOKEN_RE = /^[A-Za-z0-9][A-Za-z0-9._/-]*$/;
+
+function safeRefToken(raw: string): string | null {
+  if (!GIT_REF_TOKEN_RE.test(raw) || raw.includes('..') || raw.endsWith('.lock')
+    || raw.endsWith('/')) {
+    return null;
+  }
+  return raw;
+}
+
+/** Git commit/object ids: SHA-1 (40) or SHA-256 (64) lowercase hex. */
+function isGitSha(raw: string): boolean {
+  return /^[0-9a-f]{40}$/.test(raw) || /^[0-9a-f]{64}$/.test(raw);
+}
+
+function sha256Fingerprint(content: string): string {
+  return createHash('sha256').update(content, 'utf8').digest('hex').slice(0, 16);
+}
+
+/** The exact snapshot a commit proposal is bound to. */
+interface CommitSnapshot {
+  operation: 'commit';
+  repoRoot: string;
+  branch: string;
+  headSha: string;
+  summary: string;
+  fingerprint: string;
+}
+
+/** The exact snapshot a push proposal is bound to. */
+interface PushSnapshot {
+  operation: 'push';
+  repoRoot: string;
+  branch: string;
+  headSha: string;
+  remote: string;
+  upstreamBranch: string;
+  ahead: number;
+  fingerprint: string;
+}
+
+type GitSnapshot = CommitSnapshot | PushSnapshot
+  | { operation: 'commit' | 'push'; error: string };
+
+/** One in-memory, one-use, connection-bound pending proposal. */
+interface PendingGitProposal {
+  operation: 'commit' | 'push';
+  proposalId: string;
+  createdAt: number;
+  fingerprint: string;
+}
+
+type GitExecResult = { code: number; stdout: string; stderr: string; killed: boolean };
+type GitRunOutcome = { ok: true; stdout: string }
+  | { ok: false; definite: boolean };
+
+function commitProposalMessage(snapshot: CommitSnapshot): string {
+  return [
+    FIXED_COMMIT_MESSAGE,
+    '',
+    `Branch: ${snapshot.branch}`,
+    `Staged: ${snapshot.summary}`,
+    `Fingerprint: ${snapshot.fingerprint}`,
+  ].join('\n');
+}
+
+function pushProposalMessage(snapshot: PushSnapshot): string {
+  return [
+    `Branch: ${snapshot.branch} → ${snapshot.remote}/${snapshot.upstreamBranch}`,
+    `Ahead: ${snapshot.ahead} ${snapshot.ahead === 1 ? 'commit' : 'commits'}`,
+    `HEAD: ${snapshot.headSha}`,
+    `Fingerprint: ${snapshot.fingerprint}`,
+  ].join('\n');
+}
+
+/** Stable proposal id: opaque, hex, and never an argument to Git. */
+function newProposalId(): string {
+  return randomBytes(16).toString('hex');
+}
 
 // --- Beginner /tg copy (docs/BEGINNER_UX.md section 4) ----------------------
 // Local TUI surface only; Telegram-side beginner copy stays centralized in
@@ -135,6 +273,10 @@ interface BridgeConnection {
   uiPromptActive: boolean;
   heartbeatTimer: ReturnType<typeof setInterval> | null;
   pollTimer: ReturnType<typeof setInterval> | null;
+  /** True while a Git snapshot/execution is in flight; polls never overlap it. */
+  gitBusy: boolean;
+  /** Bounded in-memory one-use proposal; lives and dies with this connection. */
+  gitProposal: PendingGitProposal | null;
 }
 
 // Ids are always produced by TuiBridgeClient (32 hex chars); validate the
@@ -266,14 +408,22 @@ function defaultStateDirectory(): string {
 
 export class SelectiveTuiBridgeExtension {
   readonly #stateDirectory: string;
+  readonly #gitProposalTtlMs: number;
   #pi: ExtensionAPI | null = null;
   #connection: BridgeConnection | null = null;
   #store: Store | null = null;
   /** Latest live session context; the ONLY context abort/status may use. */
   #latestCtx: ExtensionContext | null = null;
 
-  constructor(stateDirectory: string) {
+  constructor(
+    stateDirectory: string,
+    options: { gitProposalTtlMs?: number } = {},
+  ) {
     this.#stateDirectory = stateDirectory;
+    this.#gitProposalTtlMs = typeof options.gitProposalTtlMs === 'number'
+      && Number.isFinite(options.gitProposalTtlMs) && options.gitProposalTtlMs > 0
+      ? options.gitProposalTtlMs
+      : DEFAULT_GIT_PROPOSAL_TTL_MS;
   }
 
   register(pi: ExtensionAPI): void {
@@ -542,6 +692,8 @@ export class SelectiveTuiBridgeExtension {
         uiPromptActive: false,
         heartbeatTimer: null,
         pollTimer: null,
+        gitBusy: false,
+        gitProposal: null,
       };
       this.#writeOptIn({
         trackingId: result.trackingId,
@@ -716,6 +868,8 @@ export class SelectiveTuiBridgeExtension {
         uiPromptActive: false,
         heartbeatTimer: null,
         pollTimer: null,
+        gitBusy: false,
+        gitProposal: null,
       };
       this.#startTimers();
       this.#setFooter(result.shortId);
@@ -750,8 +904,21 @@ export class SelectiveTuiBridgeExtension {
   }
 
   #pollTick(): void {
+    void this.pollOnce().catch(() => {
+      // A poll cycle must never crash Pi; the next tick retries.
+    });
+  }
+
+  /**
+   * One poll cycle: claim remote commands and handle them. Git commands
+   * are handled strictly one at a time — while one is in flight no further
+   * poll may claim or dispatch anything, so async polling can never
+   * overlap a Git command or double-report. Public so tests and
+   * diagnostics can drive a cycle deterministically.
+   */
+  async pollOnce(): Promise<void> {
     const c = this.#connection;
-    if (!c) return;
+    if (!c || c.gitBusy) return;
     let commands: Array<{ commandId: string; kind: string; payload: unknown }> = [];
     try {
       const result = c.client.poll({
@@ -767,7 +934,17 @@ export class SelectiveTuiBridgeExtension {
       return;
     }
     for (const command of commands) {
-      this.#handleRemoteCommand(c, command);
+      if (this.#connection !== c) return; // torn down mid-batch: stop now
+      if (GIT_COMMAND_KINDS.has(command.kind)) {
+        c.gitBusy = true;
+        try {
+          await this.#handleRemoteCommand(c, command);
+        } finally {
+          c.gitBusy = false;
+        }
+      } else {
+        this.#handleRemoteCommand(c, command);
+      }
     }
   }
 
@@ -888,6 +1065,11 @@ export class SelectiveTuiBridgeExtension {
           this.#unlinkConnected();
           return;
         }
+        case 'git_commit_request':
+        case 'git_push_request':
+        case 'git_commit_execute':
+        case 'git_push_execute':
+          return this.#handleGitCommand(c, command, report);
         default:
           report(false, undefined, 'unknown_command');
       }
@@ -900,6 +1082,309 @@ export class SelectiveTuiBridgeExtension {
     if (c.uiPromptActive) return 'waiting';
     if (c.agentActive) return 'busy';
     return 'connected';
+  }
+
+  // --- G3: snapshot-bound Git commit/push --------------------------------
+
+  /**
+   * The single Git entry point: pi.exec('git', args, {cwd, timeout}) with
+   * only fixed or locally validated argv. Nothing else may spawn.
+   */
+  async #runGit(
+    c: BridgeConnection,
+    args: string[],
+    timeoutMs: number,
+  ): Promise<GitRunOutcome> {
+    const exec = (this.#pi as { exec?: unknown } | null)?.exec;
+    if (typeof exec !== 'function') return { ok: false, definite: true };
+    try {
+      const raw = await (exec as (
+        command: string,
+        args: string[],
+        options: { cwd: string; timeout: number },
+      ) => Promise<unknown>)('git', args, { cwd: c.cwd as string, timeout: timeoutMs });
+      const result = raw as Partial<GitExecResult> | null | undefined;
+      if (!result || typeof result.stdout !== 'string') return { ok: false, definite: false };
+      if (result.killed === true) return { ok: false, definite: false };
+      if (typeof result.code !== 'number') return { ok: false, definite: false };
+      if (result.code !== 0) return { ok: false, definite: true };
+      return { ok: true, stdout: result.stdout };
+    } catch {
+      // An exec that never returned a result is UNCERTAIN, never a failure.
+      return { ok: false, definite: false };
+    }
+  }
+
+  /**
+   * Bounded read-only proof that HEAD is a direct child of the approved
+   * head on the same branch with the fixed subject. Fixed argv only; a
+   * failing lookup means the proof FAILS (never a guess).
+   */
+  async #verifyCommit(c: BridgeConnection, snapshot: CommitSnapshot): Promise<boolean> {
+    if (!isGitSha(snapshot.headSha)) return false;
+    const parent = await this.#runGit(c, ['rev-parse', 'HEAD^'], GIT_SNAPSHOT_TIMEOUT_MS);
+    if (!parent.ok || parent.stdout.trim() !== snapshot.headSha) return false;
+    const branch = await this.#runGit(c, ['rev-parse', '--abbrev-ref', 'HEAD'], GIT_SNAPSHOT_TIMEOUT_MS);
+    if (!branch.ok || branch.stdout.trim() !== snapshot.branch) return false;
+    const subject = await this.#runGit(c, ['log', '-1', '--pretty=%s', 'HEAD'], GIT_SNAPSHOT_TIMEOUT_MS);
+    if (!subject.ok || subject.stdout.trim() !== FIXED_COMMIT_MESSAGE) return false;
+    return true;
+  }
+
+  /**
+   * Bounded read-only proof that the configured upstream tracking ref now
+   * resolves to the approved HEAD. Fixed/validated argv only.
+   */
+  async #verifyPush(c: BridgeConnection, snapshot: PushSnapshot): Promise<boolean> {
+    const remote = safeRefToken(snapshot.remote);
+    const upstream = safeRefToken(snapshot.upstreamBranch);
+    if (remote === null || upstream === null || !isGitSha(snapshot.headSha)) {
+      return false;
+    }
+    const ref = await this.#runGit(
+      c,
+      ['rev-parse', `refs/remotes/${remote}/${upstream}`],
+      GIT_SNAPSHOT_TIMEOUT_MS,
+    );
+    return ref.ok && ref.stdout.trim() === snapshot.headSha;
+  }
+
+  /**
+   * Read-only snapshot of the commit surface: repository root, current
+   * non-detached branch, HEAD, and a deterministic capture of the FULL
+   * staged index via `git ls-files --stage -z` (modes, blob object ids and
+   * paths, NUL-delimited). The listing is what the fingerprint hashes: a
+   * text diff cannot bind binary staged blobs (distinct binaries both
+   * render "Binary files differ"), and diff output could invoke configured
+   * external diff/textconv helpers — so diff calls are only for the
+   * nothing-staged check and the bounded human summary, and always carry
+   * --no-ext-diff --no-textconv. Fails closed on every surprise.
+   */
+  async #snapshotCommit(c: BridgeConnection): Promise<GitSnapshot> {
+    const root = await this.#runGit(c, ['rev-parse', '--show-toplevel'], GIT_SNAPSHOT_TIMEOUT_MS);
+    if (!root.ok) return { operation: 'commit', error: 'not_a_repository' };
+    const repoRoot = root.stdout.trim();
+    const branchRes = await this.#runGit(c, ['rev-parse', '--abbrev-ref', 'HEAD'], GIT_SNAPSHOT_TIMEOUT_MS);
+    if (!branchRes.ok) return { operation: 'commit', error: 'git_unavailable' };
+    const branch = branchRes.stdout.trim();
+    if (branch === 'HEAD' || safeRefToken(branch) === null) {
+      return { operation: 'commit', error: 'detached_head' };
+    }
+    const head = await this.#runGit(c, ['rev-parse', 'HEAD'], GIT_SNAPSHOT_TIMEOUT_MS);
+    if (!head.ok) return { operation: 'commit', error: 'git_unavailable' };
+    const headSha = head.stdout.trim();
+    if (!/^[0-9a-f]{40}$/.test(headSha) && !/^[0-9a-f]{64}$/.test(headSha)) {
+      return { operation: 'commit', error: 'git_unavailable' };
+    }
+    const listing = await this.#runGit(c, ['ls-files', '--stage', '-z'], GIT_SNAPSHOT_TIMEOUT_MS);
+    if (!listing.ok) return { operation: 'commit', error: 'git_unavailable' };
+    if (listing.stdout.length === 0) return { operation: 'commit', error: 'nothing_staged' };
+    const patch = await this.#runGit(
+      c,
+      ['diff', '--cached', '--no-ext-diff', '--no-textconv'],
+      GIT_SNAPSHOT_TIMEOUT_MS,
+    );
+    if (!patch.ok) return { operation: 'commit', error: 'git_unavailable' };
+    if (patch.stdout.trim().length === 0) {
+      return { operation: 'commit', error: 'nothing_staged' };
+    }
+    const stat = await this.#runGit(
+      c,
+      ['diff', '--cached', '--no-ext-diff', '--no-textconv', '--shortstat'],
+      GIT_SNAPSHOT_TIMEOUT_MS,
+    );
+    if (!stat.ok) return { operation: 'commit', error: 'git_unavailable' };
+    const summary = stat.stdout.trim() || 'changes staged';
+    // The fingerprint binds the complete captured staged-index listing —
+    // blob object ids, modes and paths — NOT the text diff, so binary
+    // mutations (invisible in diff output) still cause approval drift.
+    const fingerprint = sha256Fingerprint(`${repoRoot}\n${branch}\n${headSha}\n${listing.stdout}`);
+    return { operation: 'commit', repoRoot, branch, headSha, summary, fingerprint };
+  }
+
+  /**
+   * Read-only snapshot of the push surface: repository root, current
+   * non-detached branch, HEAD, and the branch's CONFIGURED upstream split
+   * into a validated remote + branch pair. Fails closed on every surprise.
+   */
+  async #snapshotPush(c: BridgeConnection): Promise<GitSnapshot> {
+    const root = await this.#runGit(c, ['rev-parse', '--show-toplevel'], GIT_SNAPSHOT_TIMEOUT_MS);
+    if (!root.ok) return { operation: 'push', error: 'not_a_repository' };
+    const repoRoot = root.stdout.trim();
+    const branchRes = await this.#runGit(c, ['rev-parse', '--abbrev-ref', 'HEAD'], GIT_SNAPSHOT_TIMEOUT_MS);
+    if (!branchRes.ok) return { operation: 'push', error: 'git_unavailable' };
+    const branch = branchRes.stdout.trim();
+    if (branch === 'HEAD' || safeRefToken(branch) === null) {
+      return { operation: 'push', error: 'detached_head' };
+    }
+    const head = await this.#runGit(c, ['rev-parse', 'HEAD'], GIT_SNAPSHOT_TIMEOUT_MS);
+    if (!head.ok) return { operation: 'push', error: 'git_unavailable' };
+    const headSha = head.stdout.trim();
+    if (!/^[0-9a-f]{40}$/.test(headSha) && !/^[0-9a-f]{64}$/.test(headSha)) {
+      return { operation: 'push', error: 'git_unavailable' };
+    }
+    const upstreamRes = await this.#runGit(
+      c,
+      ['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{u}'],
+      GIT_SNAPSHOT_TIMEOUT_MS,
+    );
+    if (!upstreamRes.ok) return { operation: 'push', error: 'no_upstream' };
+    const upstream = upstreamRes.stdout.trim();
+    const slash = upstream.indexOf('/');
+    if (slash <= 0 || safeRefToken(upstream) === null) {
+      return { operation: 'push', error: 'no_upstream' };
+    }
+    const remote = upstream.slice(0, slash);
+    const upstreamBranch = upstream.slice(slash + 1);
+    if (safeRefToken(remote) === null || safeRefToken(upstreamBranch) === null) {
+      return { operation: 'push', error: 'no_upstream' };
+    }
+    const aheadRes = await this.#runGit(c, ['rev-list', '@{u}..HEAD', '--count'], GIT_SNAPSHOT_TIMEOUT_MS);
+    if (!aheadRes.ok) return { operation: 'push', error: 'git_unavailable' };
+    const ahead = Number.parseInt(aheadRes.stdout.trim(), 10);
+    if (!Number.isSafeInteger(ahead) || ahead < 0) {
+      return { operation: 'push', error: 'git_unavailable' };
+    }
+    const fingerprint = sha256Fingerprint(`${repoRoot}\n${branch}\n${upstream}\n${headSha}`);
+    return {
+      operation: 'push', repoRoot, branch, headSha, remote, upstreamBranch, ahead, fingerprint,
+    };
+  }
+
+  /**
+   * The whole remote Git lifecycle. `report` (from #handleRemoteCommand)
+   * guarantees EXACTLY one terminal result per claimed command on every
+   * path. The proposal is consumed BEFORE anything else so an execute is
+   * strictly one-use; the snapshot is re-computed and compared right
+   * before any mutating call; hooks run normally (no --no-verify, no
+   * hooksPath override, no -c); push argv is remote + exact refspec and
+   * can never contain a force flag; raw Git stderr never leaves this
+   * module — Telegram only ever sees a whitelisted result code.
+   */
+  async #handleGitCommand(
+    c: BridgeConnection,
+    command: { commandId: string; kind: string; payload: unknown },
+    report: (ok: boolean, text?: string, resultCode?: string) => void,
+  ): Promise<void> {
+    try {
+      if (!c.cwd) {
+        report(false, undefined, 'no_cwd');
+        return;
+      }
+      // Busy guard: a Git snapshot or commit during an agent turn is
+      // refused before anything runs or is proposed.
+      if (this.#isBusy(this.#latestCtx)) {
+        report(false, undefined, 'pi_busy');
+        return;
+      }
+      if (command.kind === 'git_commit_request' || command.kind === 'git_push_request') {
+        const wantPush = command.kind === 'git_push_request';
+        const snapshot = wantPush
+          ? await this.#snapshotPush(c)
+          : await this.#snapshotCommit(c);
+        if ('error' in snapshot) {
+          report(false, undefined, snapshot.error);
+          return;
+        }
+        const proposalId = newProposalId();
+        const message = wantPush
+          ? pushProposalMessage(snapshot as PushSnapshot)
+          : commitProposalMessage(snapshot as CommitSnapshot);
+        // Bounded state: the latest proposal replaces any earlier one; it
+        // lives on the connection and dies with it.
+        c.gitProposal = { operation: snapshot.operation, proposalId, createdAt: Date.now(), fingerprint: snapshot.fingerprint };
+        try {
+          c.client.publishGitProposal({
+            trackingId: c.trackingId,
+            connectionId: c.connectionId,
+            operation: snapshot.operation,
+            proposalId,
+            message,
+          });
+        } catch {
+          c.gitProposal = null;
+          report(false, undefined, 'proposal_failed');
+          return;
+        }
+        // Typed success code: the Telegram copy is operation-specific
+        // ("Commit/Push approval ready"), never a generic result line.
+        report(true, undefined, wantPush ? 'git_push_proposal_ready' : 'git_commit_proposal_ready');
+        return;
+      }
+      // --- execute phase: one-use, snapshot-revalidated ---
+      const wantPush = command.kind === 'git_push_execute';
+      const payload = command.payload as { proposalId?: unknown } | null;
+      const proposalId = typeof payload?.proposalId === 'string' ? payload.proposalId : null;
+      const proposal = c.gitProposal;
+      c.gitProposal = null; // consume first: strictly one-use
+      if (!proposal || proposalId === null || proposal.proposalId !== proposalId
+        || proposal.operation !== (wantPush ? 'push' : 'commit')) {
+        report(false, undefined, 'stale_proposal');
+        return;
+      }
+      if (Date.now() - proposal.createdAt > this.#gitProposalTtlMs) {
+        report(false, undefined, 'stale_proposal');
+        return;
+      }
+      const fresh = wantPush ? await this.#snapshotPush(c) : await this.#snapshotCommit(c);
+      if ('error' in fresh) {
+        // Availability failures stay git_unavailable (state could not be
+        // read; the owner should check and request again). Only a real
+        // snapshot-vs-approval mismatch is drift. Failing closed either way.
+        report(false, undefined, fresh.error);
+        return;
+      }
+      if (fresh.fingerprint !== proposal.fingerprint) {
+        report(false, undefined, 'git_drift');
+        return;
+      }
+      // Push argv is tag-scope-proof: --no-follow-tags defeats a hostile
+      // configured push.followTags, the explicit HEAD refspec pushes only
+      // the approved branch tip, and --atomic makes the ref update
+      // all-or-nothing (Git >= 2.4 client and server, the assumed contract
+      // floor). Force is never used.
+      const outcome = wantPush
+        ? await this.#runGit(
+          c,
+          [
+            'push', '--no-follow-tags', '--atomic', (fresh as PushSnapshot).remote,
+            `HEAD:refs/heads/${(fresh as PushSnapshot).upstreamBranch}`,
+          ],
+          GIT_MUTATING_TIMEOUT_MS,
+        )
+        : await this.#runGit(c, ['commit', '-m', FIXED_COMMIT_MESSAGE], GIT_MUTATING_TIMEOUT_MS);
+      const verify = () => (wantPush
+        ? this.#verifyPush(c, fresh as PushSnapshot)
+        : this.#verifyCommit(c, fresh as CommitSnapshot));
+      if (outcome.ok) {
+        // Exit 0 alone proves nothing (the wrapper may map a signal kill
+        // to code 0): the repository must prove the approved mutation.
+        if (await verify()) {
+          report(true, undefined, wantPush ? 'git_push_completed' : 'git_commit_completed');
+          return;
+        }
+        report(false, undefined, 'git_unknown');
+        return;
+      }
+      if (outcome.definite) {
+        // Definite non-zero exit: a failure UNLESS the post-check proves
+        // the repository mutated anyway (e.g. a hook committed and then
+        // something failed) — that mutation is unclassifiable.
+        if (await verify()) {
+          report(false, undefined, 'git_unknown');
+          return;
+        }
+        report(false, undefined, 'git_failed');
+        return;
+      }
+      // Killed, timed out or no result: UNCERTAIN, never replayed.
+      report(false, undefined, 'git_unknown');
+    } catch {
+      // A catch here can follow a real mutation whose verification threw:
+      // the outcome is UNCERTAIN and needs manual inspection, never a
+      // definite label. git_unknown is the closed-copy contract.
+      report(false, undefined, 'git_unknown');
+    }
   }
 
   #pushState(c: BridgeConnection): void {

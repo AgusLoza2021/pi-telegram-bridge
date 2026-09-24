@@ -495,3 +495,212 @@ describe('store: transport inbox, outbox, offset', () => {
     assert.equal(after.length, 0);
   });
 });
+
+describe('store: git approval protocol (closed typed command/event contract, G2)', () => {
+  const TRACKING = 'a'.repeat(32);
+  const CONNECTION = '1'.repeat(32);
+  const PROPOSAL_ID = 'ab12cd34ef560172';
+
+  let store;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(TEST_RUNS, 'store-'));
+    store = openStore('git-protocol', { isProcessAlive: () => true });
+    const res = store.registerTuiSession({
+      trackingId: TRACKING,
+      connectionId: CONNECTION,
+      label: 'alpha',
+      pid: 1111,
+      staleCutoff: T0,
+    });
+    assert.equal(res.ok, true);
+  });
+
+  afterEach(() => {
+    store.close();
+  });
+
+  test('accepts the four closed git command kinds with their exact payload shapes', () => {
+    for (const kind of ['git_commit_request', 'git_push_request']) {
+      assert.equal(
+        store.enqueueTuiCommand({ trackingId: TRACKING, kind, payload: null }).ok,
+        true,
+        `${kind} accepts a null payload`,
+      );
+    }
+    for (const kind of ['git_commit_execute', 'git_push_execute']) {
+      assert.equal(
+        store.enqueueTuiCommand({
+          trackingId: TRACKING, kind, payload: { proposalId: PROPOSAL_ID },
+        }).ok,
+        true,
+        `${kind} accepts a closed proposalId payload`,
+      );
+    }
+  });
+
+  test('git request commands fail closed on any non-null payload', () => {
+    for (const kind of ['git_commit_request', 'git_push_request']) {
+      assert.throws(
+        () => store.enqueueTuiCommand({ trackingId: TRACKING, kind, payload: {} }),
+        TypeError,
+      );
+      assert.throws(
+        () => store.enqueueTuiCommand({ trackingId: TRACKING, kind, payload: { text: 'rm -rf' } }),
+        TypeError,
+      );
+    }
+  });
+
+  test('git execute commands accept only a well-formed proposalId payload', () => {
+    for (const kind of ['git_commit_execute', 'git_push_execute']) {
+      assert.throws(
+        () => store.enqueueTuiCommand({ trackingId: TRACKING, kind, payload: null }),
+        TypeError,
+      );
+      assert.throws(
+        () => store.enqueueTuiCommand({ trackingId: TRACKING, kind, payload: {} }),
+        TypeError,
+      );
+      assert.throws(
+        () => store.enqueueTuiCommand({
+          trackingId: TRACKING, kind, payload: { proposalId: 'not-hex!' },
+        }),
+        TypeError,
+      );
+      assert.throws(
+        () => store.enqueueTuiCommand({
+          trackingId: TRACKING, kind, payload: { proposalId: 'AB12CD34EF560172' },
+        }),
+        TypeError,
+      );
+      assert.throws(
+        () => store.enqueueTuiCommand({
+          trackingId: TRACKING, kind, payload: { proposalId: 'ab12' },
+        }),
+        TypeError,
+      );
+      // The proposalId is the ONLY field: a command string or argv can
+      // never ride along inside an execute payload.
+      assert.throws(
+        () => store.enqueueTuiCommand({
+          trackingId: TRACKING,
+          kind,
+          payload: { proposalId: PROPOSAL_ID, argv: ['git', 'push', '--force'] },
+        }),
+        TypeError,
+      );
+    }
+  });
+
+  test('git_proposal events accept the closed commit and push shapes', () => {
+    assert.equal(
+      store.appendTuiEvent({
+        trackingId: TRACKING,
+        kind: 'git_proposal',
+        payload: { operation: 'commit', proposalId: PROPOSAL_ID, message: 'Add tomato bed logic' },
+      }).ok,
+      true,
+    );
+    assert.equal(
+      store.appendTuiEvent({
+        trackingId: TRACKING,
+        kind: 'git_proposal',
+        payload: { operation: 'push', proposalId: PROPOSAL_ID },
+      }).ok,
+      true,
+    );
+    // G3: a push proposal may carry the bounded snapshot summary the
+    // approval card must show (branch, upstream, HEAD, fingerprint).
+    assert.equal(
+      store.appendTuiEvent({
+        trackingId: TRACKING,
+        kind: 'git_proposal',
+        payload: {
+          operation: 'push', proposalId: PROPOSAL_ID, message: 'Branch: main → origin/main',
+        },
+      }).ok,
+      true,
+    );
+    const pending = store.listPendingBrokerTuiEvents({ limit: 10 });
+    const proposals = pending.filter((e) => e.kind === 'git_proposal');
+    assert.equal(proposals.length, 3);
+    assert.deepEqual(proposals[0].payload, {
+      operation: 'commit', proposalId: PROPOSAL_ID, message: 'Add tomato bed logic',
+    });
+    assert.deepEqual(proposals[1].payload, { operation: 'push', proposalId: PROPOSAL_ID });
+    assert.deepEqual(proposals[2].payload, {
+      operation: 'push', proposalId: PROPOSAL_ID, message: 'Branch: main → origin/main',
+    });
+  });
+
+  test('git_proposal events fail closed on every malformed shape', () => {
+    const base = { trackingId: TRACKING, kind: 'git_proposal' };
+    assert.throws(() => store.appendTuiEvent({ ...base, payload: null }), TypeError);
+    assert.throws(
+      () => store.appendTuiEvent({
+        ...base,
+        payload: { operation: 'shell', proposalId: PROPOSAL_ID },
+      }),
+      TypeError,
+    );
+    assert.throws(
+      () => store.appendTuiEvent({
+        ...base,
+        payload: { operation: 'commit', proposalId: PROPOSAL_ID },
+      }),
+      TypeError,
+      'a commit proposal without the exact message is rejected',
+    );
+    assert.throws(
+      () => store.appendTuiEvent({
+        ...base,
+        payload: { operation: 'commit', proposalId: PROPOSAL_ID, message: '' },
+      }),
+      TypeError,
+    );
+    assert.throws(
+      () => store.appendTuiEvent({
+        ...base,
+        payload: { operation: 'commit', proposalId: PROPOSAL_ID, message: 'x'.repeat(4097) },
+      }),
+      TypeError,
+    );
+    // G3: a push message is optional but, when present, must still be a
+    // well-formed bounded text — the same closed rules as a commit message.
+    assert.throws(
+      () => store.appendTuiEvent({
+        ...base,
+        payload: { operation: 'push', proposalId: PROPOSAL_ID, message: '' },
+      }),
+      TypeError,
+    );
+    assert.throws(
+      () => store.appendTuiEvent({
+        ...base,
+        payload: {
+          operation: 'push', proposalId: PROPOSAL_ID, message: 'x'.repeat(4097),
+        },
+      }),
+      TypeError,
+    );
+    assert.throws(
+      () => store.appendTuiEvent({
+        ...base,
+        payload: { operation: 'commit', proposalId: 'zz', message: 'Add x' },
+      }),
+      TypeError,
+    );
+    // Closed shapes: no extra field (a command string or argv) can ride
+    // along inside a proposal event either.
+    assert.throws(
+      () => store.appendTuiEvent({
+        ...base,
+        payload: {
+          operation: 'push', proposalId: PROPOSAL_ID, cwd: 'C:/x',
+        },
+      }),
+      TypeError,
+    );
+  });
+});

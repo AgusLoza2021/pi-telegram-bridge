@@ -8,6 +8,7 @@
 - **Este puente (bridge)** es un pequeño programa que vive en tu propio PC y conecta tu chat privado de Telegram con Pi. No hay nada alojado en internet: si tu PC está apagado o en suspensión, el puente también lo está.
 - **A tu teléfono llegan solo las respuestas finales de Pi** — nunca tus archivos, nunca tu terminal, nunca el razonamiento interno de Pi.
 - **No es acceso remoto a tu PC:** no puedes ejecutar comandos CMD ni PowerShell desde el teléfono, y el puente no abre ningún puerto de escucha.
+- **Una excepción acotada:** los comandos `/commit` y `/push` preparan una tarjeta de aprobación de un solo uso, ligada a una instantánea del repositorio; nada se ejecuta hasta que toques **Approve**. `/commit` hace un commit de solo el índice ya preparado (staged) con el mensaje fijo `chore: update project files`; `/push` envía solo la rama actual a su upstream configurado, sin force. La configuración local de Git, las credenciales y los hooks siguen siendo de confianza: si el resultado es incierto, revisá tu repositorio antes de volver a intentar.
 
 ## Requisitos (2 minutos)
 
@@ -100,7 +101,7 @@ Para más síntomas y soluciones, mira la sección [Fix problems del README](REA
 | **`/tg`** | El comando que escribes dentro de una ventana de Pi para vincularla a tu teléfono (o desvincularla, con `/tg off`). |
 | **Ventana de Pi** | Una copia de Pi corriendo en una terminal. Puedes tener varias; cada una se vincula por separado. |
 | **Sesión / workspace** | Una sesión es una ventana de Pi viva que el puente conoce; el workspace es la carpeta de proyecto en la que esa ventana trabaja. El nombre de esa carpeta se convierte en la etiqueta legible que ves en el teléfono, como `Pi · mi-proyecto`. |
-| **La conexión de fondo** | Un programa pequeño que corre en silencio en tu PC y transporta mensajes entre Telegram y Pi. Está registrado como tarea programada de Windows, pero no arranca nada hasta que la prendés con `telegram on`; si la apagás con `telegram off`, sigue apagada después de reiniciar. Se comunica con Telegram mediante long polling. |
+| **La conexión de fondo** | Un programa pequeño que corre en silencio en tu PC y transporta mensajes entre Telegram y Pi. Está registrado como tarea programada de Windows, deshabilitada al instalarse; la configuración Beginner la arranca sola al terminar, y la avanzada te pregunta si querés arrancarla. Después la controlás vos: `telegram on` la habilita y arranca, `telegram off` la detiene y la deshabilita, y una vez apagada sigue apagada después de reiniciar hasta que la prendés de nuevo. Se comunica con Telegram mediante long polling. |
 
 ## Saber más
 

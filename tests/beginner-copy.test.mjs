@@ -39,6 +39,12 @@ import {
   eventDisconnected,
   eventStatus,
   eventCommandResult,
+  BUTTON_APPROVE,
+  gitApprovalCommitCard,
+  gitApprovalPushCard,
+  gitApprovedCommit,
+  gitApprovedPush,
+  gitApprovalStale,
   HELP_TEXT,
   unknownCommand,
 } from '../src/beginner-copy.mjs';
@@ -63,6 +69,10 @@ function everyBuilderOutput(label) {
     eventDisconnected(label),
     eventStatus(label, { state: 'busy', model: 'm' }),
     eventCommandResult(label, false, 'input_refused'),
+    gitApprovalCommitCard(label, 'Add the watering schedule'),
+    gitApprovalPushCard(label),
+    gitApprovedCommit(label),
+    gitApprovedPush(label),
   ];
 }
 
@@ -234,6 +244,51 @@ describe('beginner copy: event presentation (BEGINNER_UX.md sections 9 and 2)', 
     );
     assert.equal(eventCommandResult('alpha', false, undefined), 'Pi · alpha — command failed (failed).');
   });
+
+  test('every known Git failure code renders fixed closed copy, never the raw code', () => {
+    const expected = {
+      git_drift: 'Pi · alpha — The repository changed since you approved. Approve the newest card again.',
+      git_failed: 'Pi · alpha — Git did not complete the change. Check your repository before trying again.',
+      git_unavailable: 'Pi · alpha — Git could not be reached. Check Git on this PC, then send the command again.',
+      not_a_repository: 'Pi · alpha — That Pi window is not working inside a Git repository.',
+      detached_head: 'Pi · alpha — That Pi window is not on a branch, so nothing can be committed there.',
+      nothing_staged: 'Pi · alpha — Nothing is prepared to commit yet.',
+      no_upstream: 'Pi · alpha — That branch has no online copy yet. Publish it once from Pi first.',
+      stale_proposal: 'Pi · alpha — That approval is no longer current. Send the command again and approve the newest card.',
+      proposal_failed: 'Pi · alpha — The approval card could not be prepared. Send the command again.',
+      pi_busy: 'Pi · alpha — Pi is busy. Wait for the current work to finish, then try again.',
+      no_cwd: 'Pi · alpha — That Pi window has no folder open, so Git cannot run there.',
+    };
+    for (const [code, line] of Object.entries(expected)) {
+      const rendered = eventCommandResult('alpha', false, code);
+      assert.equal(rendered, line, `${code} must render its fixed closed copy`);
+      assert.doesNotMatch(rendered, new RegExp(`\\(${code}\\)`),
+        'the raw result code must never be echoed as detail');
+      assert.doesNotMatch(rendered, /https?:|\/|credential|stderr/i,
+        'no raw stderr, URL, path or credential may enter Git failure copy');
+    }
+    // git_failed must never claim files were unchanged: hooks may have
+    // modified working-tree files even without a proven commit or push.
+    const failedCopy = eventCommandResult('alpha', false, 'git_failed');
+    assert.doesNotMatch(failedCopy, /nothing was (modified|changed)|no files|unchanged/i,
+      'git_failed copy must not claim the working tree is untouched');
+  });
+
+  test('an unmapped Git-family code falls to safe generic handling without echoing detail', () => {
+    for (const hostile of ['git_surprise_123', 'git_', '__proto__', 'constructor']) {
+      const rendered = eventCommandResult('alpha', false, hostile);
+      assert.doesNotMatch(rendered, /surprise|stderr|https?:/,
+        'unmapped or hostile code text must never be rendered');
+      assert.ok(rendered.startsWith('Pi · alpha — command failed'),
+        'the fallback must stay the safe generic failure line');
+    }
+    // Git-family unmapped codes render no parenthetical at all.
+    assert.equal(eventCommandResult('alpha', false, 'git_surprise_123'),
+      'Pi · alpha — command failed.');
+    // Non-Git whitelisted codes keep the existing generic echo behavior.
+    assert.equal(eventCommandResult('alpha', false, 'input_refused'),
+      'Pi · alpha — command failed (input_refused).');
+  });
 });
 
 describe('beginner copy: /help structure and friendly errors (BEGINNER_UX.md section 11)', () => {
@@ -253,6 +308,121 @@ describe('beginner copy: /help structure and friendly errors (BEGINNER_UX.md sec
 
   test('an unknown slash command gets the friendly MSG-E4 guidance', () => {
     assert.equal(unknownCommand, "I didn't understand that. Send /help to see what I can do.");
+  });
+});
+
+describe('beginner copy: git approval cards (G2)', () => {
+  test('the commit approval card shows the exact automatic commit message', () => {
+    const message = 'Add tomato bed planting logic\n\nReviewed-by: nobody';
+    const card = gitApprovalCommitCard('alpha', message);
+    assert.ok(card.includes(message), 'the automatic commit text must appear exactly');
+    assert.match(card, /Ready to commit/);
+    assert.match(card, /^Pi · alpha — /, 'the card names the proposing Pi readably');
+    assert.ok(card.length < 4200, 'the card stays inside one Telegram message');
+  });
+
+  test('an oversized commit message is clipped but never reworded', () => {
+    const card = gitApprovalCommitCard('alpha', 'x'.repeat(5000));
+    assert.ok(card.startsWith('Pi · alpha — Ready to commit:'));
+    assert.ok(card.length < 4200);
+  });
+
+  test('the push approval card without a summary is a fixed line with no message echo', () => {
+    assert.equal(gitApprovalPushCard('alpha'), 'Pi · alpha — Ready to push your saved work?');
+  });
+
+  test('the push approval card with a snapshot summary shows it after the headline (G3)', () => {
+    const card = gitApprovalPushCard('alpha', 'Branch: main → origin/main\nFingerprint: ab12');
+    assert.ok(card.startsWith('Pi · alpha — Ready to push:'));
+    assert.ok(card.includes('Branch: main → origin/main'));
+    assert.ok(card.includes('Fingerprint: ab12'));
+  });
+
+  test('the push approval card clips an over-long summary to the transport bound', () => {
+    const card = gitApprovalPushCard('alpha', 'x'.repeat(5000));
+    assert.ok(card.startsWith('Pi · alpha — Ready to push:'));
+    assert.ok(card.length < 4200);
+  });
+
+  test('approval acks, the Approve button and the stale line are fixed beginner-safe copy', () => {
+    assert.match(gitApprovedCommit('alpha'), /Approved/);
+    assert.match(gitApprovedCommit('alpha'), /Pi · alpha/);
+    assert.match(gitApprovedPush('alpha'), /Approved/);
+    assert.equal(BUTTON_APPROVE, 'Approve');
+    assert.ok(BUTTON_APPROVE.length <= MAX_BUTTON_TEXT_CHARS);
+    assert.match(gitApprovalStale, /already expired/);
+    assert.doesNotMatch(gitApprovalStale, /[0-9a-f]{16}/, 'the stale line carries no tokens or ids');
+    assert.ok(HELP_TEXT.includes('/commit [shortId]'), 'the advanced help lists /commit');
+    assert.ok(HELP_TEXT.includes('/push [shortId]'), 'the advanced help lists /push');
+  });
+
+  test('an unknown Git outcome gets distinct copy: inspect Git state before retrying', () => {
+    const rendered = eventCommandResult('alpha', false, 'git_unknown');
+    assert.doesNotMatch(rendered, /failed/,
+      'an unknown outcome must never be worded as a definite failure');
+    assert.match(rendered, /unknown/i);
+    assert.match(rendered, /Git/i);
+    assert.match(rendered, /before.*(retry|trying)|inspect/i,
+      'the owner must be told to inspect the repository before retrying');
+    assert.doesNotMatch(rendered, /[0-9a-f]{16}/, 'no raw details or ids in the unknown card');
+  });
+
+  test('git approval copy never leaks jargon or ids from a hostile label', () => {
+    const hostile = 'tg:abc123 aaaaaaaaaaaaaaaa9999 pid=7 DPAPI broker sqlite argv';
+    for (const rendered of [
+      gitApprovalCommitCard(hostile, 'Add x'),
+      gitApprovalPushCard(hostile),
+      gitApprovedCommit(hostile),
+      gitApprovedPush(hostile),
+    ]) {
+      assert.doesNotMatch(rendered, /abc123|aaaaaaaa|DPAPI|broker|sqlite|argv|pid/);
+      assert.ok(rendered.length > 0);
+    }
+  });
+});
+
+describe('beginner copy: operation-specific Git result lines (G4)', () => {
+  test('the closed Git success codes render operation-specific lines, never "command finished"', () => {
+    assert.equal(
+      eventCommandResult('alpha', true, 'git_commit_proposal_ready'),
+      'Pi · alpha — Commit approval ready.',
+    );
+    assert.equal(
+      eventCommandResult('alpha', true, 'git_push_proposal_ready'),
+      'Pi · alpha — Push approval ready.',
+    );
+    assert.equal(
+      eventCommandResult('alpha', true, 'git_commit_completed'),
+      'Pi · alpha — Commit completed.',
+    );
+    assert.equal(
+      eventCommandResult('alpha', true, 'git_push_completed'),
+      'Pi · alpha — Push completed.',
+    );
+  });
+
+  test('non-Git successes keep the generic line; unknown codes are never guessed into Git copy', () => {
+    assert.equal(eventCommandResult('alpha', true, null), 'Pi · alpha — command finished.');
+    assert.equal(eventCommandResult('alpha', true, undefined), 'Pi · alpha — command finished.');
+    assert.equal(eventCommandResult('alpha', true, 'status_done'), 'Pi · alpha — command finished.');
+  });
+
+  test('the git_unknown copy stays distinct and no Git result ever carries raw details', () => {
+    const unknown = eventCommandResult('alpha', false, 'git_unknown');
+    assert.match(unknown, /unknown/i);
+    assert.match(unknown, /Check your repository before trying again/);
+    for (const rendered of [
+      eventCommandResult('alpha', true, 'git_commit_proposal_ready'),
+      eventCommandResult('alpha', true, 'git_push_proposal_ready'),
+      eventCommandResult('alpha', true, 'git_commit_completed'),
+      eventCommandResult('alpha', true, 'git_push_completed'),
+      eventCommandResult('alpha', false, 'git_failed'),
+      eventCommandResult('alpha', false, 'git_drift'),
+      unknown,
+    ]) {
+      assert.doesNotMatch(rendered, /https?:|token|credential|stderr/i,
+        'no URL, credential or raw Git output may enter result copy');
+    }
   });
 });
 

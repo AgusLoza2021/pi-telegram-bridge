@@ -7,10 +7,10 @@
 1. Download the repository as a ZIP and extract it, or clone it with `git clone https://github.com/AgusLoza2021/pi-telegram-bridge.git`.
 2. Create your own Telegram bot by messaging **@BotFather** with `/newbot`. Keep its token private.
 3. Run **`Setup Pi Telegram.cmd`** from the extracted project folder and follow the prompts to enter your token and pair your phone with the QR code.
-4. When setup asks whether to start the connection, choose **Yes** to start now. If you choose No, open a Command Prompt in the project folder and run `telegram on` later. Check it with `telegram status`; use `telegram off` to stop it.
+4. When you confirm with **ENROLL**, setup finishes on its own: it installs the helper, registers the background connection and **starts it automatically** — no extra question is asked. Check it with `telegram status`; use `telegram off` to stop it and `telegram on` to start it again later.
 5. Open Pi, run `/tg`, choose **Connect**, then message your bot in a private chat.
 
-The bridge intentionally ignores group chats. For prerequisites, screenshots, and troubleshooting, see the [complete beginner guide](#check-your-pc-first).
+The bridge intentionally ignores group chats. For prerequisites and troubleshooting, see the [complete beginner guide](#check-your-pc-first).
 
 ![Pi Telegram Bridge: a private Telegram chat reaches a Pi window linked with /tg, through the bridge on your own PC](docs/assets/banner.svg)
 
@@ -88,7 +88,7 @@ You will create your own private bot in Telegram. This takes about 2 minutes.
 4. When it asks, **paste the bot token from Step 2**. The window hides what you paste. The token stays on your PC: it is stored in encrypted form (protected for your Windows account) and is never typed, sent, or shown anywhere else — not on your phone, not in any chat, not in any log.
 5. The window shows a **QR code**. Open the camera app on your phone and point it at the code. Telegram opens your bot; tap **Start**. The code contains only the bot's name and a one-use pairing code — never the token.
 6. The window waits up to a minute for your phone. When your phone is recognized, it asks you to type **ENROLL** to confirm. Nothing is saved until you do.
-7. After you confirm, the window installs a small helper inside Pi (it stays inactive until *you* link a Pi window in Step 4) and registers the background task disabled. It then asks whether to start the connection now. If you say no, run `telegram on` from the setup folder when you are ready. Use `telegram off` to stop it and `telegram status` to check it. Once you turn it off, it stays off even after you restart Windows.
+7. After you confirm, the window installs a small helper inside Pi (it stays inactive until *you* link a Pi window in Step 4) and registers the background task. When setup ends, the background connection **starts automatically** — there is no extra question. Use `telegram off` to stop it and `telegram status` to check it. Once you turn it off, it stays off even after you restart Windows; start it again with `telegram on`.
 
 If anything fails along the way, your previous settings are kept safe and nothing half-finished is saved. See [Fix problems](#fix-problems).
 
@@ -122,6 +122,7 @@ Any three of the four means you are almost there — check [Fix problems](#fix-p
 | Tap **Change Pi** | Choose another linked Pi by its readable project label. |
 | Tap **Disconnect** | Disconnect the selected Pi from Telegram. |
 | Send text while Pi is busy | Choose whether to add it for later, redirect the current task, stop and use it, or leave the task alone. |
+| Send `/commit` or `/push` | The bot shows a one-use approval card bound to the current repository snapshot; nothing runs until you tap **Approve**. |
 
 On the PC:
 
@@ -162,7 +163,7 @@ For service status, repair, manual setup, and the full command reference, see th
 | **`/tg`** | The command you type inside a Pi window to link (or unlink, with `/tg off`) that window to your phone. |
 | **Pi window** | One running copy of Pi in a terminal. You can have several; each one is linked separately. |
 | **Session / workspace** | A session is one live Pi window the bridge knows about; the workspace is the project folder that window is working in. Its folder name becomes the readable label you see on your phone, like `Pi · my-project`. |
-| **The background connection** | A small program that runs quietly on your PC and shuttles messages between Telegram and Pi, so Pi can answer even when that Pi window is doing something else. It is registered as a Windows scheduled task, but it starts nothing until you turn it on with `telegram on`, and it stays off after a restart once you turned it off. It talks to Telegram by long polling. |
+| **The background connection** | A small program that runs quietly on your PC and shuttles messages between Telegram and Pi, so Pi can answer even when that Pi window is doing something else. It is registered as a Windows scheduled task, and setup starts it automatically when installation finishes. After that you control it yourself: `telegram off` stops it, `telegram on` starts it again, and once you turned it off it stays off after a restart until you turn it on again. It talks to Telegram by long polling. |
 
 ## Is it safe?
 
@@ -173,6 +174,7 @@ The bridge is local and fail-closed by design:
 - The plaintext bot token never appears in source, process arguments, environment variables, chat, or logs. Its only on-disk form is an encrypted blob (Windows DPAPI, protected for your Windows account) inside a user-only state directory.
 - Each Pi process opts in locally with `/tg`.
 - Remote input reaches Pi only through Pi's official prompt, steer, follow-up, abort, status, and disconnect APIs. There is no remote shell.
+- One narrow exception: the typed `/commit` and `/push` commands. Each one prepares an exact, one-use approval card in the chat, and only your explicit **Approve** tap executes it against the bound repository snapshot. `/commit` is a staged-only commit with the fixed message `chore: update project files`; `/push` sends only the current branch to its configured upstream with no force. Your local Git configuration, credentials, and hooks remain trusted: a hook can run local programs or alter the resulting commit, and an uncertain result asks for manual inspection before any retry.
 - Telegram receives finalized assistant answers and explicit status results — not hidden reasoning, token-by-token streams, or raw tool-call transcripts.
 - The QR code contains no token, user ID, or chat ID.
 

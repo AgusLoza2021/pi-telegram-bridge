@@ -17,11 +17,25 @@ These commands work only in the enrolled private chat. Session arguments use sho
 | `/followup [shortId] <text>` | Queue a follow-up after the current turn. |
 | `/abort [shortId]` | Abort the current turn. |
 | `/disconnect [shortId]` | Disconnect that Pi session. |
+| `/commit [shortId]` | Prepare a commit proposal for your one-use approval. |
+| `/push [shortId]` | Prepare a push proposal for your one-use approval. |
 | Plain text | Prompt the selected session. |
 
 The router fails closed: prompt lines beginning with `/` are refused, unknown or ambiguous IDs are never guessed, stale selections must be selected again, and unknown commands show help.
 
 Telegram receives bounded, safely chunked final assistant output and explicit command results. It does not receive model reasoning, token-by-token output, or raw tool-call transcripts.
+
+### Git commit and push approvals
+
+`/commit` and `/push` are the only mutating remote operations, and each runs only after you tap **Approve** on its exact, one-use approval card. The card is bound to a repository snapshot that is revalidated immediately before execution: the commit snapshot binds the repository root, branch, HEAD, and the full staged-index listing; the push snapshot binds the repository root, branch, HEAD, and the configured remote/upstream branch and ahead state (never a resolved push URL or Git configuration beyond that). Any snapshot drift refuses the operation.
+
+- `/commit` commits only the already-staged index (it never stages files) with the fixed message `chore: update project files`, shown exactly on the card.
+- `/push` pushes only the current branch's configured upstream with an explicit refspec — no force, no tag expansion, and `--atomic`, so a remote that does not support `--atomic` fails closed. Real remote support for `--atomic` is assumed, not exercised by the tests.
+- Approvals are one-use and expire; broker restarts, connection replacements and duplicate taps never re-run an operation.
+- Results arrive as operation-specific copy: `Commit approval ready.` / `Push approval ready.` when a proposal is published, and `Commit completed.` / `Push completed.` after a verified operation. An unknown Git outcome gets distinct wording and tells you to check your repository before trying again — it is never worded as a definite failure. Raw Git diff output, stderr and diagnostics, full remote URLs, credentials, and local paths never appear in the chat: approval cards intentionally show only the bounded snapshot metadata (staged shortstat, branch, upstream alias, HEAD SHA, fingerprint, and the push card's ahead count), and result cards use fixed, mapped copy.
+- Local Git configuration, remote URLs, credential and transport helpers, and hooks remain fully trusted on the PC: hooks run normally and may execute local programs or alter the resulting commit. This is not a sandbox for Git.
+
+If a result is uncertain, inspect the repository with Git directly before sending `/commit` or `/push` again.
 
 ## Advanced Pi commands
 
@@ -75,7 +89,7 @@ The QR renderer is local-only computation. It does not call an online QR service
 
 The dedicated scheduled task is named `PiTelegramBridgeBroker`. It runs as the current interactive user with limited privileges, stores no Windows password, and pins the exact Node.js executable and repository paths captured at installation.
 
-The task is registered **disabled**. That enable bit is the connection switch: nothing runs at a sign-in until `telegram on`, and `telegram off` clears the bit again, so the connection stays off across restarts.
+The task is registered **disabled**. Setup turns it on in one of two ways: the double-click Beginner setup starts it automatically once ENROLL confirms, and the advanced setup asks `Start the broker now?` — but only when you accepted registering the task earlier (yes enables and starts it; no leaves it disabled). The enable bit is the connection switch: `telegram on` enables and starts the task, `telegram off` stops it and clears the bit again, and once it is off it stays off across sign-ins and restarts until you run `telegram on`.
 
 Once enabled, the task:
 

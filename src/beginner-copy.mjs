@@ -122,6 +122,45 @@ export const busyAbortSent = (rawLabel) =>
 /** MSG-O2 — the Stop button resolved. */
 export const stopAck = (rawLabel) => `Stopped. ${displayLabel(rawLabel)} is idle now.`;
 
+// --- git approval cards (G2) ------------------------------------------------
+
+/** The Approve button label on a proposal card. */
+export const BUTTON_APPROVE = 'Approve';
+
+/** The exact maximum commit-message text carried by one approval card. */
+const MAX_GIT_CARD_MESSAGE_CHARS = 3500;
+
+/**
+ * Commit approval card: the automatic commit text appears EXACTLY as the
+ * extension published it (clipped only to the transport bound, never
+ * reworded or sanitized), after the readable `Pi · <label>` headline.
+ */
+export const gitApprovalCommitCard = (rawLabel, message) =>
+  `${displayLabel(rawLabel)} — Ready to commit:\n\n${clip(message ?? '', MAX_GIT_CARD_MESSAGE_CHARS)}`;
+
+/**
+ * Push approval card: without a snapshot summary it stays the fixed G2
+ * line; with one (G3: branch, upstream, HEAD, fingerprint) the summary
+ * follows the headline exactly as the extension published it, clipped
+ * only to the transport bound.
+ */
+export const gitApprovalPushCard = (rawLabel, message) =>
+  message === undefined || message === null
+    ? `${displayLabel(rawLabel)} — Ready to push your saved work?`
+    : `${displayLabel(rawLabel)} — Ready to push:\n\n${clip(message, MAX_GIT_CARD_MESSAGE_CHARS)}`;
+
+/** After an Approve tap: the typed execute command was accepted. */
+export const gitApprovedCommit = (rawLabel) =>
+  `Approved. ${displayLabel(rawLabel)} will run the commit now.`;
+
+/** After an Approve tap for a push. */
+export const gitApprovedPush = (rawLabel) =>
+  `Approved. ${displayLabel(rawLabel)} will push now.`;
+
+/** A stale, consumed, replaced or pre-restart approval tap: fixed fail-closed line. */
+export const gitApprovalStale =
+  'This approval already expired. Send the commit or push request again.';
+
 /** MSG-B4 variant for the Leave-it-alone button (no session on the callback). */
 export const busyDiscard =
   'Okay — the current task keeps running. Your saved message was discarded.';
@@ -194,8 +233,61 @@ export const eventStatus = (rawLabel, payload) =>
   `${displayLabel(rawLabel)} status\n${statusLine(payload)}`;
 
 /** Beginner command-result card. The code is the whitelisted result code. */
+
+/**
+ * Closed fixed mappings from Git result codes to beginner copy (G4). The
+ * extension emits exactly these codes; anything else falls to safe generic
+ * handling. Both tables are null-prototype literals only — no raw Git
+ * output, URL, path or credential can ever enter result copy, and hostile
+ * keys ('__proto__', 'constructor') can never resolve to inherited values.
+ */
+const GIT_SUCCESS_RESULT_LINES = Object.freeze(Object.assign(Object.create(null), {
+  git_commit_proposal_ready: 'Commit approval ready.',
+  git_push_proposal_ready: 'Push approval ready.',
+  git_commit_completed: 'Commit completed.',
+  git_push_completed: 'Push completed.',
+}));
+
+const GIT_FAILURE_RESULT_LINES = Object.freeze(Object.assign(Object.create(null), {
+  git_drift: 'The repository changed since you approved. Approve the newest card again.',
+  git_failed: 'Git did not complete the change. Check your repository before trying again.',
+  git_unavailable: 'Git could not be reached. Check Git on this PC, then send the command again.',
+  not_a_repository: 'That Pi window is not working inside a Git repository.',
+  detached_head: 'That Pi window is not on a branch, so nothing can be committed there.',
+  nothing_staged: 'Nothing is prepared to commit yet.',
+  no_upstream: 'That branch has no online copy yet. Publish it once from Pi first.',
+  stale_proposal: 'That approval is no longer current. Send the command again and approve the newest card.',
+  proposal_failed: 'The approval card could not be prepared. Send the command again.',
+  pi_busy: 'Pi is busy. Wait for the current work to finish, then try again.',
+  no_cwd: 'That Pi window has no folder open, so Git cannot run there.',
+}));
+
 export function eventCommandResult(rawLabel, ok, resultCode) {
-  if (ok === true) return `${displayLabel(rawLabel)} — command finished.`;
+  if (ok === true) {
+    const gitLine = typeof resultCode === 'string'
+      ? GIT_SUCCESS_RESULT_LINES[resultCode]
+      : undefined;
+    return `${displayLabel(rawLabel)} — ${gitLine ?? 'command finished.'}`;
+  }
+  // G3: an UNKNOWN Git outcome is never worded as a definite failure —
+  // retrying blind could duplicate a commit or push. The owner must
+  // inspect the repository first; raw details never reach this card.
+  if (resultCode === 'git_unknown') {
+    return `${displayLabel(rawLabel)} — the Git result is unknown. Check your repository before trying again.`;
+  }
+  // G4: known Git failure codes render fixed closed copy — never the raw
+  // code as detail. Unmapped Git-family codes also stay silent (generic
+  // line, no echo), so a future or hostile code cannot leak arbitrary
+  // text. Non-Git whitelisted codes keep the existing generic echo.
+  const failureLine = typeof resultCode === 'string'
+    ? GIT_FAILURE_RESULT_LINES[resultCode]
+    : undefined;
+  if (failureLine !== undefined) {
+    return `${displayLabel(rawLabel)} — ${failureLine}`;
+  }
+  if (typeof resultCode === 'string' && resultCode.startsWith('git_')) {
+    return `${displayLabel(rawLabel)} — command failed.`;
+  }
   const code = typeof resultCode === 'string' && resultCode.length > 0
     ? clip(resultCode, 64)
     : 'failed';
@@ -225,6 +317,8 @@ export const ADVANCED_HELP_LINES = [
   '/followup [shortId] <text> - queue a follow-up',
   '/abort [shortId] - abort the running turn',
   '/disconnect [shortId] - disconnect the TUI',
+  '/commit [shortId] - prepare a commit proposal for your approval',
+  '/push [shortId] - prepare a push proposal for your approval',
   'Plain text goes to the selected TUI as a prompt.',
 ];
 

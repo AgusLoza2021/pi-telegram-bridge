@@ -212,6 +212,31 @@ Delivery rules unchanged: bounded message size, safe chunking, final text only �
 
 ---
 
+## 9b. Git approval cards (implemented — G2/G3/G4)
+
+The typed `/commit` and `/push` commands (advanced layer, §11) produce approval cards whose copy is **implemented** in `src/beginner-copy.mjs`, rendered by `src/selective-telegram-broker.mjs`, and pinned byte-exact by `tests/beginner-copy.test.mjs`.
+
+| Situation | Exact copy / behavior |
+|---|---|
+| Commit proposal published | `Pi · <label> — Ready to commit:` + the exact automatic commit text (`chore: update project files` plus the snapshot summary the extension published) + `[Approve] [Cancel]` |
+| Push proposal published, no summary | `Pi · <label> — Ready to push your saved work?` + `[Approve] [Cancel]` |
+| Push proposal published with a snapshot summary | `Pi · <label> — Ready to push:` + the summary lines (branch, upstream, HEAD, fingerprint) + `[Approve] [Cancel]` |
+| Approve tapped (commit) | `Approved. Pi · <label> will run the commit now.` |
+| Approve tapped (push) | `Approved. Pi · <label> will push now.` |
+| Stale, consumed, replaced or expired approval tap | `This approval already expired. Send the commit or push request again.` |
+| Proposal accepted by Pi (commit) | `Pi · <label> — Commit approval ready.` |
+| Proposal accepted by Pi (push) | `Pi · <label> — Push approval ready.` |
+| Verified commit executed | `Pi · <label> — Commit completed.` |
+| Verified push executed | `Pi · <label> — Push completed.` |
+| Unknown Git outcome (`git_unknown`) | `Pi · <label> — the Git result is unknown. Check your repository before trying again.` — never worded as a definite failure |
+
+Hard rules:
+
+- Approval cards are one-use and bound to a repository snapshot: snapshot drift resolves with the drift copy (the repository changed since you approved — approve the newest card again); expiry, broker restart, a consumed or replaced token resolve with the stale-approval copy — never with a re-run.
+- Raw Git diff output, stderr and diagnostics, full remote URLs, credentials, and local paths never appear in any of these cards. Approval cards intentionally show only the bounded snapshot metadata (staged shortstat, branch, upstream alias, HEAD SHA, fingerprint, and the push card's ahead count); results use a closed, fixed result-code mapping.
+
+---
+
 ## 10. Callback payload and authorization constraints
 
 All beginner buttons are Telegram inline callbacks. Constraints, verifiable per callback:
@@ -243,7 +268,7 @@ Friendly errors follow the fixed-whitelist pattern: each known failure has one p
 
 ## 12. Explicit non-goals (V1)
 
-- **No generic command/shell surface.** No remote terminal, no CMD/PowerShell endpoint, no arbitrary command execution — remote input reaches Pi only through its official message/steer/follow-up/abort APIs.
+- **No generic command/shell surface.** No remote terminal, no CMD/PowerShell endpoint, no arbitrary command execution — remote input reaches Pi only through its official message/steer/follow-up/abort APIs. The one deliberate exception is the closed, typed `/commit` and `/push` approval pair (§9b): fixed argv, one-use snapshot-bound approval cards, no command string ever accepted.
 - **No hidden reasoning or tool stream.** Final outputs only; no thinking content, no token-by-token streaming, no tool-call transcripts.
 - **No auto-connect.** Setup links the PC; it never links a Pi process. Every Pi window connects only when the user types `/tg` in it, every time.
 - **No public listener.** Outbound polling to Telegram only; nothing listens on the network, ever.

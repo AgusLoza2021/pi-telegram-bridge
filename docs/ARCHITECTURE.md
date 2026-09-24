@@ -62,6 +62,19 @@ Remote actions map to Pi's official extension APIs:
 
 There is no arbitrary command execution API. The broker does not spawn, own, signal, or terminate Pi processes.
 
+### Git approval protocol
+
+The single deliberate exception to "no mutating operations" is the closed, typed `/commit` and `/push` pair:
+
+1. The owner sends `/commit` or `/push` in the enrolled private chat.
+2. The extension takes a bounded read-only repository snapshot (branch, upstream, HEAD, staged index) and publishes a proposal event; the broker renders an exact approval card. The commit card shows the fixed automatic message `chore: update project files`; the push card shows the branch, upstream, HEAD and fingerprint summary.
+3. The owner's **Approve** tap dispatches a one-use execute command carrying only the opaque proposal id — never a command string or argv.
+4. The extension consumes the proposal, recomputes the snapshot, and refuses on any snapshot drift. Commit argv is fixed (`commit -m <fixed message>`, staged-only, hooks honored); push argv is the explicit upstream refspec with `--no-follow-tags`, `--atomic`, and never a force flag. A remote that does not support `--atomic` fails closed.
+5. Every exit code is proven against the repository state before success is reported; results reach Telegram as whitelisted result codes with fixed, mapped copy only — raw Git diff output, stderr and diagnostics, full remote URLs, credentials, and local paths never do, and approval cards intentionally show only the bounded snapshot metadata (staged shortstat, branch, upstream alias, HEAD SHA, fingerprint, and the push card's ahead count). The success codes render operation-specific copy (`Commit approval ready`, `Push approval ready`, `Commit completed`, `Push completed`).
+6. An uncertain outcome (timeout, kill, unproven mutation) is reported as `git_unknown` and must be resolved by manual repository inspection before any retry; it is never replayed automatically.
+
+Local Git configuration, remote URLs, credential and transport helpers, and hooks remain fully trusted on the PC: an approval authorizes normal hook execution, which may run local programs or alter the resulting commit. This protocol is snapshot-bound and argv-fixed; it is not a sandbox for Git.
+
 ### Output boundary
 
 The extension forwards only finalized assistant text and explicit command/status results. It does not forward chain-of-thought, model reasoning, token streams, tool calls, or tool results.
@@ -135,7 +148,7 @@ A generated `index.ts` binds that installation to the selected local state direc
 
 `PiTelegramBridgeBroker` runs as the current interactive user with limited privileges. The registered settings are verified after installation:
 
-- registered disabled: the on/off switch owns the enable bit, so a sign-in starts nothing until the owner turns the connection on;
+- registered disabled initially: Beginner setup enables and starts it automatically after ENROLL, advanced setup asks before enabling, and afterwards the on/off switch owns the enable bit — once turned off with `telegram off`, a sign-in stays off until the owner runs `telegram on` again;
 - logon trigger for the current user;
 - no stop-on-idle or battery termination;
 - unlimited execution duration;
@@ -152,7 +165,7 @@ Graceful shutdown uses an instance-bound local control file and bounded waits. L
 3. DPAPI CurrentUser encryption inside a verified user-only state directory.
 4. No secret in arguments, environment variables, logs, runtime JSON, or SQLite payloads.
 5. Local per-process Pi opt-in; no automatic Pi connection.
-6. Typed Pi operations only; no generic shell.
+6. Typed Pi operations only; no generic shell. The sole exception is the closed, snapshot-bound `/commit`/`/push` approval protocol (above) with fixed argv.
 7. Finalized assistant output only; no reasoning or tool transcript transport.
 8. Durable deduplication, command claims, and delivery acknowledgements.
 9. Reversible installation with dated backups before replacement.

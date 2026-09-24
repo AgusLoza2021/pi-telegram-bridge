@@ -43,9 +43,11 @@
 #                    followups flag + legacy runtime.json shape); with
 #                    -PrepareOnly it keeps the old prepare-only behavior.
 #
-# The script never writes .env files, never autostarts anything by
-# itself, and never sends anything to Telegram except
-# getMe/getWebhookInfo/getUpdates. No credential is ever passed as an
+# The script never writes .env files, and never sends anything to Telegram except
+# getMe/getWebhookInfo/getUpdates. The ADVANCED path never autostarts anything by
+# itself: it only offers the optional start prompt, and only when the task
+# registration was accepted. The explicit double-click
+# Beginner path starts the broker automatically after ENROLL. No credential is ever passed as an
 # argument: the token travels through stdin pipes only. The QR payload
 # is username+nonce ONLY and never contains the bot token; the nonce is
 # generated locally and never sent anywhere except inside the deep link
@@ -704,7 +706,7 @@ Write-Host '  - From the authorized Telegram chat: /sessions, /use <shortId>,'
 Write-Host '    /status, /send, /steer, /followup, /abort, /disconnect.'
 Write-Host '    Plain text prompts the selected TUI; final outputs only.'
 Write-Host '  - Phone connection on demand: telegram on | telegram off | telegram status'
-Write-Host '    (nothing connects at sign-in until you run "telegram on").'
+Write-Host '    (the task runs at sign-in only while enabled: "telegram on" enables and starts it, "telegram off" stops and disables it).'
 Write-Host '  - Service lifecycle: scripts/status-broker-service.ps1,'
 Write-Host '    start-broker-service.ps1, stop-broker-service.ps1,'
 Write-Host '    uninstall-broker-service.ps1.'
