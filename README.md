@@ -161,6 +161,29 @@ Two limits worth knowing:
 - This is a **PC-side command**. Nothing on your phone can pull a picture off your disk.
 - Your token is never printed, logged, or typed on the command line, and a failure prints one short code instead of a traceback.
 
+## Send a voice note from your phone (it becomes text)
+
+Instead of typing, record a voice note in your private chat. The bridge transcribes it **on your PC, locally** — the audio never leaves your machine — and the text arrives to the linked Pi window exactly as if you had typed it. Forwarded audio files work the same way.
+
+This needs a one-time setup that is **never done automatically** — the project does not download binaries on its own:
+
+1. Download the whisper.cpp Windows binary zip from its GitHub releases (release `v1.9.2` is the last one that ships `whisper-bin-x64.zip`) and extract `whisper-cli.exe` together with its `.dll` files into `.local/tools/whisper/`.
+2. Download the model `ggml-small.bin` (~466 MB) into `.local/tools/whisper/models/`.
+3. Put `ffmpeg.exe` at `.local/tools/ffmpeg/ffmpeg.exe`, or point the config at an ffmpeg you already have (a full absolute path is required).
+
+That folder layout is the default configuration; every value can be overridden in the `transcription` section of the config (paths, language, thread count, caps, and the technical vocabulary prompt that helps Spanish dictation survive English words like "retry" or "merge").
+
+Hard limits that protect the poll loop:
+
+| Rule | Value |
+|---|---|
+| Maximum audio size | 20 MB |
+| Maximum duration | 5 minutes (measured from the converted audio, not from Telegram's claim) |
+| Per-process timeout | 2 minutes; a hung process is killed, never waited on |
+| Where transcription runs | Your CPU only. No cloud service is ever contacted. |
+
+If the audio cannot be transcribed (tool missing, file too large, decoder failure), the bot answers with one short fixed message and the bridge keeps working — nothing gets stuck.
+
 ## Fix problems
 
 Find your symptom, then follow the matching action. A failed setup never replaces an existing working link.
@@ -182,6 +205,8 @@ Find your symptom, then follow the matching action. A failed setup never replace
 | Several Pi windows are linked | Tap **Change Pi** and choose the readable project label you want. |
 | You want to remove the bridge | Follow [Uninstall and rollback](docs/ADVANCED.md#uninstall-and-rollback). State and backups are preserved unless you remove them yourself. |
 | Sending a picture printed `FAILED: ...` | Each code names exactly one cause. `path_escape`: the file is outside the project folder — this check runs first, so you get it even when the file is also missing or misnamed; add `--root "C:\the\folder"` if the picture lives elsewhere. `not_found` or `not_a_file`: nothing readable at that path. `bad_extension`: not a `.png`, `.jpg`, `.jpeg`, or `.webp`. `too_large`: over 10 MB. `bad_root`: the folder you passed to `--root` does not exist. |
+| The bot answers "I couldn't transcribe that audio" | Check the three tool files exist: `.local/tools/whisper/whisper-cli.exe`, `.local/tools/whisper/models/ggml-small.bin`, and `.local/tools/ffmpeg/ffmpeg.exe`. Audio over 20 MB or longer than 5 minutes is refused by design. If you just installed the tools, no restart is needed — the next voice note picks them up. |
+| You want voice transcription off | Set `transcription.enabled` to `false` in your local config. Voice notes then behave as if the feature did not exist: they are silently consumed, and no tool runs. |
 
 For service status, repair, manual setup, and the full command reference, see the [Advanced guide](docs/ADVANCED.md).
 

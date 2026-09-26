@@ -109,6 +109,22 @@ Dos cosas que conviene saber:
 - Es un comando **de la PC**. Nada desde tu teléfono puede extraer una imagen de tu disco.
 - Tu token nunca se imprime, ni se registra, ni se escribe en la línea de comandos, y si algo falla verás un código corto en lugar de un error largo.
 
+## Enviar una nota de voz desde el teléfono (se convierte en texto)
+
+En lugar de escribir, grabá una nota de voz en tu chat privado. El puente la transcribe **en tu PC, localmente** — el audio nunca sale de tu máquina — y el texto le llega a la ventana de Pi vinculada exactamente como si lo hubieras tipeado. Los audios reenviados funcionan igual.
+
+Necesita una configuración única que **nunca se hace automáticamente** — el proyecto no descarga binarios por su cuenta:
+
+1. Descargá el zip de binarios de Windows de whisper.cpp desde sus releases de GitHub (la versión `v1.9.2` es la última que publica `whisper-bin-x64.zip`) y extraé `whisper-cli.exe` con sus archivos `.dll` en `.local/tools/whisper/`.
+2. Descargá el modelo `ggml-small.bin` (~466 MB) en `.local/tools/whisper/models/`.
+3. Poné `ffmpeg.exe` en `.local/tools/ffmpeg/ffmpeg.exe`, o apuntá la configuración a un ffmpeg que ya tengas (se exige una ruta absoluta completa).
+
+Esa estructura de carpetas es la configuración por defecto; cada valor se puede sobrescribir en la sección `transcription` de la configuración (rutas, idioma, cantidad de hilos, límites y el vocabulario técnico que ayuda a que el dictado en español sobreviva a palabras en inglés como "retry" o "merge").
+
+Límites duros que protegen el loop de polling: máximo 20 MB por audio, máximo 5 minutos (medidos sobre el audio convertido, no según lo que dice Telegram), timeout de 2 minutos por proceso (un proceso colgado se mata, nunca se espera), y todo corre en tu CPU: nunca se contacta ningún servicio en la nube.
+
+Si el audio no se puede transcribir (falta una herramienta, archivo demasiado grande, fallo del decodificador), el bot responde con un mensaje fijo corto y el puente sigue funcionando — nada se traba.
+
 ## Los fallos más comunes
 
 | Síntoma | Qué hacer |
@@ -119,6 +135,8 @@ Dos cosas que conviene saber:
 | El código QR expiró o no se puede escanear | Cierra la configuración y ejecuta `Setup Pi Telegram.cmd` de nuevo para obtener un código nuevo. Sube el brillo de la pantalla y acerca el teléfono. |
 | El bot dice que no hay Pi conectado (`no Pi window is connected`) | Abre Pi en la PC, escribe `/tg` y elige **Connect**. |
 | Al enviar una foto imprime `FAILED: ...` | Cada código nombra una sola causa. `path_escape`: el archivo está fuera de la carpeta del proyecto — esta comprobación va primero, así que la ves incluso si el archivo además no existe o tiene mal el nombre; agrega `--root "C:\la\carpeta"` si la imagen está en otro lado. `not_found` o `not_a_file`: no hay nada legible en esa ruta. `bad_extension`: no es `.png`, `.jpg`, `.jpeg` ni `.webp`. `too_large`: supera los 10 MB. `bad_root`: la carpeta que pasaste en `--root` no existe. |
+| El bot responde "I couldn't transcribe that audio" | Verificá que existan los tres archivos: `.local/tools/whisper/whisper-cli.exe`, `.local/tools/whisper/models/ggml-small.bin` y `.local/tools/ffmpeg/ffmpeg.exe`. Un audio de más de 20 MB o de más de 5 minutos se rechaza por diseño. Si acabás de instalar las herramientas no hace falta reiniciar nada — la próxima nota de voz las usa. |
+| Querés apagar la transcripción de voz | Poné `transcription.enabled` en `false` en tu configuración local. Las notas de voz pasan a comportarse como si la función no existiera: se consumen en silencio y no corre ninguna herramienta. |
 
 Para más síntomas y soluciones, mira la sección [Fix problems del README](README.md#fix-problems).
 
