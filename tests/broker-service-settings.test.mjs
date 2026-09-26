@@ -28,6 +28,24 @@ function quotePs(value) {
 }
 
 describe('broker service task settings', () => {
+  // The registered shape the verifier must ACCEPT: every required setting
+  // present, and no repetition anywhere in the document (see the trigger
+  // builder - the broker starts at sign-in only, and only while the owner
+  // has the connection on).
+  function safeTaskXml(triggersXml) {
+    return '<Task><Settings>'
+      + '<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>'
+      + '<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>'
+      + '<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>'
+      + '<StartWhenAvailable>true</StartWhenAvailable>'
+      + '<IdleSettings><StopOnIdleEnd>false</StopOnIdleEnd></IdleSettings>'
+      + '<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>'
+      + '<RestartOnFailure><Interval>PT1M</Interval><Count>3</Count></RestartOnFailure>'
+      + '</Settings>'
+      + (triggersXml ?? '<Triggers><LogonTrigger></LogonTrigger></Triggers>')
+      + '</Task>';
+  }
+
   test('production builder explicitly prevents ten-minute idle termination and bounds restart', () => {
     const start = COMMON_SOURCE.indexOf('function New-BrokerServiceTaskSettings {');
     const end = COMMON_SOURCE.indexOf('\n}\n', start);
@@ -46,6 +64,17 @@ describe('broker service task settings', () => {
       assert.ok(builder.includes(required), `missing task setting: ${required}`);
     }
     assert.doesNotMatch(builder, /-RunOnlyIfIdle|-RestartOnIdle/);
+  });
+
+  test('production trigger builder never installs a repetition: the broker starts only when the owner asks', () => {
+    const start = COMMON_SOURCE.indexOf('function New-BrokerServiceTaskTrigger {');
+    const end = COMMON_SOURCE.indexOf('\n}\n', start);
+    assert.ok(start >= 0 && end > start);
+    const builder = COMMON_SOURCE.slice(start, end);
+    assert.match(builder, /New-ScheduledTaskTrigger -AtLogOn/,
+      'the trigger must stay a plain logon trigger');
+    assert.doesNotMatch(builder, /Repetition/,
+      'the trigger builder must not build a repetition: a repeated logon trigger relaunches the broker in the background, out of the owner\'s control');
   });
 
   test('Windows PowerShell 5.1 constructs the intended settings object without registering a task', { skip: !IS_WIN }, () => {
@@ -75,23 +104,7 @@ describe('broker service task settings', () => {
   });
 
   test('registered XML verifier accepts the safe shape and rejects idle-stop regression', { skip: !IS_WIN }, () => {
-    // The accept fixture carries the REAL persisted logon-trigger repetition
-    // fragment from the PiTelegramBridgeRepetitionProbe probe (Task Scheduler
-    // persisted Interval PT5M with NO Duration element inside <LogonTrigger>).
-    const logonTriggerWithRepetition = '<Triggers><LogonTrigger>'
-      + '<Repetition><Interval>PT5M</Interval><StopAtDurationEnd>true</StopAtDurationEnd></Repetition>'
-      + '</LogonTrigger></Triggers>';
-    const good = '<Task><Settings>'
-      + '<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>'
-      + '<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>'
-      + '<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>'
-      + '<StartWhenAvailable>true</StartWhenAvailable>'
-      + '<IdleSettings><StopOnIdleEnd>false</StopOnIdleEnd></IdleSettings>'
-      + '<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>'
-      + '<RestartOnFailure><Interval>PT1M</Interval><Count>3</Count></RestartOnFailure>'
-      + '</Settings>'
-      + logonTriggerWithRepetition
-      + '</Task>';
+    const good = safeTaskXml();
     const command = [
       `. ${quotePs(COMMON)}`,
       `$good = ${quotePs(good)}`,
@@ -105,44 +118,29 @@ describe('broker service task settings', () => {
     assert.equal(ps(command), 'OK');
   });
 
-  test('registered XML verifier rejects a logon trigger without the five-minute repetition', { skip: !IS_WIN }, () => {
-    const good = '<Task><Settings>'
-      + '<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>'
-      + '<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>'
-      + '<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>'
-      + '<StartWhenAvailable>true</StartWhenAvailable>'
-      + '<IdleSettings><StopOnIdleEnd>false</StopOnIdleEnd></IdleSettings>'
-      + '<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>'
-      + '<RestartOnFailure><Interval>PT1M</Interval><Count>3</Count></RestartOnFailure>'
-      + '</Settings>'
-      + '<Triggers><LogonTrigger></LogonTrigger></Triggers>'
-      + '</Task>';
+  test('registered XML verifier accepts a plain logon trigger and rejects the self-heal repetition', { skip: !IS_WIN }, () => {
+    // The accepted shape carries no repetition: the broker must start only
+    // when the owner asks, never on Task Scheduler's own schedule.
+    const good = safeTaskXml();
     const command = [
       `. ${quotePs(COMMON)}`,
       `$good = ${quotePs(good)}`,
+      'Assert-BrokerServiceTaskXml -TaskXml $good | Out-Null',
+      '$withRepetition = $good.Replace("<LogonTrigger>", "<LogonTrigger><Repetition><Interval>PT5M</Interval><StopAtDurationEnd>true</StopAtDurationEnd></Repetition>")',
       '$rejected = $false',
-      'try { Assert-BrokerServiceTaskXml -TaskXml $good | Out-Null } catch { $rejected = $true }',
-      'if (-not $rejected) { throw "missing logon-trigger repetition was accepted" }',
+      'try { Assert-BrokerServiceTaskXml -TaskXml $withRepetition | Out-Null } catch { $rejected = $true }',
+      'if (-not $rejected) { throw "self-heal logon-trigger repetition was accepted" }',
       'Write-Output "OK"',
     ].join('; ');
     assert.equal(ps(command), 'OK');
   });
 
-  test('registered XML verifier anchors the repetition inside the logon trigger, not anywhere in the document', { skip: !IS_WIN }, () => {
-    // A repetition OUTSIDE the logon trigger must not satisfy the check:
-    // only a repetition inside <LogonTrigger> re-fires the logon start.
-    const misplaced = '<Task><Settings>'
-      + '<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>'
-      + '<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>'
-      + '<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>'
-      + '<StartWhenAvailable>true</StartWhenAvailable>'
-      + '<IdleSettings><StopOnIdleEnd>false</StopOnIdleEnd></IdleSettings>'
-      + '<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>'
-      + '<RestartOnFailure><Interval>PT1M</Interval><Count>3</Count></RestartOnFailure>'
-      + '</Settings>'
-      + '<Repetition><Interval>PT5M</Interval><StopAtDurationEnd>true</StopAtDurationEnd></Repetition>'
-      + '<Triggers><LogonTrigger></LogonTrigger></Triggers>'
-      + '</Task>';
+  test('registered XML verifier rejects a repetition placed anywhere, not only inside the logon trigger', { skip: !IS_WIN }, () => {
+    // The ban is on the bare element, so a repetition parked outside
+    // <LogonTrigger> is rejected by the same rule instead of sneaking past a
+    // check that only looked inside the trigger.
+    const misplaced = safeTaskXml()
+      .replace('</Settings>', '</Settings><Repetition><Interval>PT5M</Interval><StopAtDurationEnd>true</StopAtDurationEnd></Repetition>');
     const command = [
       `. ${quotePs(COMMON)}`,
       `$misplaced = ${quotePs(misplaced)}`,

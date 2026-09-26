@@ -4,7 +4,10 @@
 # - Task: PiTelegramBridgeBroker, trigger AtLogOn of the CURRENT user,
 #   principal = current interactive user, LogonType Interactive,
 #   RunLevel Limited. Never LocalSystem; no Windows password is ever
-#   stored or prompted for.
+#   stored or prompted for. The trigger carries NO repetition, so it
+#   fires once per sign-in and never re-fires on its own schedule: a
+#   repetition would relaunch the broker in the background, out of the
+#   owner's control and with a visible console window on every fire.
 # - Action: <absolute node.exe> <absolute src/runtime-broker.mjs>
 #   --state-dir <absolute confined state dir>, working directory = module
 #   root, hidden. No token, no Telegram ids, no credential material in
@@ -96,7 +99,7 @@ if ($credentialsPresent) {
     Write-Host 'SETUP_REQUIRED - credentials are missing; the task was registered DISABLED.'
     Write-Host 'Run scripts/setup.ps1 to enroll, then turn the connection on with "telegram on".'
 }
-Write-Host "Task: $taskName (logon trigger, current user, Interactive, Limited)."
+Write-Host "Task: $taskName (logon trigger, current user, Interactive, Limited, no repetition)."
 Write-Host "Node: $nodeExe"
 Write-Host "Broker: $brokerScript"
 Write-Host "State: $stateRoot"

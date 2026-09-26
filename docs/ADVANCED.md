@@ -80,6 +80,7 @@ The task is registered **disabled** by whichever setup path registers it: the Be
 Once enabled, the task:
 
 - starts at user logon and when explicitly requested;
+- has no repetition, so it never re-fires on its own schedule: if the broker dies while the connection is on, it stays down until you run `telegram on` again, and `telegram status` reports the link as down;
 - does not stop when the PC leaves Task Scheduler's idle state;
 - has no execution-time limit;
 - ignores duplicate start requests while one instance is running;

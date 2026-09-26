@@ -42,26 +42,27 @@ function New-BrokerServiceTaskSettings {
 
 <#
 .SYNOPSIS
-Builds the logon trigger with a five-minute repetition interval. The
-repetition is the SELF-HEAL path: RestartOnFailure (kept as a second line
-of defence) is not trusted, because it failed to relaunch the broker on
-the real machine after a STATUS_CONTROL_C_EXIT death. Task Scheduler
-re-fires a repeated logon trigger every 5 minutes regardless of how the
-previous run ended, and MultipleInstances=IgnoreNew (asserted below)
-makes each repetition a no-op while the broker is healthy and a relaunch
-when it is dead.
-PowerShell 5.1 cannot set a repetition directly on a logon trigger
-(mutating its CIM Repetition object throws), so the repetition object is
-built on a throwaway -Once trigger and copied over. No repetition
-duration is set, so the repetition never expires.
+Builds the plain logon trigger: one start at sign-in, and ONLY while the
+owner has the connection on. The installer registers the task DISABLED
+and only an explicit owner action enables it (the telegram switch, or the
+start helper in this module), so this trigger starts nothing by itself
+until the owner asks for the connection.
+
+There is deliberately NO repetition. A repeated logon trigger re-fires
+every interval no matter how the previous run ended, and re-fire is what
+turned the broker into a background process the owner could not leave
+off: after the connection was turned on, Task Scheduler relaunched the
+broker on its own schedule whenever it was dead, and every relaunch
+starts a visible console process. Crash recovery stays bounded and
+belongs to RestartOnFailure (3 attempts, one minute apart, asserted
+below), which can only act inside a start the owner already asked for.
+
+The readback assertion below rejects a persisted repetition, so this
+decision is enforced on the registered task and not only here.
 #>
 function New-BrokerServiceTaskTrigger {
     param([Parameter(Mandatory = $true)][string]$UserIdentity)
-    $logonTrigger = New-ScheduledTaskTrigger -AtLogOn -User $UserIdentity
-    $repetitionSource = New-ScheduledTaskTrigger -Once -At (Get-Date) `
-        -RepetitionInterval (New-TimeSpan -Minutes 5)
-    $logonTrigger.Repetition = $repetitionSource.Repetition
-    return $logonTrigger
+    return New-ScheduledTaskTrigger -AtLogOn -User $UserIdentity
 }
 
 <#
@@ -82,14 +83,23 @@ function Assert-BrokerServiceTaskXml {
         '<MultipleInstancesPolicy>\s*IgnoreNew\s*</MultipleInstancesPolicy>',
         '<StartWhenAvailable>\s*true\s*</StartWhenAvailable>',
         '<RestartOnFailure>[\s\S]*?<Interval>\s*PT1M\s*</Interval>',
-        '<RestartOnFailure>[\s\S]*?<Count>\s*3\s*</Count>',
-        # The repetition must be INSIDE the logon trigger: a repetition
-        # anywhere else in the document does not re-fire the logon start.
-        '<LogonTrigger>(?:(?!</LogonTrigger>)[\s\S])*?<Repetition>(?:(?!</Repetition>)[\s\S])*?<Interval>\s*PT5M\s*</Interval>'
+        '<RestartOnFailure>[\s\S]*?<Count>\s*3\s*</Count>'
+    )
+    # Forbidden settings. Task Scheduler must NOT persist a repetition: a
+    # repetition re-fires the start on its own schedule, which is exactly
+    # the background relaunch the owner refuses. Matching the bare element
+    # covers every trigger shape, placement and interval.
+    $forbidden = @(
+        '<Repetition>'
     )
     foreach ($pattern in $required) {
         if ($TaskXml -notmatch $pattern) {
             throw "registered task settings verification failed ($pattern)"
+        }
+    }
+    foreach ($pattern in $forbidden) {
+        if ($TaskXml -match $pattern) {
+            throw "registered task settings verification failed (forbidden: $pattern)"
         }
     }
     return $true
