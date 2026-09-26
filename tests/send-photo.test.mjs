@@ -12,6 +12,7 @@ import { Writable } from 'node:stream';
 import { fileURLToPath } from 'node:url';
 
 import { TelegramApi, TelegramApiError, TELEGRAM_API_ORIGIN } from '../src/telegram-api.mjs';
+import { MAX_PHOTO_BYTES, PHOTO_EXTENSIONS } from '../src/media-policy.mjs';
 import { main as sendPhotoMain } from '../scripts/send-photo.mjs';
 
 const TEST_RUNS = fileURLToPath(new URL('../.local/test-runs/', import.meta.url));
@@ -176,6 +177,50 @@ describe('send-photo CLI', () => {
     writeFileSync(join(dir, 'pic.png'), PNG_BYTES);
     return dir;
   }
+
+  test('--help prints the usage and exits 0 without touching credentials or the network', async () => {
+    const { stdout, lines } = capture();
+    const code = await sendPhotoMain(['--help'], {
+      stdout,
+      // Throws loudly if the help path ever reaches for credentials. Asking
+      // how the tool works must never read the DPAPI blob.
+      revealCredentials: () => { throw new Error('help must not reveal credentials'); },
+    });
+    assert.equal(code, 0, 'help is a success, not a usage error');
+    const out = lines.join('');
+    assert.match(out, /^Send one photo to the enrolled allowed chat\./);
+    assert.match(out, /Usage:/);
+    assert.ok(!out.startsWith('FAILED:'), 'help must not report a failure');
+    assert.notEqual(out.trimEnd(), 'SENT', 'help is not a send result');
+  });
+
+  test('-h is an alias for --help, and --help wins next to malformed arguments', async () => {
+    const first = capture();
+    assert.equal(await sendPhotoMain(['-h'], { stdout: first.stdout }), 0);
+
+    // The bug this pins: the unknown-flag throw used to fire before --help
+    // could be honoured, so `--help --bogus` printed FAILED: bad_usage.
+    const second = capture();
+    assert.equal(
+      await sendPhotoMain(['--help', '--bogus'], { stdout: second.stdout }),
+      0,
+      'a usage request must not be defeated by the rest of the command line',
+    );
+    assert.equal(first.lines.join(''), second.lines.join(''), '-h and --help print the same text');
+  });
+
+  test('the usage quotes the real policy limits instead of drifting from them', async () => {
+    const { stdout, lines } = capture();
+    await sendPhotoMain(['--help'], { stdout });
+    const out = lines.join('');
+    for (const ext of PHOTO_EXTENSIONS) {
+      assert.ok(out.includes(ext), `usage must list the enforced extension ${ext}`);
+    }
+    assert.ok(
+      out.includes(`${MAX_PHOTO_BYTES / (1024 * 1024)} MB`),
+      'usage must state the enforced size cap',
+    );
+  });
 
   test('--dry-run validates and reports success with exit 0, no network and no credentials', async () => {
     const dir = makePhotoDir('dry');
