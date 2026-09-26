@@ -15,6 +15,10 @@
 // - Transient failures (network, timeout, 5xx, 429, unparseable body) are
 //   retried with exponential backoff + jitter; 429 honors retry_after.
 //   401/403/409 and other definitive failures are NEVER retried.
+// - File downloads (getFile + /file/bot<token>/<path>) follow the same
+//   fixed-origin, credential-free, abortable, bounded discipline. Audio
+//   bytes are never decoded as text, and Telegram's untrusted file_path is
+//   validated before any download URL is ever built.
 
 import { readFile } from 'node:fs/promises';
 import { basename } from 'node:path';
@@ -80,6 +84,7 @@ export class TelegramApi {
    * @param {number} [options.maxDelayMs] backoff cap
    * @param {number} [options.jitterRatio] 0..1 multiplicative jitter
    * @param {number} [options.maxResponseBytes] response body cap
+   * @param {number} [options.maxDownloadBytes] file download cap in bytes
    * @param {(ms: number, signal?: AbortSignal) => Promise<void>} [options.sleep]
    * @param {() => number} [options.random] jitter source (0..1)
    */
@@ -93,6 +98,7 @@ export class TelegramApi {
     maxDelayMs = 8000,
     jitterRatio = 0.25,
     maxResponseBytes = 1_048_576,
+    maxDownloadBytes = 20 * 1024 * 1024,
     sleep = defaultSleep,
     random = Math.random,
   } = {}) {
@@ -111,6 +117,7 @@ export class TelegramApi {
     this.#maxDelayMs = maxDelayMs;
     this.#jitterRatio = jitterRatio;
     this.#maxResponseBytes = maxResponseBytes;
+    this.#maxDownloadBytes = maxDownloadBytes;
     this.#sleep = sleep;
     this.#random = random;
   }
@@ -124,6 +131,7 @@ export class TelegramApi {
   #maxDelayMs;
   #jitterRatio;
   #maxResponseBytes;
+  #maxDownloadBytes;
   #sleep;
   #random;
   #closed = false;
@@ -136,11 +144,23 @@ export class TelegramApi {
   }
 
   /**
-   * One request attempt: timeout-bounded, abort-aware, response-bounded.
-   * Throws TelegramApiError with a fixed code; never includes the URL,
-   * token, raw body or underlying cause text.
+   * Download URL for a VALIDATED file_path. Built here and never exposed,
+   * logged or included in errors, exactly like #url.
    */
-  async #attempt(method, payload, signal, timeoutMs) {
+  #fileUrl(filePath) {
+    return `${TELEGRAM_API_ORIGIN}/file/bot${this.#botToken}/${filePath}`;
+  }
+
+  /**
+   * Shared per-attempt discipline for every outbound request (JSON POST and
+   * file GET alike): closed/aborted pre-check, an internal AbortController
+   * bounded per attempt by `timeoutMs`, chained to the external `signal`,
+   * tracked in-flight so close() aborts it, and timer/listener cleanup.
+   * `consume(controller, timedOut)` performs the fetch AND consumes the
+   * response while the attempt is still live (so the per-attempt timeout
+   * covers the body read too); its result is returned untouched.
+   */
+  async #runAttempt(consume, signal, timeoutMs) {
     if (this.#closed || (signal?.aborted ?? false)) {
       throw new TelegramApiError({ code: 'aborted' });
     }
@@ -157,6 +177,39 @@ export class TelegramApi {
       else signal.addEventListener('abort', onExternalAbort, { once: true });
     }
     try {
+      return await consume(controller, () => timedOut);
+    } finally {
+      clearTimeout(timer);
+      if (signal) signal.removeEventListener('abort', onExternalAbort);
+      this.#inFlight.delete(controller);
+    }
+  }
+
+  /**
+   * Map a non-ok response to the fixed credential-free code, honouring the
+   * server's retry_after hint. Shared by the JSON and download paths.
+   */
+  #errorFromResponse(response, data) {
+    const status = response.status;
+    const errorCode = typeof data?.error_code === 'number' ? data.error_code : status;
+    const retryAfterRaw = data?.parameters?.retry_after;
+    const retryAfterMs = typeof retryAfterRaw === 'number' && retryAfterRaw >= 0
+      ? retryAfterRaw * 1000
+      : null;
+    return new TelegramApiError({
+      code: codeFromStatus(errorCode),
+      status,
+      retryAfterMs,
+    });
+  }
+
+  /**
+   * One JSON POST attempt: returns Telegram's `result`. Throws
+   * TelegramApiError with a fixed code; never includes the URL, token,
+   * raw body or underlying cause text.
+   */
+  async #attempt(method, payload, signal, timeoutMs) {
+    return this.#runAttempt(async (controller, timedOut) => {
       let response;
       try {
         // Multipart bodies (FormData) must carry their own content-type
@@ -176,7 +229,7 @@ export class TelegramApi {
         response = await this.#fetchImpl(this.#url(method), init);
       } catch (error) {
         if (signal?.aborted || this.#closed) throw new TelegramApiError({ code: 'aborted' });
-        if (timedOut) throw new TelegramApiError({ code: 'timeout' });
+        if (timedOut()) throw new TelegramApiError({ code: 'timeout' });
         throw new TelegramApiError({ code: 'network' });
       }
       const text = await this.#readBounded(response);
@@ -188,24 +241,10 @@ export class TelegramApi {
         throw new TelegramApiError({ code: 'bad_response' });
       }
       if (!response.ok || data?.ok !== true) {
-        const status = response.status;
-        const errorCode = typeof data?.error_code === 'number' ? data.error_code : status;
-        const retryAfterRaw = data?.parameters?.retry_after;
-        const retryAfterMs = typeof retryAfterRaw === 'number' && retryAfterRaw >= 0
-          ? retryAfterRaw * 1000
-          : null;
-        throw new TelegramApiError({
-          code: codeFromStatus(errorCode),
-          status,
-          retryAfterMs,
-        });
+        throw this.#errorFromResponse(response, data);
       }
       return data.result;
-    } finally {
-      clearTimeout(timer);
-      if (signal) signal.removeEventListener('abort', onExternalAbort);
-      this.#inFlight.delete(controller);
-    }
+    }, signal, timeoutMs);
   }
 
   /** Read the response body with a hard cap; never buffer unbounded input. */
@@ -243,17 +282,51 @@ export class TelegramApi {
   }
 
   /**
+   * Read the response body as BYTES with a hard cap; audio is not UTF-8 and
+   * must never pass through a TextDecoder. Same discipline as #readBounded:
+   * a content-length over the cap is rejected before reading, and the
+   * stream is cancelled rather than buffered past the cap.
+   */
+  async #readBoundedBytes(response, maxBytes) {
+    const contentLength = Number(response.headers?.get?.('content-length') ?? '0');
+    if (Number.isFinite(contentLength) && contentLength > maxBytes) {
+      // Cancel the body so the connection is not left hanging.
+      try { await response.body?.cancel?.(); } catch { /* already gone */ }
+      throw new TelegramApiError({ code: 'too_large' });
+    }
+    const body = response.body;
+    if (!body || typeof body.getReader !== 'function') {
+      const buffer = await response.arrayBuffer();
+      if (buffer.byteLength > maxBytes) {
+        throw new TelegramApiError({ code: 'too_large' });
+      }
+      return Buffer.from(buffer);
+    }
+    const reader = body.getReader();
+    const chunks = [];
+    let total = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > maxBytes) {
+        try { await reader.cancel(); } catch { /* already cancelled */ }
+        throw new TelegramApiError({ code: 'too_large' });
+      }
+      chunks.push(value);
+    }
+    return Buffer.concat(chunks);
+  }
+
+  /**
    * Request with bounded retries. `signal` aborts everything immediately
    * ('aborted'); retry sleeps honor server retry_after over local backoff.
    */
-  async #request(method, payload, { signal = undefined, retries = true } = {}) {
-    const timeoutMs = method === 'getUpdates'
-      ? Math.max(this.#timeoutMs, (this.#longPollTimeoutSec + 5) * 1000)
-      : this.#timeoutMs;
+  async #withRetry(fn, { signal = undefined, retries = true } = {}) {
     let attempt = 0;
     for (;;) {
       try {
-        return await this.#attempt(method, payload, signal, timeoutMs);
+        return await fn();
       } catch (error) {
         const isApiError = error instanceof TelegramApiError;
         const code = isApiError ? error.code : 'network';
@@ -278,7 +351,126 @@ export class TelegramApi {
   }
 
   /**
-   * Long poll. `offset` is the next update_id to fetch; the caller only
+   * JSON POST with bounded retries: the shared #withRetry loop driving the
+   * shared per-attempt discipline, unchanged for every existing method.
+   */
+  async #request(method, payload, { signal = undefined, retries = true } = {}) {
+    const timeoutMs = method === 'getUpdates'
+      ? Math.max(this.#timeoutMs, (this.#longPollTimeoutSec + 5) * 1000)
+      : this.#timeoutMs;
+    return this.#withRetry(
+      () => this.#attempt(method, payload, signal, timeoutMs),
+      { signal, retries },
+    );
+  }
+
+  /**
+   * One file GET attempt: returns the raw bytes of a successful response.
+   * A non-ok response still speaks JSON: read the error body bounded,
+   * attempt to parse it and map through the same fixed codes as any other
+   * call (retry_after honoured), so a 404/429/5xx download behaves like the
+   * JSON path. Same per-attempt timeout, abort tracking and redirect
+   * refusal as every other request.
+   */
+  async #downloadAttempt(url, signal, timeoutMs, maxBytes) {
+    return this.#runAttempt(async (controller, timedOut) => {
+      let response;
+      try {
+        response = await this.#fetchImpl(url, {
+          method: 'GET',
+          signal: controller.signal,
+          // The URL carries the bot token and the fixed origin never
+          // legitimately redirects: same refusal as the JSON path.
+          redirect: 'error',
+        });
+      } catch (error) {
+        if (signal?.aborted || this.#closed) throw new TelegramApiError({ code: 'aborted' });
+        if (timedOut()) throw new TelegramApiError({ code: 'timeout' });
+        throw new TelegramApiError({ code: 'network' });
+      }
+      if (!response.ok) {
+        const text = await this.#readBounded(response);
+        let data = null;
+        try {
+          data = JSON.parse(text);
+        } catch {
+          // Not JSON: the status-only mapping below still applies.
+        }
+        throw this.#errorFromResponse(response, data);
+      }
+      return this.#readBoundedBytes(response, maxBytes);
+    }, signal, timeoutMs);
+  }
+
+  /**
+   * Telegram's `file_path` is UNTRUSTED input: validate it here so no
+   * caller can skip the check. Fail closed with the fixed 'bad_file_path'
+   * code; the rejected value itself is never echoed back.
+   */
+  #validateFilePath(filePath) {
+    if (typeof filePath !== 'string' || filePath.trim().length === 0) {
+      throw new TelegramApiError({ code: 'bad_file_path' });
+    }
+    // Control characters (including NUL, newline, carriage return).
+    // eslint-disable-next-line no-control-regex
+    if (/[\u0000-\u001f\u007f]/.test(filePath)) {
+      throw new TelegramApiError({ code: 'bad_file_path' });
+    }
+    if (
+      filePath.includes('\\')
+      || filePath.startsWith('/')
+      || filePath.startsWith('//')
+      || filePath.includes('?')
+      || filePath.includes('#')
+      || filePath.includes(':')
+    ) {
+      throw new TelegramApiError({ code: 'bad_file_path' });
+    }
+    // '..' as a whole path segment only; a filename like 'a..b' is fine.
+    if (filePath.split('/').some((segment) => segment === '..')) {
+      throw new TelegramApiError({ code: 'bad_file_path' });
+    }
+    // Final alphabet check: anything outside Telegram's own file_path
+    // shape is rejected outright.
+    if (!/^[A-Za-z0-9._/-]+$/.test(filePath)) {
+      throw new TelegramApiError({ code: 'bad_file_path' });
+    }
+    return filePath;
+  }
+
+  /**
+   * Resolve an inbound file id to its (untrusted) download metadata.
+   * A normal JSON POST through the existing path; the caller validates the
+   * returned file_path via downloadFile.
+   */
+  getFile({ fileId, signal } = {}) {
+    return this.#request('getFile', { file_id: fileId }, { signal });
+  }
+
+  /**
+   * Download one file by its `file_path` (from getFile) and return the raw
+   * bytes. The path is untrusted and validated HERE, so no caller can skip
+   * the check; as defence in depth the final URL is asserted to still start
+   * with the exact expected fixed-origin prefix before the request is
+   * issued. The token stays encapsulated: never returned, never in an
+   * error, never in a thrown message. Bounded by maxDownloadBytes.
+   */
+  async downloadFile({ filePath, signal } = {}) {
+    const safePath = this.#validateFilePath(filePath);
+    const url = this.#fileUrl(safePath);
+    const prefix = `${TELEGRAM_API_ORIGIN}/file/bot${this.#botToken}/`;
+    if (!url.startsWith(prefix)) {
+      // Unreachable while validation holds: fail closed rather than ever
+      // issuing a request outside the fixed origin.
+      throw new TelegramApiError({ code: 'bad_file_path' });
+    }
+    return this.#withRetry(
+      () => this.#downloadAttempt(url, signal, this.#timeoutMs, this.#maxDownloadBytes),
+      { signal },
+    );
+  }
+
+  /** Long poll. `offset` is the next update_id to fetch; the caller only
    * advances the durable offset after the update is handled atomically.
    */
   getUpdates({ offset, signal } = {}) {

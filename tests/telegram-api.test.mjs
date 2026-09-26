@@ -40,7 +40,9 @@ function makeFakeFetch(script = {}) {
   const calls = [];
   const fetchImpl = async (url, init) => {
     const method = String(url).split('/').pop();
-    calls.push({ url, method, init, body: JSON.parse(init.body) });
+    // GETs (file downloads) carry no body: keep the captured shape honest
+    // instead of letting JSON.parse(undefined) throw.
+    calls.push({ url, method, init, body: init.body === undefined ? undefined : JSON.parse(init.body) });
     const handler = script[method];
     if (typeof handler === 'function') return handler(calls[calls.length - 1]);
     if (handler) return handler;
@@ -421,6 +423,262 @@ describe('telegram-api: abort, timeout and bounded responses', () => {
     const api = makeApi(fetchImpl, { sleep: async () => {} });
     await api.getMe();
     assert.equal(attempts, 2);
+    await api.close();
+  });
+});
+
+describe('telegram-api: inbound file download (T2)', () => {
+  /** Raw-byte response: nothing in it is text. */
+  function bytesResponse(bytes) {
+    return new Response(bytes, { status: 200 });
+  }
+
+  /**
+   * Hand-built streaming response so caps and cancellation are observable.
+   * The stream never closes on its own: a consumer that keeps reading past
+   * the served chunks would hang (and fail the test) instead of silently
+   * reaching a synthetic end, and cancellation stays observable in
+   * stats.cancelled — a close() from a later pull would race an in-flight
+   * cancel() and error the stream, hiding exactly what we assert.
+   */
+  function trackingByteResponse({ chunks = 3, chunkSize = 1024, contentLength } = {}) {
+    let pulls = 0;
+    let served = 0;
+    let cancelled = false;
+    const stream = new ReadableStream({
+      pull(controller) {
+        pulls += 1;
+        if (served < chunks) {
+          served += 1;
+          controller.enqueue(new Uint8Array(chunkSize).fill(0x41));
+        }
+      },
+      cancel() { cancelled = true; },
+    });
+    const headers = new Headers();
+    if (contentLength !== undefined) headers.set('content-length', String(contentLength));
+    return {
+      response: { ok: true, status: 200, headers, body: stream },
+      stats: {
+        get pulls() { return pulls; },
+        get served() { return served; },
+        get cancelled() { return cancelled; },
+      },
+    };
+  }
+
+  test('getFile posts file_id to /bot<token>/getFile and returns Telegram\'s result', async () => {
+    const result = { file_id: 'F1', file_unique_id: 'U1', file_size: 9, file_path: 'voice/file_0.oga' };
+    const { calls, fetchImpl } = makeFakeFetch({
+      getFile: jsonResponse({ ok: true, result }),
+    });
+    const api = makeApi(fetchImpl);
+    const returned = await api.getFile({ fileId: 'F1' });
+    assert.deepEqual(returned, result);
+    assert.equal(calls[0].url, `${TELEGRAM_API_ORIGIN}/bot${TOKEN}/getFile`);
+    assert.equal(calls[0].init.method, 'POST');
+    assert.equal(calls[0].body.file_id, 'F1');
+    await api.close();
+  });
+
+  test('downloadFile issues a GET to the fixed-origin file URL and returns the exact bytes (never text-decoded)', async () => {
+    // Payload a TextDecoder round-trip would corrupt: 0xFF and 0xFE are
+    // invalid UTF-8, 0x80 starts an invalid sequence, 0xC3 0x28 is a broken
+    // two-byte pair, and the embedded NUL must survive as a byte.
+    const raw = Uint8Array.from([0x4f, 0x67, 0x67, 0x53, 0xff, 0xfe, 0x00, 0x80, 0xc3, 0x28]);
+    const { calls, fetchImpl } = makeFakeFetch({
+      // makeFakeFetch keys handlers by the URL's last path segment.
+      'file_0.oga': bytesResponse(raw),
+    });
+    const api = makeApi(fetchImpl);
+    const bytes = await api.downloadFile({ filePath: 'voice/file_0.oga' });
+    assert.ok(Buffer.isBuffer(bytes), 'audio must come back as bytes, not a string');
+    assert.equal(calls[0].url, `${TELEGRAM_API_ORIGIN}/file/bot${TOKEN}/voice/file_0.oga`);
+    assert.equal(calls[0].init.method, 'GET');
+    assert.equal(calls[0].init.redirect, 'error', 'the download refuses redirects like every other call');
+    assert.deepEqual([...bytes], [...raw]);
+    // Prove no string decoding happened: a text round-trip of these bytes
+    // differs from what was served, and must differ from what came back.
+    const roundTripped = Buffer.from(new TextDecoder().decode(raw), 'utf8');
+    assert.notEqual(Buffer.compare(roundTripped, Buffer.from(raw)), 0, 'test payload must be corrupted by a text round-trip');
+    assert.notEqual(Buffer.compare(roundTripped, bytes), 0);
+    await api.close();
+  });
+
+  test('the cap is enforced in bytes: a stream over maxDownloadBytes throws too_large and cancels the stream', async () => {
+    // Cap 1024 with 1024-byte chunks: the first chunk lands exactly on the
+    // cap (inclusive), the second crosses it and must stop the read.
+    const { response, stats } = trackingByteResponse({ chunks: 3, chunkSize: 1024 });
+    const { calls, fetchImpl } = makeFakeFetch({ 'big.oga': () => response });
+    const api = makeApi(fetchImpl, { maxDownloadBytes: 1024, maxRetries: 3, sleep: async () => {} });
+    await assert.rejects(
+      () => api.downloadFile({ filePath: 'voice/big.oga' }),
+      (error) => {
+        assert.ok(error instanceof TelegramApiError);
+        assert.equal(error.code, 'too_large');
+        assert.doesNotMatch(error.message, TOKEN_LEAK);
+        return true;
+      },
+    );
+    assert.equal(calls.length, 1, 'too_large must never be retried');
+    assert.ok(stats.pulls <= 3, 'at most one pull per read: reading stops at the cap');
+    assert.ok(stats.cancelled, 'the stream must be cancelled rather than buffered past the cap');
+    await api.close();
+  });
+
+  test('a content-length over the cap is rejected before reading', async () => {
+    // The stream never closes, so an implementation that read the body
+    // would keep pulling forever and hang this test instead of passing it.
+    const { response, stats } = trackingByteResponse(
+      { chunks: 1, chunkSize: 8, contentLength: 20 * 1024 * 1024 + 1 },
+    );
+    const { fetchImpl } = makeFakeFetch({ 'big.oga': () => response });
+    const api = makeApi(fetchImpl, { maxDownloadBytes: 20 * 1024 * 1024 });
+    await assert.rejects(
+      () => api.downloadFile({ filePath: 'voice/big.oga' }),
+      (error) => error.code === 'too_large',
+    );
+    // At most the construction-time pull: the body was never read.
+    assert.ok(stats.pulls <= 1, 'the body must never be read');
+    assert.ok(stats.cancelled, 'the body must be cancelled, not left hanging');
+    await api.close();
+  });
+
+  test('a body of exactly maxDownloadBytes is accepted (the cap is inclusive)', async () => {
+    const { fetchImpl } = makeFakeFetch({
+      'exact.oga': bytesResponse(new Uint8Array(2048).fill(0x42)),
+    });
+    const api = makeApi(fetchImpl, { maxDownloadBytes: 2048 });
+    const bytes = await api.downloadFile({ filePath: 'voice/exact.oga' });
+    assert.equal(bytes.byteLength, 2048);
+    await api.close();
+  });
+
+  describe('untrusted file_path validation (bad_file_path)', () => {
+    const rejected = [
+      ['traversal with a colon', '../../bot123:ABC/getMe'],
+      ['absolute path', '/etc/passwd'],
+      ['backslash', 'a\\..\\b'],
+      ['query string', 'voice/file_0.oga?x=1'],
+      ['fragment', 'voice/file_0.oga#frag'],
+      ['scheme', 'http://evil.example/x'],
+      ['protocol-relative', '//evil.example/x'],
+      ['NUL byte', 'voice/file_\0.oga'],
+      ['newline', 'voice/file\n.oga'],
+      ['whitespace only', '   '],
+      ['not a string', 42],
+      ['null', null],
+      ['undefined', undefined],
+    ];
+    for (const [name, filePath] of rejected) {
+      test(`rejects ${name} with bad_file_path, no request, no echo`, async () => {
+        const { calls, fetchImpl } = makeFakeFetch();
+        const api = makeApi(fetchImpl);
+        await assert.rejects(
+          () => api.downloadFile({ filePath }),
+          (error) => {
+            assert.ok(error instanceof TelegramApiError);
+            assert.equal(error.code, 'bad_file_path');
+            // The code alone is the message: no token, no path echo.
+            assert.doesNotMatch(error.message, TOKEN_LEAK);
+            assert.doesNotMatch(String(error.stack ?? ''), TOKEN_LEAK);
+            assert.equal(error.message.includes(String(filePath)), false);
+            return true;
+          },
+        );
+        assert.equal(calls.length, 0, 'a rejected path must never reach fetch');
+        await api.close();
+      });
+    }
+
+    test('accepts a benign voice file_path', async () => {
+      const raw = Uint8Array.from([1, 2, 3]);
+      const { calls, fetchImpl } = makeFakeFetch({ 'file_0.oga': bytesResponse(raw) });
+      const api = makeApi(fetchImpl);
+      const bytes = await api.downloadFile({ filePath: 'voice/file_0.oga' });
+      assert.deepEqual([...bytes], [1, 2, 3]);
+      assert.equal(calls.length, 1);
+      await api.close();
+    });
+  });
+
+  test('a 429 download honors retry_after and retries', async () => {
+    const delays = [];
+    let attempts = 0;
+    const raw = Uint8Array.from([1, 2, 3]);
+    const { calls, fetchImpl } = makeFakeFetch({
+      'file_0.oga': () => {
+        attempts += 1;
+        if (attempts === 1) {
+          return jsonResponse({ ok: false, error_code: 429, description: 'Too Many Requests', parameters: { retry_after: 2 } }, 429);
+        }
+        return bytesResponse(raw);
+      },
+    });
+    const api = makeApi(fetchImpl, { sleep: async (ms) => delays.push(ms) });
+    const bytes = await api.downloadFile({ filePath: 'voice/file_0.oga' });
+    assert.deepEqual([...bytes], [1, 2, 3]);
+    assert.equal(attempts, 2);
+    assert.deepEqual(delays, [2000], 'retry_after (ms) must take precedence over backoff');
+    await api.close();
+  });
+
+  test('a 404 download fails as http_error and never retries', async () => {
+    let attempts = 0;
+    const { fetchImpl } = makeFakeFetch({
+      'file_0.oga': () => {
+        attempts += 1;
+        return jsonResponse({ ok: false, error_code: 404, description: 'Not Found' }, 404);
+      },
+    });
+    const api = makeApi(fetchImpl, { maxRetries: 5, sleep: async () => {} });
+    await assert.rejects(
+      () => api.downloadFile({ filePath: 'voice/file_0.oga' }),
+      (error) => {
+        assert.equal(error.code, 'http_error');
+        assert.doesNotMatch(error.message, TOKEN_LEAK);
+        assert.doesNotMatch(String(error.stack ?? ''), TOKEN_LEAK);
+        return true;
+      },
+    );
+    assert.equal(attempts, 1, 'http_error is definitive: no retry');
+    await api.close();
+  });
+
+  test('an aborted download surfaces as aborted', async () => {
+    const fetchImpl = async (url, init) => new Promise((resolve, reject) => {
+      init.signal.addEventListener('abort', () => {
+        const error = new Error('AbortError');
+        error.name = 'AbortError';
+        reject(error);
+      });
+    });
+    const api = makeApi(fetchImpl, { maxRetries: 3 });
+    const controller = new AbortController();
+    const pending = api.downloadFile({ filePath: 'voice/file_0.oga', signal: controller.signal });
+    controller.abort();
+    await assert.rejects(() => pending, (error) => error.code === 'aborted');
+    await api.close();
+  });
+
+  test('a hung download times out per attempt and reports timeout', async () => {
+    let attempts = 0;
+    const fetchImpl = async (url, init) => {
+      attempts += 1;
+      return new Promise((resolve, reject) => {
+        init.signal.addEventListener('abort', () => {
+          const error = new Error('AbortError');
+          error.name = 'AbortError';
+          reject(error);
+        });
+      });
+    };
+    const api = makeApi(fetchImpl, { timeoutMs: 50, maxRetries: 1, sleep: async () => {} });
+    await assert.rejects(
+      () => api.downloadFile({ filePath: 'voice/file_0.oga' }),
+      (error) => error.code === 'timeout',
+    );
+    assert.equal(attempts, 2, 'timeout is retryable');
     await api.close();
   });
 });
