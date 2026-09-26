@@ -15,7 +15,7 @@ export class ConfigError extends Error {
   }
 }
 
-const TOP_LEVEL_SECTIONS = Object.freeze(['telegram', 'pi', 'store', 'bridge']);
+const TOP_LEVEL_SECTIONS = Object.freeze(['telegram', 'pi', 'store', 'bridge', 'transcription']);
 
 // Keys that could mutate object prototypes through merging.
 const FORBIDDEN_KEYS = Object.freeze(['__proto__', 'constructor', 'prototype']);
@@ -41,6 +41,24 @@ const DEFAULTS = Object.freeze({
     maxMessageChars: 3800,
     rateLimit: Object.freeze({ max: 10, windowMs: 60000 }),
   }),
+  // Local voice transcription. Paths are state-root-relative here and are
+  // absolute-resolved at use time by the transcriber; config never does
+  // PATH lookup and never downloads anything.
+  transcription: Object.freeze({
+    enabled: true,
+    whisperCliPath: '.local/tools/whisper/whisper-cli.exe',
+    // Explicit small model: a ggml-medium.bin sits next to it and must
+    // never be picked up implicitly.
+    modelPath: '.local/tools/whisper/models/ggml-small.bin',
+    ffmpegPath: '.local/tools/ffmpeg/ffmpeg.exe',
+    language: 'es',
+    threads: 8,
+    prompt: 'retry, backoff, tests, test suite, commit, merge, branch, deploy, npm, node, git, refactor, endpoint',
+    maxAudioBytes: 20 * 1024 * 1024,
+    maxDurationSec: 300,
+    processTimeoutMs: 120000,
+    maxStderrBytes: 65536,
+  }),
 });
 
 // Hard bounds per numeric field path; [min, max] inclusive.
@@ -52,6 +70,11 @@ const NUMERIC_BOUNDS = Object.freeze({
   'bridge.maxMessageChars': [1, 3800],
   'bridge.rateLimit.max': [1, 1000],
   'bridge.rateLimit.windowMs': [1, 3600000],
+  'transcription.threads': [1, 128],
+  'transcription.maxAudioBytes': [1, 104857600],
+  'transcription.maxDurationSec': [1, 86400],
+  'transcription.processTimeoutMs': [1, 86400000],
+  'transcription.maxStderrBytes': [1, 1048576],
 });
 
 const ENV_TO_PATH = Object.freeze({
@@ -62,7 +85,26 @@ const ENV_TO_PATH = Object.freeze({
   BRIDGE_RATE_LIMIT_WINDOW_MS: ['bridge', 'rateLimit', 'windowMs'],
   PI_CLI_PATH: ['pi', 'cliPath'],
   PI_WORKSPACE: ['pi', 'workspace'],
+  TRANSCRIPTION_ENABLED: ['transcription', 'enabled'],
+  TRANSCRIPTION_WHISPER_CLI_PATH: ['transcription', 'whisperCliPath'],
+  TRANSCRIPTION_MODEL_PATH: ['transcription', 'modelPath'],
+  TRANSCRIPTION_FFMPEG_PATH: ['transcription', 'ffmpegPath'],
+  TRANSCRIPTION_LANGUAGE: ['transcription', 'language'],
+  TRANSCRIPTION_THREADS: ['transcription', 'threads'],
+  TRANSCRIPTION_PROMPT: ['transcription', 'prompt'],
+  TRANSCRIPTION_MAX_AUDIO_BYTES: ['transcription', 'maxAudioBytes'],
+  TRANSCRIPTION_MAX_DURATION_SEC: ['transcription', 'maxDurationSec'],
+  TRANSCRIPTION_PROCESS_TIMEOUT_MS: ['transcription', 'processTimeoutMs'],
+  TRANSCRIPTION_MAX_STDERR_BYTES: ['transcription', 'maxStderrBytes'],
 });
+
+// Env leaves carried as strings (paths and text fields).
+const STRING_ENV_LEAVES = Object.freeze(new Set([
+  'dbPath', 'cliPath', 'workspace',
+  'whisperCliPath', 'modelPath', 'ffmpegPath', 'language', 'prompt',
+]));
+// Env leaves carried as strict "true"/"false" booleans.
+const BOOLEAN_ENV_LEAVES = Object.freeze(new Set(['enabled']));
 
 // Credentials: present-but-empty env means a deliberate choice and fails
 // closed instead of silently falling back to the file.
@@ -188,6 +230,7 @@ function defaultConfig() {
     pi: { ...DEFAULTS.pi },
     store: { ...DEFAULTS.store },
     bridge: { ...DEFAULTS.bridge, rateLimit: { ...DEFAULTS.bridge.rateLimit } },
+    transcription: { ...DEFAULTS.transcription },
   };
 }
 
@@ -243,11 +286,16 @@ export function loadConfig({ env = process.env, file } = {}) {
     const raw = env[name];
     if (raw === undefined || raw === '') continue;
     const leaf = path[path.length - 1];
-    if (leaf === 'dbPath' || leaf === 'cliPath' || leaf === 'workspace') {
+    if (STRING_ENV_LEAVES.has(leaf)) {
       if (typeof raw !== 'string' || raw.length === 0) {
         throw new ConfigError(`${name} must be a non-empty string`);
       }
       setAtPath(config, path, raw);
+    } else if (BOOLEAN_ENV_LEAVES.has(leaf)) {
+      if (raw !== 'true' && raw !== 'false') {
+        throw new ConfigError(`${name} must be "true" or "false"`);
+      }
+      setAtPath(config, path, raw === 'true');
     } else {
       const value = Number(raw);
       assertBounds(value, path.join('.'));
@@ -267,9 +315,19 @@ export function loadConfig({ env = process.env, file } = {}) {
     assertBounds(node[parts[parts.length - 1]], field);
   }
 
-  for (const pathValue of [config.pi.cliPath, config.pi.workspace]) {
+  const transcriptionPathValues = [
+    config.transcription.whisperCliPath,
+    config.transcription.modelPath,
+    config.transcription.ffmpegPath,
+  ];
+  for (const pathValue of [...transcriptionPathValues, config.pi.cliPath, config.pi.workspace]) {
     if (pathValue !== '' && (typeof pathValue !== 'string' || pathValue.includes('\0'))) {
-      throw new ConfigError('pi path options must be non-empty plain strings');
+      throw new ConfigError('path options must be non-empty plain strings');
+    }
+  }
+  for (const textValue of [config.transcription.language, config.transcription.prompt]) {
+    if (typeof textValue !== 'string' || textValue.length === 0 || textValue.includes('\0')) {
+      throw new ConfigError('transcription text options must be non-empty plain strings');
     }
   }
   if (typeof config.store.dbPath !== 'string' || config.store.dbPath.length === 0

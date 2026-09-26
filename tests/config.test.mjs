@@ -241,3 +241,171 @@ describe('config: deep freeze (B3)', () => {
     assert.throws(() => { cfg.bridge.rateLimit.max = 1; });
   });
 });
+
+// ---------------------------------------------------------------------------
+// T1 transcription config contract tests.
+// The transcription section follows the file's own precedence:
+// defaults < local JSON file < environment. Paths are stored relative to
+// the module state root and are absolute-resolved at use time by the
+// transcriber, never by config. No real tool paths: every fixture below
+// is an obviously fake relative shape.
+
+const TECH_PROMPT = 'retry, backoff, tests, test suite, commit, merge, branch, deploy, npm, node, git, refactor, endpoint';
+
+describe('transcription config: defaults', () => {
+  test('every field has a state-root-relative default', () => {
+    const cfg = loadConfig({ env: envWith() });
+    assert.equal(cfg.transcription.enabled, true);
+    assert.equal(cfg.transcription.whisperCliPath, '.local/tools/whisper/whisper-cli.exe');
+    // The explicit small model: the medium file sits next to it and must
+    // never be picked up implicitly.
+    assert.equal(cfg.transcription.modelPath, '.local/tools/whisper/models/ggml-small.bin');
+    assert.match(cfg.transcription.modelPath, /ggml-small\.bin$/);
+    assert.doesNotMatch(cfg.transcription.modelPath, /medium/);
+    assert.equal(cfg.transcription.ffmpegPath, '.local/tools/ffmpeg/ffmpeg.exe');
+    assert.equal(cfg.transcription.language, 'es');
+    assert.equal(cfg.transcription.threads, 8);
+    assert.equal(cfg.transcription.prompt, TECH_PROMPT);
+    assert.equal(cfg.transcription.maxAudioBytes, 20 * 1024 * 1024);
+    assert.equal(cfg.transcription.maxDurationSec, 300);
+    assert.equal(cfg.transcription.processTimeoutMs, 120000);
+    assert.equal(cfg.transcription.maxStderrBytes, 65536);
+  });
+
+  test('the transcription section is deeply frozen', () => {
+    const cfg = loadConfig({ env: envWith() });
+    assert.equal(Object.isFrozen(cfg.transcription), true);
+    assert.throws(() => { cfg.transcription.enabled = false; });
+    assert.throws(() => { cfg.transcription.threads = 1; });
+  });
+});
+
+describe('transcription config: file overrides', () => {
+  test('every field is overridable from the config file', () => {
+    const file = writeConfigFile('transcription-file', {
+      transcription: {
+        enabled: false,
+        whisperCliPath: '.local/tools/whisper/custom-cli.exe',
+        modelPath: '.local/tools/whisper/models/ggml-medium.bin',
+        ffmpegPath: '.local/tools/ffmpeg/custom-ffmpeg.exe',
+        language: 'en',
+        threads: 4,
+        prompt: 'custom vocabulary',
+        maxAudioBytes: 1024,
+        maxDurationSec: 60,
+        processTimeoutMs: 30000,
+        maxStderrBytes: 1024,
+      },
+    });
+    const cfg = loadConfig({ env: envWith(), file });
+    assert.equal(cfg.transcription.enabled, false);
+    assert.equal(cfg.transcription.whisperCliPath, '.local/tools/whisper/custom-cli.exe');
+    assert.equal(cfg.transcription.modelPath, '.local/tools/whisper/models/ggml-medium.bin');
+    assert.equal(cfg.transcription.ffmpegPath, '.local/tools/ffmpeg/custom-ffmpeg.exe');
+    assert.equal(cfg.transcription.language, 'en');
+    assert.equal(cfg.transcription.threads, 4);
+    assert.equal(cfg.transcription.prompt, 'custom vocabulary');
+    assert.equal(cfg.transcription.maxAudioBytes, 1024);
+    assert.equal(cfg.transcription.maxDurationSec, 60);
+    assert.equal(cfg.transcription.processTimeoutMs, 30000);
+    assert.equal(cfg.transcription.maxStderrBytes, 1024);
+  });
+
+  test('file fields absent from the section keep their defaults', () => {
+    const file = writeConfigFile('transcription-partial', {
+      transcription: { language: 'en' },
+    });
+    const cfg = loadConfig({ env: envWith(), file });
+    assert.equal(cfg.transcription.language, 'en');
+    assert.equal(cfg.transcription.threads, 8);
+    assert.equal(cfg.transcription.enabled, true);
+  });
+
+  test('enabled: false round-trips through the file', () => {
+    const file = writeConfigFile('transcription-disabled', { transcription: { enabled: false } });
+    const cfg = loadConfig({ env: envWith(), file });
+    assert.equal(cfg.transcription.enabled, false);
+  });
+
+  test('wrong types and empty strings fail closed', () => {
+    const badType = writeConfigFile('transcription-bad-type', { transcription: { threads: 'eight' } });
+    assert.throws(() => loadConfig({ env: envWith(), file: badType }), ConfigError);
+    const badBool = writeConfigFile('transcription-bad-bool', { transcription: { enabled: 'no' } });
+    assert.throws(() => loadConfig({ env: envWith(), file: badBool }), ConfigError);
+    const empty = writeConfigFile('transcription-empty', { transcription: { prompt: '' } });
+    assert.throws(() => loadConfig({ env: envWith(), file: empty }), ConfigError);
+    const unknown = writeConfigFile('transcription-unknown', { transcription: { nope: 1 } });
+    assert.throws(() => loadConfig({ env: envWith(), file: unknown }), ConfigError);
+  });
+});
+
+describe('transcription config: env overrides', () => {
+  test('every field is overridable via environment', () => {
+    const cfg = loadConfig({
+      env: envWith({
+        TRANSCRIPTION_ENABLED: 'false',
+        TRANSCRIPTION_WHISPER_CLI_PATH: '.local/tools/whisper/env-cli.exe',
+        TRANSCRIPTION_MODEL_PATH: '.local/tools/whisper/models/env-model.bin',
+        TRANSCRIPTION_FFMPEG_PATH: '.local/tools/ffmpeg/env-ffmpeg.exe',
+        TRANSCRIPTION_LANGUAGE: 'en',
+        TRANSCRIPTION_THREADS: '2',
+        TRANSCRIPTION_PROMPT: 'env vocabulary',
+        TRANSCRIPTION_MAX_AUDIO_BYTES: '2048',
+        TRANSCRIPTION_MAX_DURATION_SEC: '120',
+        TRANSCRIPTION_PROCESS_TIMEOUT_MS: '45000',
+        TRANSCRIPTION_MAX_STDERR_BYTES: '4096',
+      }),
+    });
+    assert.equal(cfg.transcription.enabled, false);
+    assert.equal(cfg.transcription.whisperCliPath, '.local/tools/whisper/env-cli.exe');
+    assert.equal(cfg.transcription.modelPath, '.local/tools/whisper/models/env-model.bin');
+    assert.equal(cfg.transcription.ffmpegPath, '.local/tools/ffmpeg/env-ffmpeg.exe');
+    assert.equal(cfg.transcription.language, 'en');
+    assert.equal(cfg.transcription.threads, 2);
+    assert.equal(cfg.transcription.prompt, 'env vocabulary');
+    assert.equal(cfg.transcription.maxAudioBytes, 2048);
+    assert.equal(cfg.transcription.maxDurationSec, 120);
+    assert.equal(cfg.transcription.processTimeoutMs, 45000);
+    assert.equal(cfg.transcription.maxStderrBytes, 4096);
+  });
+
+  test('environment overrides the config file (env "true" re-enables)', () => {
+    const file = writeConfigFile('transcription-env-precedence', { transcription: { enabled: false } });
+    const cfg = loadConfig({ env: envWith({ TRANSCRIPTION_ENABLED: 'true' }), file });
+    assert.equal(cfg.transcription.enabled, true);
+  });
+
+  test('absent env keeps the file value', () => {
+    const file = writeConfigFile('transcription-absent-env', { transcription: { threads: 3 } });
+    const cfg = loadConfig({ env: envWith(), file });
+    assert.equal(cfg.transcription.threads, 3);
+  });
+
+  test('enabled accepts only "true" or "false"', () => {
+    assert.throws(
+      () => loadConfig({ env: envWith({ TRANSCRIPTION_ENABLED: 'yes' }) }),
+      ConfigError,
+    );
+    assert.throws(
+      () => loadConfig({ env: envWith({ TRANSCRIPTION_ENABLED: '1' }) }),
+      ConfigError,
+    );
+  });
+
+  test('numeric fields enforce the shared hard bounds', () => {
+    const cases = [
+      ['TRANSCRIPTION_THREADS', '0'],
+      ['TRANSCRIPTION_MAX_AUDIO_BYTES', '0'],
+      ['TRANSCRIPTION_MAX_DURATION_SEC', '0'],
+      ['TRANSCRIPTION_PROCESS_TIMEOUT_MS', '0'],
+      ['TRANSCRIPTION_MAX_STDERR_BYTES', '0'],
+    ];
+    for (const [name, value] of cases) {
+      assert.throws(
+        () => loadConfig({ env: envWith({ [name]: value }) }),
+        ConfigError,
+        `${name}=${value} should be rejected`,
+      );
+    }
+  });
+});
