@@ -16,6 +16,9 @@
 //   retried with exponential backoff + jitter; 429 honors retry_after.
 //   401/403/409 and other definitive failures are NEVER retried.
 
+import { readFile } from 'node:fs/promises';
+import { basename } from 'node:path';
+
 export const TELEGRAM_API_ORIGIN = 'https://api.telegram.org';
 export const TELEGRAM_ALLOWED_UPDATES = Object.freeze(['message', 'callback_query']);
 
@@ -156,16 +159,21 @@ export class TelegramApi {
     try {
       let response;
       try {
-        response = await this.#fetchImpl(this.#url(method), {
+        // Multipart bodies (FormData) must carry their own content-type
+        // with the fetch-chosen boundary: setting a JSON header here would
+        // corrupt the upload. The JSON text path below is unchanged.
+        const isForm = payload instanceof FormData;
+        const init = {
           method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify(payload),
+          body: isForm ? payload : JSON.stringify(payload),
           signal: controller.signal,
           // The URL carries the bot token and api.telegram.org never
           // legitimately redirects: refuse to follow a 3xx from an
           // intermediary instead of replaying the request to it.
           redirect: 'error',
-        });
+        };
+        if (!isForm) init.headers = { 'content-type': 'application/json' };
+        response = await this.#fetchImpl(this.#url(method), init);
       } catch (error) {
         if (signal?.aborted || this.#closed) throw new TelegramApiError({ code: 'aborted' });
         if (timedOut) throw new TelegramApiError({ code: 'timeout' });
@@ -288,6 +296,41 @@ export class TelegramApi {
       payload.reply_markup = replyMarkup;
     }
     return this.#request('sendMessage', payload, { signal });
+  }
+
+  /**
+   * Multipart body for one photo, shared by sendPhoto and the offline
+   * --dry-run builder in scripts/send-photo.mjs so the dry-run bytes are
+   * EXACTLY the bytes a real send would produce.
+   */
+  static buildPhotoForm({ chatId, bytes, filename, caption = null }) {
+    const form = new FormData();
+    form.append('chat_id', String(chatId));
+    if (caption !== null && caption !== undefined) {
+      // Plain text only: this project never sets parse_mode, so Telegram
+      // renders the caption exactly as sent. No parse_mode field is ever
+      // appended here.
+      form.append('caption', caption);
+    }
+    form.append('photo', new Blob([bytes]), filename);
+    return form;
+  }
+
+  /**
+   * One outbound photo as multipart/form-data: Telegram only accepts raw
+   * bytes for a local file upload, so the JSON body path never applies
+   * here. It reuses the exact same attempt discipline as every other
+   * method: per-attempt timeout, abort awareness, redirect refusal,
+   * bounded response read and the fixed credential-free codes.
+   *
+   * Validate the file with src/media-policy.mjs first; a failed local
+   * read propagates as a plain fs error and is the caller's to map.
+   * The caption, when given, is plain text: parse_mode is never set.
+   */
+  async sendPhoto({ chatId, filePath, caption = null, signal } = {}) {
+    const bytes = await readFile(filePath);
+    const form = TelegramApi.buildPhotoForm({ chatId, bytes, filename: basename(filePath), caption });
+    return this.#request('sendPhoto', form, { signal });
   }
 
   /** Callback feedback; Telegram caps the text at 200 characters. */
