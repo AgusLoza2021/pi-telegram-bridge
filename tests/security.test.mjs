@@ -228,3 +228,37 @@ describe('rate limiter', () => {
     assert.equal(limiter.take('a', t0 + 60000).allowed, true);
   });
 });
+
+describe('rate limiter peek (non-consuming)', () => {
+  test('peek reports a token available while tokens are left', () => {
+    const limiter = createRateLimiter({ max: 2, windowMs: 60000 });
+    const t0 = 1_000_000;
+    limiter.take('u1', t0); // one of two tokens spent
+    assert.equal(limiter.peek('u1', t0 + 1).allowed, true);
+  });
+
+  test('peek reports no token when the window is exhausted', () => {
+    const limiter = createRateLimiter({ max: 1, windowMs: 60000 });
+    const t0 = 1_000_000;
+    limiter.take('u1', t0);
+    const peek = limiter.peek('u1', t0 + 1);
+    assert.equal(peek.allowed, false);
+    assert.ok(peek.retryAfterMs > 0);
+  });
+
+  test('peek consumes nothing: take right after still succeeds when tokens were available', () => {
+    const limiter = createRateLimiter({ max: 1, windowMs: 60000 });
+    const t0 = 1_000_000;
+    assert.equal(limiter.peek('u1', t0).allowed, true);
+    assert.equal(limiter.peek('u1', t0).allowed, true, 'repeated peeks must not consume');
+    assert.equal(limiter.take('u1', t0).allowed, true, 'the token the peek saw must still be there');
+  });
+
+  test('peek consumes nothing: take right after still fails when exhausted', () => {
+    const limiter = createRateLimiter({ max: 1, windowMs: 60000 });
+    const t0 = 1_000_000;
+    limiter.take('u1', t0);
+    assert.equal(limiter.peek('u1', t0 + 1).allowed, false);
+    assert.equal(limiter.take('u1', t0 + 2).allowed, false, 'peek must not free the window');
+  });
+});

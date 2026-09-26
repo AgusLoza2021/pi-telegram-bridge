@@ -2311,3 +2311,367 @@ describe('SelectiveTelegramBroker: one honest outbound throttle record per episo
     } finally { fx.close(); }
   });
 });
+
+// T4 voice transcription: pre-resolution contract. Transcription resolves
+// in pollOnce BEFORE handleUpdate opens its transaction, so the receipt/
+// offset atomicity and the synchronous #planMessage stay untouched. No
+// network, no real binaries: the transcriber, getFile and downloadFile are
+// injected fakes, exactly like the rest of the broker's seams.
+
+/** The one fixed failure reply (no codes, no paths, no transcript echo). */
+const AUDIO_FAILURE_REPLY = "I couldn't transcribe that audio. Type it as a message instead.";
+
+/**
+ * Fake API extended with the file-download seam: getFile hands out a
+ * file_path per fileId, downloadFile hands out fixed bytes. Both count
+ * their calls so tests can assert ZERO downloads where required.
+ */
+function makeAudioApi() {
+  const api = makeFakeApi();
+  const calls = { getFile: 0, downloadFile: 0 };
+  api.getFile = async ({ fileId } = {}) => {
+    calls.getFile++;
+    return { file_path: `voice/${fileId}.oga` };
+  };
+  api.downloadFile = async ({ filePath } = {}) => {
+    calls.downloadFile++;
+    return Buffer.from('ogg-opus-bytes');
+  };
+  api.calls = calls;
+  return api;
+}
+
+/** One authorized-by-default voice/audio message update. */
+function voice({ userId = 101, chatId = 202, kind = 'voice' } = {}) {
+  updateIdSeq++;
+  return {
+    update_id: updateIdSeq,
+    message: {
+      message_id: updateIdSeq,
+      from: { id: userId, is_bot: false },
+      chat: { id: chatId },
+      date: 0,
+      [kind]: { file_id: `audiofile${updateIdSeq}`, duration: 3 },
+    },
+  };
+}
+
+/** Injectable fake transcriber: returns { text } or throws. */
+function fakeTranscriber(text = 'transcribed words') {
+  const calls = [];
+  return {
+    calls,
+    async transcribe({ bytes } = {}) {
+      calls.push(bytes);
+      if (text instanceof Error) throw text;
+      return { text };
+    },
+  };
+}
+
+describe('SelectiveTelegramBroker: voice transcription resolves before the transaction (T4)', () => {
+  let t;
+  let store;
+  let clientA;
+  let dir;
+
+  before(() => {
+    dir = mkdtempSync(join(TEST_RUNS, 'sel-audio-'));
+    t = Date.now();
+    store = new Store(join(dir, 'bridge.sqlite'), { now: () => t, isProcessAlive: () => true });
+    // Exactly ONE live session: the transcript enters the free-text path,
+    // which auto-dispatches to the sole live session (T02 semantics).
+    clientA = new TuiBridgeClient(store, { staleAfterMs: 30_000 });
+    assert.equal(clientA.connect({ ...A, shortId: 'aaa111', label: 'alpha', pid: 1111, cwd: 'C:/proj/alpha' }).ok, true);
+  });
+
+  after(() => {
+    store.close();
+  });
+
+  /** Drop transport leftovers so every test starts from a quiet store. */
+  function clearTransport() {
+    const pending = store.listPendingBrokerTuiEvents({ limit: 256 });
+    if (pending.length > 0) {
+      store.acknowledgeTuiEvents({ eventIds: pending.map((e) => e.eventId) });
+    }
+    while (store.claimNextTuiCommand({ trackingId: A.trackingId, connectionId: A.connectionId }).ok) {}
+  }
+
+  function newAudioBroker(api, {
+    transcriber = null,
+    config = BROKER_CONFIG,
+    logs = [],
+  } = {}) {
+    const options = { store, api, config, now: () => t, logger: (event) => logs.push(event) };
+    if (transcriber !== null) options.transcriber = transcriber;
+    return new SelectiveTelegramBroker(options);
+  }
+
+  test('an authorized voice note is transcribed and routed as plain text; offset advanced, inbox recorded', async () => {
+    clearTransport();
+    const api = makeAudioApi();
+    const transcriber = fakeTranscriber('run the whole test suite');
+    const broker = newAudioBroker(api, { transcriber });
+    const update = voice();
+    api.queueUpdate(update);
+    await broker.pollOnce();
+    await broker.flushReplies();
+    assert.equal(api.calls.getFile, 1, 'exactly one getFile');
+    assert.equal(api.calls.downloadFile, 1, 'exactly one download');
+    assert.deepEqual(
+      transcriber.calls,
+      [Buffer.from('ogg-opus-bytes')],
+      'the downloaded bytes reach the transcriber',
+    );
+    assert.equal(store.getBrokerTransportOffset(), update.update_id + 1, 'the offset advances');
+    const commands = clientA.poll(A).commands;
+    assert.equal(commands.length, 1);
+    assert.equal(commands[0].kind, 'prompt');
+    assert.equal(commands[0].payload.text, 'run the whole test suite',
+      'the transcript becomes the prompt through the free-text path');
+    assert.match(api.sent[0].text, /Pi · alpha — Prompt queued\./);
+    // Inbox recorded: a re-delivery of the same update must plan nothing.
+    broker.handleUpdate(update);
+    await broker.flushReplies();
+    assert.equal(api.sent.length, 1, 'the inbox dedup keeps the outcome one-time');
+  });
+
+  test('a forwarded audio (message.audio) takes the same path', async () => {
+    clearTransport();
+    const api = makeAudioApi();
+    const transcriber = fakeTranscriber('dig the hole deeper');
+    const broker = newAudioBroker(api, { transcriber });
+    const update = voice({ kind: 'audio' });
+    api.queueUpdate(update);
+    await broker.pollOnce();
+    await broker.flushReplies();
+    assert.equal(store.getBrokerTransportOffset(), update.update_id + 1);
+    const commands = clientA.poll(A).commands;
+    assert.equal(commands.length, 1);
+    assert.equal(commands[0].kind, 'prompt');
+    assert.equal(commands[0].payload.text, 'dig the hole deeper');
+  });
+
+  const failureFlavours = [
+    ['a throwing transcriber', () => ({ transcriber: fakeTranscriber(new Error('boom C:/secrets/path stderr noise')) })],
+    ['a throwing download', (api) => {
+      api.downloadFile = async () => { throw new Error('boom download noise'); };
+      return { transcriber: fakeTranscriber('never reached') };
+    }],
+    ['an empty transcript (silence is failure)', () => ({ transcriber: fakeTranscriber('') })],
+  ];
+
+  for (const [flavour, makeFailing] of failureFlavours) {
+    test(`failure flavour — ${flavour}: offset still advanced, inbox recorded, one fixed reply, nothing leaked`, async () => {
+      clearTransport();
+      const api = makeAudioApi();
+      const { transcriber } = makeFailing(api);
+      const logs = [];
+      const broker = newAudioBroker(api, { transcriber, logs });
+      const update = voice();
+      api.queueUpdate(update);
+      await broker.pollOnce();
+      await broker.flushReplies();
+      assert.equal(store.getBrokerTransportOffset(), update.update_id + 1,
+        'a failed transcription must never wedge the offset');
+      assert.equal(api.sent.length, 1, 'exactly one reply');
+      assert.equal(api.sent[0].text, AUDIO_FAILURE_REPLY, 'the reply is the one fixed string');
+      assert.equal(clientA.poll(A).commands.length, 0,
+        'a failed audio enqueues nothing');
+      const transcriptCode = logs.filter((e) => e.code === 'audio_transcription_failed');
+      assert.equal(transcriptCode.length, 1, 'exactly one fixed-token log record');
+      const leaks = JSON.stringify(logs) + api.sent.map((s) => s.text).join('\n');
+      assert.equal(leaks.includes('boom'), false, 'no error text anywhere');
+      assert.equal(leaks.includes('C:/secrets'), false, 'no path anywhere');
+      assert.equal(leaks.includes('stderr'), false, 'no stderr anywhere');
+      assert.equal(leaks.includes('never reached'), false, 'no transcript anywhere');
+      // Inbox recorded: a re-delivery must not re-plan or re-reply.
+      broker.handleUpdate(update);
+      await broker.flushReplies();
+      assert.equal(api.sent.length, 1);
+    });
+  }
+
+  test('an unauthorized sender cannot make the machine transcribe: zero downloads, zero CPU, no reply', async () => {
+    clearTransport();
+    const api = makeAudioApi();
+    const transcriber = fakeTranscriber('never');
+    const logs = [];
+    const broker = newAudioBroker(api, { transcriber, logs });
+    const wrongUser = voice({ userId: 999 });
+    const wrongChat = voice({ chatId: 999 });
+    api.queueUpdate(wrongUser);
+    api.queueUpdate(wrongChat);
+    await broker.pollOnce();
+    await broker.flushReplies();
+    assert.equal(api.calls.getFile, 0, 'no download for an unauthorized voice note');
+    assert.equal(api.calls.downloadFile, 0);
+    assert.equal(transcriber.calls.length, 0, 'no transcription for an unauthorized voice note');
+    assert.equal(api.sent.length, 0, 'no reply');
+    assert.equal(store.getBrokerTransportOffset(), wrongChat.update_id + 1,
+      'both unauthorized updates are consumed with receipt + offset only');
+  });
+
+  test('a rate-limited owner is never downloaded or transcribed and gets the same outcome as rate-limited text', async () => {
+    clearTransport();
+    const api = makeAudioApi();
+    const transcriber = fakeTranscriber('never');
+    const logs = [];
+    const config = {
+      telegram: { allowedUserId: 101, allowedChatId: 202 },
+      bridge: { maxMessageChars: 3800, rateLimit: { max: 1, windowMs: 60_000 } },
+    };
+    const broker = newAudioBroker(api, { transcriber, config, logs });
+    // The single inbound token goes to a plain text message first.
+    updateIdSeq++;
+    const textUpdate = {
+      update_id: updateIdSeq,
+      message: {
+        message_id: updateIdSeq,
+        from: { id: 101, is_bot: false },
+        chat: { id: 202 },
+        date: 0,
+        text: '/help',
+      },
+    };
+    api.queueUpdate(textUpdate);
+    await broker.pollOnce();
+    await broker.flushReplies();
+    assert.equal(api.sent.length, 1);
+    // The voice note now peeks an exhausted limiter: no download, no CPU.
+    const update = voice();
+    api.queueUpdate(update);
+    await broker.pollOnce();
+    await broker.flushReplies();
+    assert.equal(api.calls.getFile, 0, 'no download when the inbound limiter is exhausted');
+    assert.equal(api.calls.downloadFile, 0);
+    assert.equal(transcriber.calls.length, 0);
+    assert.equal(api.sent.length, 1, 'no extra reply beyond the text one');
+    assert.equal(store.getBrokerTransportOffset(), update.update_id + 1, 'the offset still advances');
+    assert.ok(logs.some((e) => e.code === 'rate_limited_inbound'),
+      'the same rate-limit record rate-limited text produces');
+  });
+
+  test('the audio peek does not consume: with one token left the message still takes it and is processed', async () => {
+    clearTransport();
+    const api = makeAudioApi();
+    const transcriber = fakeTranscriber('process me');
+    const config = {
+      telegram: { allowedUserId: 101, allowedChatId: 202 },
+      bridge: { maxMessageChars: 3800, rateLimit: { max: 1, windowMs: 60_000 } },
+    };
+    const broker = newAudioBroker(api, { transcriber, config });
+    const update = voice();
+    api.queueUpdate(update);
+    await broker.pollOnce();
+    await broker.flushReplies();
+    assert.equal(api.calls.getFile, 1, 'the peek saw the one available token');
+    const commands = clientA.poll(A).commands;
+    assert.equal(commands.length, 1, 'the take after the peek consumed that same token');
+    assert.equal(commands[0].payload.text, 'process me');
+    assert.match(api.sent[0].text, /Prompt queued\./);
+  });
+
+  test('transcription disabled: a voice note behaves exactly as today (silent drop, no download, no reply)', async () => {
+    clearTransport();
+    const api = makeAudioApi();
+    // No injected transcriber and no transcription section: the feature is inert.
+    const logs = [];
+    const broker = newAudioBroker(api, { logs });
+    const update = voice();
+    api.queueUpdate(update);
+    await broker.pollOnce();
+    await broker.flushReplies();
+    assert.equal(api.calls.getFile, 0, 'no download when transcription is disabled');
+    assert.equal(api.calls.downloadFile, 0);
+    assert.equal(api.sent.length, 0, 'today\'s silent drop');
+    assert.equal(clientA.poll(A).commands.length, 0);
+    assert.equal(store.getBrokerTransportOffset(), update.update_id + 1, 'consumed like any non-text update');
+  });
+
+  test('an enabled transcription config constructs the real transcriber and routes through it', async () => {
+    clearTransport();
+    const api = makeAudioApi();
+    const logs = [];
+    const config = {
+      telegram: { allowedUserId: 101, allowedChatId: 202 },
+      bridge: { maxMessageChars: 3800, rateLimit: { max: 1000, windowMs: 60_000 } },
+      transcription: {
+        enabled: true,
+        whisperCliPath: 'missing-whisper-cli.exe',
+        modelPath: 'missing-model.bin',
+        ffmpegPath: 'missing-ffmpeg.exe',
+        language: 'es',
+        threads: 1,
+        prompt: 'test vocabulary',
+        maxAudioBytes: 1024,
+        maxDurationSec: 60,
+        processTimeoutMs: 1000,
+        maxStderrBytes: 1024,
+      },
+    };
+    const broker = newAudioBroker(api, { config, logs });
+    const update = voice();
+    api.queueUpdate(update);
+    await broker.pollOnce();
+    await broker.flushReplies();
+    assert.equal(api.calls.getFile, 1, 'the real transcriber was constructed and used');
+    assert.equal(api.sent.length, 1);
+    assert.equal(api.sent[0].text, AUDIO_FAILURE_REPLY,
+      'missing tools fail closed to the fixed failure reply');
+    assert.equal(logs.filter((e) => e.code === 'audio_transcription_failed').length, 1);
+    assert.equal(store.getBrokerTransportOffset(), update.update_id + 1);
+  });
+
+  test('an audio update reaching the plan without a resolved outcome fails closed to the fixed failure reply', async () => {
+    clearTransport();
+    const api = makeAudioApi();
+    const transcriber = fakeTranscriber('unused');
+    const broker = newAudioBroker(api, { transcriber });
+    broker.handleUpdate(voice());
+    await broker.flushReplies();
+    assert.equal(api.calls.getFile, 0, 'the plan itself never downloads; pre-resolution does');
+    assert.equal(api.sent.length, 1);
+    assert.equal(api.sent[0].text, AUDIO_FAILURE_REPLY);
+  });
+
+  test('video notes and documents stay silently dropped even when transcription is enabled', async () => {
+    clearTransport();
+    const api = makeAudioApi();
+    const transcriber = fakeTranscriber('never');
+    const broker = newAudioBroker(api, { transcriber });
+    updateIdSeq++;
+    const videoNoteUpdate = {
+      update_id: updateIdSeq,
+      message: {
+        message_id: updateIdSeq,
+        from: { id: 101, is_bot: false },
+        chat: { id: 202 },
+        date: 0,
+        video_note: { file_id: 'videonote1', duration: 3 },
+      },
+    };
+    updateIdSeq++;
+    const documentUpdate = {
+      update_id: updateIdSeq,
+      message: {
+        message_id: updateIdSeq,
+        from: { id: 101, is_bot: false },
+        chat: { id: 202 },
+        date: 0,
+        document: { file_id: 'document1' },
+      },
+    };
+    api.queueUpdate(videoNoteUpdate);
+    api.queueUpdate(documentUpdate);
+    await broker.pollOnce();
+    await broker.flushReplies();
+    assert.equal(api.calls.getFile, 0, 'only voice and audio are accepted');
+    assert.equal(transcriber.calls.length, 0);
+    assert.equal(api.sent.length, 0);
+    assert.equal(clientA.poll(A).commands.length, 0);
+    assert.equal(store.getBrokerTransportOffset(), documentUpdate.update_id + 1);
+  });
+});
+

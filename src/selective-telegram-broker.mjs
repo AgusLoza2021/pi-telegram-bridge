@@ -62,6 +62,7 @@ import { randomBytes } from 'node:crypto';
 
 import { TelegramApiError } from './telegram-api.mjs';
 import { authorize, chunkMessage, createRateLimiter } from './security.mjs';
+import { createTranscriber } from './audio-transcription.mjs';
 import * as copy from './beginner-copy.mjs';
 
 const MAX_TEXT_CHARS = 4000;
@@ -183,6 +184,11 @@ const NO_SELECTION_NOTICE =
 
 const SLASH_LINE_NOTICE = 'Refused: lines starting with "/" are not allowed in the text.';
 
+// Fixed, content-free audio failure reply: no error codes, no paths, no
+// stderr and no transcript echo — a transcription failure must never leak
+// what went wrong (T4). One short sentence, same tone as the other replies.
+const AUDIO_FAILURE_NOTICE = "I couldn't transcribe that audio. Type it as a message instead.";
+
 const MISSING_TARGET_NOTICE = (shortId) =>
   `No live session with short id "${shortId}". Send /sessions to list live TUIs.`;
 
@@ -225,6 +231,12 @@ export class SelectiveTelegramBroker {
    *   broker process is the single owner of its memory-only selection)
    * @param {() => number} [options.now]
    * @param {({code: string}) => void} [options.logger] fixed-code logging
+   * @param {{transcribe: (input: {bytes: Uint8Array}) => Promise<{text: string}>}}
+   *   [options.transcriber] injected transcription seam (T4). When absent
+   *   AND config.transcription?.enabled is true, the real local
+   *   transcriber is constructed from the config; when transcription is
+   *   disabled no transcriber exists and voice updates behave exactly as
+   *   before (silently dropped by the text-only plan).
    */
   constructor({
     store,
@@ -233,6 +245,7 @@ export class SelectiveTelegramBroker {
     ownerId = 'telegram-broker',
     now = Date.now,
     logger = () => {},
+    transcriber = undefined,
   }) {
     if (!store || typeof store.withTransaction !== 'function') {
       throw new TypeError('store is required');
@@ -264,6 +277,13 @@ export class SelectiveTelegramBroker {
     this.#now = now;
     this.#logger = typeof logger === 'function' ? logger : () => {};
     this.#limiter = createRateLimiter(config.bridge.rateLimit);
+    if (transcriber !== undefined
+      && (transcriber === null || typeof transcriber.transcribe !== 'function')) {
+      throw new TypeError('transcriber must provide a transcribe() function');
+    }
+    this.#transcriber = transcriber !== undefined
+      ? transcriber
+      : (config.transcription?.enabled === true ? createTranscriber(config.transcription) : null);
   }
 
   #store;
@@ -274,6 +294,8 @@ export class SelectiveTelegramBroker {
   #now;
   #logger;
   #limiter;
+  /** Local transcriber (T4); null whenever transcription is disabled. */
+  #transcriber;
   /**
    * Memory-only outbound throttle state: while non-zero, the current
    * throttle episode already logged its record and retries wait until this
@@ -378,7 +400,11 @@ export class SelectiveTelegramBroker {
     let processed = 0;
     for (const update of updates) {
       try {
-        this.handleUpdate(update);
+        // T4: any voice/audio transcription resolves HERE, before the
+        // transaction opens, so handleUpdate and #planMessage stay fully
+        // synchronous and the receipt/offset atomicity is never split.
+        const resolvedAudio = await this.#resolveAudio(update);
+        this.handleUpdate(update, resolvedAudio);
         processed++;
       } catch {
         // A throwing bug must never wedge the offset or the loop.
@@ -404,8 +430,15 @@ export class SelectiveTelegramBroker {
    * One atomic unit per update: inbox receipt -> planning -> command
    * enqueues -> offset advance. Re-delivered updates hit the inbox dedup
    * and commit nothing else, so duplicates never enqueue commands.
+   * @param {object} update
+   * @param {{state: 'ok', text: string}
+   *   |{state: 'failed'}
+   *   |{state: 'rate_limited'}} [resolvedAudio] the ALREADY SETTLED
+   *   transcription outcome for a voice/audio message, resolved in
+   *   pollOnce before this transaction opened (T4); undefined for every
+   *   other update and whenever transcription is disabled.
    */
-  handleUpdate(update) {
+  handleUpdate(update, resolvedAudio = undefined) {
     const parsed = this.#classifyUpdate(update);
     if (parsed === null) {
       this.#log('update_rejected');
@@ -468,7 +501,7 @@ export class SelectiveTelegramBroker {
         }
       } else if (type === 'message') {
         try {
-          const plan = this.#planMessage(payload);
+          const plan = this.#planMessage(payload, resolvedAudio);
           for (const command of plan.commands) {
             const result = this.#store.enqueueTuiCommand({
               trackingId: command.trackingId,
@@ -504,6 +537,52 @@ export class SelectiveTelegramBroker {
       } else {
         this.#log('reply_overflow');
       }
+    }
+  }
+
+  async #resolveAudio(update) {
+    if (this.#transcriber === null) return undefined;
+    const message = isPlainObject(update) && isPlainObject(update.message) ? update.message : null;
+    if (message === null) return undefined;
+    const media = isPlainObject(message.voice)
+      ? message.voice
+      : isPlainObject(message.audio) ? message.audio : null;
+    if (media === null) return undefined;
+    // 1. Authorize first, spend nothing otherwise: an unauthorized voice
+    //    note must cause ZERO downloads and ZERO transcription.
+    const fromId = isPlainObject(message.from) ? message.from.id : null;
+    const chatId = isPlainObject(message.chat) ? message.chat.id : null;
+    if (!authorize({ userId: fromId, chatId }, this.#config).allowed) {
+      return undefined; // handleUpdate follows today's silent-drop outcome.
+    }
+    // 2. Rate-limit peek: no token, no download, no CPU. The marker makes
+    //    the plan's own failed take produce the same rate-limit reply as
+    //    rate-limited text.
+    if (!this.#limiter.peek('inbound', this.#now()).allowed) {
+      return { state: 'rate_limited' };
+    }
+    // 3. Download + transcribe. Telegram's claimed duration/file_size are
+    //    never trusted: the transcriber measures and caps by itself.
+    const fileId = typeof media.file_id === 'string' ? media.file_id : null;
+    if (fileId === null) {
+      this.#log('audio_transcription_failed');
+      return { state: 'failed' };
+    }
+    try {
+      const file = await this.#api.getFile({ fileId });
+      const bytes = await this.#api.downloadFile({ filePath: file?.file_path });
+      const { text } = await this.#transcriber.transcribe({ bytes });
+      if (typeof text === 'string' && text.trim().length > 0) {
+        return { state: 'ok', text };
+      }
+      // An empty transcript is silence, never an empty prompt.
+      this.#log('audio_transcription_failed');
+      return { state: 'failed' };
+    } catch {
+      // Fixed token only: never the error code, message, path, stderr or
+      // the transcript itself.
+      this.#log('audio_transcription_failed');
+      return { state: 'failed' };
     }
   }
 
@@ -859,7 +938,7 @@ export class SelectiveTelegramBroker {
     };
   }
 
-  #planMessage(message) {
+  #planMessage(message, resolvedAudio = undefined) {
     if (isPlainObject(message.sender_chat)) {
       // Anonymous/channel impersonation: silent, fixed code only.
       this.#log('auth_rejected');
@@ -873,7 +952,11 @@ export class SelectiveTelegramBroker {
       return { replies: [], commands: [] };
     }
     const text = typeof message.text === 'string' ? message.text : null;
-    if (text === null) {
+    // T4: voice/audio are accepted ONLY while transcription is enabled;
+    // disabled, they fall through to today's exact silent drop below.
+    const audio = this.#transcriber !== null
+      && (isPlainObject(message.voice) || isPlainObject(message.audio));
+    if (text === null && !audio) {
       this.#log('ignore');
       return { replies: [], commands: [] };
     }
@@ -882,8 +965,28 @@ export class SelectiveTelegramBroker {
       this.#log('rate_limited_inbound');
       return { replies: [], commands: [] };
     }
-    if (text.startsWith('/')) return this.#planCommand(text);
-    return this.#planFreeText(text);
+    if (text !== null) {
+      if (text.startsWith('/')) return this.#planCommand(text);
+      return this.#planFreeText(text);
+    }
+    // Audio branch (T4): the outcome was resolved before this transaction
+    // opened; the plan stays a pure, synchronous function of it.
+    if (isPlainObject(resolvedAudio)
+      && resolvedAudio.state === 'ok'
+      && typeof resolvedAudio.text === 'string'
+      && resolvedAudio.text.trim().length > 0) {
+      // One channel, one code path: the transcript enters the EXISTING
+      // free-text path exactly as if the owner had typed it.
+      return this.#planFreeText(resolvedAudio.text);
+    }
+    if (isPlainObject(resolvedAudio) && resolvedAudio.state === 'rate_limited') {
+      // peek/take race (the peek saw an exhausted limiter but the take
+      // passed anyway): the token was spent, nothing was downloaded or
+      // transcribed — consume silently exactly like rate-limited text.
+      return { replies: [], commands: [] };
+    }
+    // 'failed', a missing outcome, or any unexpected shape: fail closed.
+    return { replies: [AUDIO_FAILURE_NOTICE], commands: [] };
   }
 
   // --- commands -----------------------------------------------------------

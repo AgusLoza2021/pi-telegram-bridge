@@ -175,5 +175,21 @@ export function createRateLimiter({ max, windowMs }) {
       hits.set(key, list);
       return { allowed: true, retryAfterMs: 0 };
     },
+
+    /**
+     * Non-consuming availability check: reports whether take(key, now)
+     * WOULD be allowed right now, recording nothing. Used to avoid
+     * spending work (e.g. an audio download) on a sender that could not
+     * pass the limiter anyway; take remains the only consuming call.
+     */
+    peek(key, now = Date.now()) {
+      const list = hits.get(key) ?? [];
+      const cutoff = now - windowMs;
+      while (list.length > 0 && list[0] <= cutoff) list.shift();
+      if (list.length >= max) {
+        return { allowed: false, retryAfterMs: list[0] + windowMs - now };
+      }
+      return { allowed: true, retryAfterMs: 0 };
+    },
   };
 }
