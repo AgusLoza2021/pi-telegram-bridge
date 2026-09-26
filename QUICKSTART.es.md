@@ -79,6 +79,36 @@ Cuatro cosas, en orden:
 3. Un mensaje normal que escribiste en el teléfono llegó a Pi como instrucción.
 4. La respuesta final de Pi volvió al mismo chat de Telegram.
 
+## Enviar una foto al teléfono
+
+Puedes enviar una imagen desde tu PC a tu propio chat privado, sin abrir Telegram en la PC:
+
+```
+node scripts/send-photo.mjs "C:\pi-telegram-bridge\captura.png"
+```
+
+Ejecútalo desde la carpeta del proyecto, la misma que contiene `Setup Pi Telegram.cmd`. La última línea que imprime es `SENT` y la imagen aparece en tu chat. El destino no se puede elegir: un envío real siempre va al chat privado que emparejaste en el Paso 3, porque el identificador del chat nunca se acepta desde la línea de comandos.
+
+Estas comprobaciones se hacen **antes** de subir nada, y un archivo que falle cualquiera de ellas nunca se envía:
+
+| Regla | Valor |
+|---|---|
+| Formatos permitidos | `.png`, `.jpg`, `.jpeg`, `.webp` |
+| Tamaño máximo | 10 MB |
+| Dónde puede estar el archivo | Dentro de la carpeta del proyecto. Si la imagen está en otro lado, agrega `--root "C:\la\carpeta"`. |
+
+Dos opciones más:
+
+- **`--caption "texto"`** envía un texto junto con la imagen. Siempre es texto plano: nunca se le aplica formato.
+- **`--dry-run`** valida el archivo y arma exactamente la petición que se enviaría, pero no envía nada ni revela tus credenciales.
+
+Con `node scripts/send-photo.mjs --help` ves todas las opciones y los límites.
+
+Dos cosas que conviene saber:
+
+- Es un comando **de la PC**. Nada desde tu teléfono puede extraer una imagen de tu disco.
+- Tu token nunca se imprime, ni se registra, ni se escribe en la línea de comandos, y si algo falla verás un código corto en lugar de un error largo.
+
 ## Los fallos más comunes
 
 | Síntoma | Qué hacer |
@@ -88,6 +118,7 @@ Cuatro cosas, en orden:
 | Hiciste doble clic en el archivo de configuración **desde dentro del ZIP** | Windows lo ejecuta desde una carpeta temporal que no tiene el resto de los archivos del proyecto, y la configuración puede avisarte de que falta algo que en realidad sí tienes. Cierra esa ventana, extrae el ZIP correctamente (clic derecho → **Extraer todo...**) y ejecuta `Setup Pi Telegram.cmd` desde la carpeta extraída. |
 | El código QR expiró o no se puede escanear | Cierra la configuración y ejecuta `Setup Pi Telegram.cmd` de nuevo para obtener un código nuevo. Sube el brillo de la pantalla y acerca el teléfono. |
 | El bot dice que no hay Pi conectado (`no Pi window is connected`) | Abre Pi en la PC, escribe `/tg` y elige **Connect**. |
+| Al enviar una foto imprime `FAILED: ...` | Cada código nombra una sola causa. `path_escape`: el archivo está fuera de la carpeta del proyecto — esta comprobación va primero, así que la ves incluso si el archivo además no existe o tiene mal el nombre; agrega `--root "C:\la\carpeta"` si la imagen está en otro lado. `not_found` o `not_a_file`: no hay nada legible en esa ruta. `bad_extension`: no es `.png`, `.jpg`, `.jpeg` ni `.webp`. `too_large`: supera los 10 MB. `bad_root`: la carpeta que pasaste en `--root` no existe. |
 
 Para más síntomas y soluciones, mira la sección [Fix problems del README](README.md#fix-problems).
 

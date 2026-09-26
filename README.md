@@ -129,6 +129,37 @@ On the PC:
 - `/tg off` disconnects that Pi window.
 - Every new Pi window starts disconnected. Link only the windows you want available from your phone.
 - Pi windows that were already running may need `/reload` once after an install or upgrade.
+- To send a picture **from your PC to your phone**, see [Send a picture to your phone](#send-a-picture-to-your-phone).
+
+## Send a picture to your phone
+
+You can send one image from your PC to your own private chat, without opening Telegram on the PC:
+
+```
+node scripts/send-photo.mjs "C:\pi-telegram-bridge\screenshot.png"
+```
+
+Run it from the project folder — the same folder that holds `Setup Pi Telegram.cmd`. The final line it prints is `SENT`, and the picture shows up in your chat. You cannot choose the destination: a real send always goes to the private chat you paired during setup, because the chat id is never accepted from the command line.
+
+These checks run **before** anything is uploaded, and a file that fails any of them is never sent:
+
+| Rule | Value |
+|---|---|
+| Allowed formats | `.png`, `.jpg`, `.jpeg`, `.webp` |
+| Maximum size | 10 MB |
+| Where the file may live | Inside the project folder by default. For a picture somewhere else, add `--root "C:\the\folder"`. |
+
+Two extras:
+
+- **`--caption "text"`** sends a caption with the picture. It is always plain text: no formatting is ever applied to it.
+- **`--dry-run`** validates the file and builds the exact request that would be sent, but sends nothing and reveals no credentials.
+
+Run `node scripts/send-photo.mjs --help` to see every option and the enforced limits.
+
+Two limits worth knowing:
+
+- This is a **PC-side command**. Nothing on your phone can pull a picture off your disk.
+- Your token is never printed, logged, or typed on the command line, and a failure prints one short code instead of a traceback.
 
 ## Fix problems
 
@@ -150,6 +181,7 @@ Find your symptom, then follow the matching action. A failed setup never replace
 | The bot does not answer | Make sure the PC is awake and online, then check the background connection: run `telegram status` in your setup folder, and `telegram on` if it is off. |
 | Several Pi windows are linked | Tap **Change Pi** and choose the readable project label you want. |
 | You want to remove the bridge | Follow [Uninstall and rollback](docs/ADVANCED.md#uninstall-and-rollback). State and backups are preserved unless you remove them yourself. |
+| Sending a picture printed `FAILED: ...` | Each code names exactly one cause. `path_escape`: the file is outside the project folder — this check runs first, so you get it even when the file is also missing or misnamed; add `--root "C:\the\folder"` if the picture lives elsewhere. `not_found` or `not_a_file`: nothing readable at that path. `bad_extension`: not a `.png`, `.jpg`, `.jpeg`, or `.webp`. `too_large`: over 10 MB. `bad_root`: the folder you passed to `--root` does not exist. |
 
 For service status, repair, manual setup, and the full command reference, see the [Advanced guide](docs/ADVANCED.md).
 
