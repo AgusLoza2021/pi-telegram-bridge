@@ -278,6 +278,24 @@ export function cbAck(op, rawLabel) {
 /** Session-scoped one-line acknowledgement: `Pi · <label> — <message>.` */
 export const sessionNotice = (rawLabel, message) => `${displayLabel(rawLabel)} — ${message}`;
 
+// --- per-session /alias (T4C2) ----------------------------------------------
+
+/** Fixed guidance when /alias has no live selected session: never a guess. */
+export const aliasNoSelection =
+  'No Pi window is selected. Send /projects, pick one, then try /alias <name> again.';
+
+/** Fixed rejection for an invalid alias: never an echo of the rejected input. */
+export const aliasInvalid =
+  "That name can't be used. Use up to 64 normal characters and try again.";
+
+/** Fixed failure when the store refuses or throws: no error details, ever. */
+export const aliasFailed =
+  'The alias could not be saved right now. Try again in a moment.';
+
+/** Concise acknowledgements prepended to the immediately re-rendered dashboard. */
+export const aliasSaved = 'Alias saved.';
+export const aliasCleared = 'Alias cleared.';
+
 // --- event presentation (BEGINNER_UX.md sections 9 and 2) --------------------
 
 /** Connected-event card headline. */
@@ -331,6 +349,7 @@ export const ADVANCED_HELP_LINES = [
   '/projects - show your projects and pick one',
   '/sessions - live connected TUIs',
   '/use <shortId> - select the active TUI for this broker',
+  '/alias <name> - rename the selected Pi window; /alias clear resets it',
   '/status [shortId] - request session status',
   '/send [shortId] <text> - prompt an idle TUI',
   '/steer [shortId] <text> - steer the running turn',

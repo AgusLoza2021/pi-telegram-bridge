@@ -11,6 +11,7 @@ These commands work only in the enrolled private chat. Session arguments use sho
 | `/help` | Show command help. |
 | `/sessions` | List live connected Pi sessions. |
 | `/use <shortId>` | Select the active Pi session. |
+| `/alias <name>` | Rename the selected Pi window; `/alias clear` resets it, `/alias <shortId> <name>` renames a specific window. |
 | `/status [shortId]` | Request status from the selected or named session. |
 | `/send [shortId] <text>` | Prompt an idle session. |
 | `/steer [shortId] <text>` | Redirect the current turn. |

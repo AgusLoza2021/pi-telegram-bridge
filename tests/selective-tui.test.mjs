@@ -30,6 +30,7 @@ import {
   projectRowLabel,
 } from '../src/beginner-copy.mjs';
 import { RuntimeConfigError, loadBrokerRuntimeConfig } from '../src/runtime-config.mjs';
+import * as copyModule from '../src/beginner-copy.mjs';
 
 const TEST_RUNS = fileURLToPath(new URL('../.local/test-runs/', import.meta.url));
 mkdirSync(TEST_RUNS, { recursive: true });
@@ -3269,6 +3270,7 @@ describe('SelectiveTelegramBroker: durable selected-destination parity (T4A)', (
     'recordInbox', 'listTuiSessions', 'listRecentTuiProjects', 'enqueueTuiCommand',
     'listPendingBrokerTuiEvents', 'acknowledgeTuiEvents',
     'getSelectedTuiTarget', 'setSelectedTuiTarget', 'clearSelectedTuiTarget',
+    'setTuiSessionAlias',
   ];
   function poisonStore(fx, overrides) {
     const bound = Object.fromEntries(
@@ -3569,6 +3571,511 @@ describe('SelectiveTelegramBroker: durable selected-destination parity (T4A)', (
       await deliverDurable(broker, api, msg('/projects'));
       await deliverDurable(broker, api, cb('v1:r'));
       assert.equal(fx.store.getSelectedTuiTarget(), null);
+    } finally { fx.close(); }
+  });
+});
+
+describe('SelectiveTelegramBroker: per-session /alias (T4C2)', () => {
+  // Same project as ALPHA (same cwd): two live windows in one project.
+  const C = Object.freeze({ trackingId: 'c'.repeat(32), connectionId: '3'.repeat(32) });
+  const ALPHA = Object.freeze({ shortId: 'aaa111', label: 'alpha', cwd: 'C:/proj/alpha' });
+  const BETA = Object.freeze({ shortId: 'bbb222', label: 'beta', cwd: 'C:/proj/beta' });
+  const GAMMA = Object.freeze({ shortId: 'ccc333', label: 'alpha two', cwd: 'C:/proj/alpha' });
+
+  const aliasNoSelection = copyModule.aliasNoSelection;
+  const aliasInvalid = copyModule.aliasInvalid;
+  const aliasFailed = copyModule.aliasFailed;
+
+  function makeFixture() {
+    const dir = mkdtempSync(join(TEST_RUNS, 'sel-alias-'));
+    let t = Date.now();
+    const now = () => t;
+    const store = new Store(join(dir, 'bridge.sqlite'), { now, isProcessAlive: () => true });
+    const sessions = [];
+    return {
+      store,
+      now,
+      advance(ms) { t += ms; },
+      connect(id, { shortId, label, cwd, state = null }) {
+        const client = new TuiBridgeClient(store, { staleAfterMs: 30_000 });
+        assert.equal(client.connect({ ...id, shortId, label, cwd, pid: 4000 + sessions.length }).ok, true);
+        if (state !== null) {
+          assert.equal(client.setState({ ...id, state }).ok, true);
+        }
+        sessions.push({ id, client });
+        return client;
+      },
+      disconnect(id) {
+        const entry = sessions.find((s) => s.id.trackingId === id.trackingId);
+        assert.ok(entry, 'the session to disconnect must exist');
+        assert.equal(entry.client.disconnect({ ...id }).ok, true);
+      },
+      pollAllCommands() {
+        const commands = [];
+        for (const { id, client } of sessions) {
+          commands.push(...client.poll(id).commands);
+        }
+        return commands;
+      },
+      close() { store.close(); },
+    };
+  }
+
+  const BROKER_STORE_METHODS = [
+    'withTransaction', 'getBrokerTransportOffset', 'advanceBrokerTransportOffset',
+    'recordInbox', 'listTuiSessions', 'listRecentTuiProjects', 'enqueueTuiCommand',
+    'listPendingBrokerTuiEvents', 'acknowledgeTuiEvents',
+    'getSelectedTuiTarget', 'setSelectedTuiTarget', 'clearSelectedTuiTarget',
+    'setTuiSessionAlias',
+  ];
+  function poisonStore(fx, overrides) {
+    const bound = Object.fromEntries(
+      BROKER_STORE_METHODS.map((name) => [name, fx.store[name].bind(fx.store)]),
+    );
+    return Object.assign(bound, overrides);
+  }
+
+  function newBroker(fx, api, store = fx.store, logger = () => {}) {
+    return new SelectiveTelegramBroker({ store, api, config: BROKER_CONFIG, now: fx.now, logger });
+  }
+
+  async function deliver(broker, api, update) {
+    broker.handleUpdate(update);
+    await broker.flushReplies();
+  }
+
+  /** One button per row on the last rendered dashboard. */
+  function rowButtons(api) {
+    const markup = api.sent[api.sent.length - 1].replyMarkup;
+    return (markup?.inline_keyboard ?? []).map((row) => row[0]);
+  }
+
+  function sessionAliasOf(fx, id) {
+    const row = fx.store.getTuiSession({ trackingId: id.trackingId, staleCutoff: fx.now() - 30_000 });
+    return row === null ? null : row.alias;
+  }
+
+  function projectKeyOf(fx, id) {
+    const row = fx.store.getTuiSession({ trackingId: id.trackingId, staleCutoff: fx.now() - 30_000 });
+    assert.notEqual(row, null);
+    return row.projectKey;
+  }
+
+  test('the constructor requires setTuiSessionAlias', () => {
+    const fx = makeFixture();
+    try {
+      fx.connect(A, ALPHA);
+      const partial = poisonStore(fx, {});
+      delete partial.setTuiSessionAlias;
+      assert.throws(
+        () => newBroker(fx, makeFakeApi(), partial),
+        TypeError,
+        'a store without setTuiSessionAlias must be rejected',
+      );
+    } finally { fx.close(); }
+  });
+
+  test('/alias <name> renames the selected live session, acknowledges and re-renders the dashboard', async () => {
+    const fx = makeFixture();
+    try {
+      fx.connect(A, ALPHA);
+      fx.connect(B, BETA);
+      const api = makeFakeApi();
+      const broker = newBroker(fx, api);
+      await deliver(broker, api, cb('v1:s:aaa111'));
+      await deliver(broker, api, msg('/alias   home   office '));
+      const reply = api.sent[api.sent.length - 1];
+      assert.ok(reply.text.startsWith('Alias saved.\n'),
+        'the fixed acknowledgement must be prepended to the re-rendered dashboard');
+      assert.ok(reply.text.includes('Your Pi projects'),
+        'the dashboard must re-render immediately so the renamed row is visible');
+      assert.equal(sessionAliasOf(fx, A), 'home office',
+        'the trimmed, whitespace-collapsed alias must be persisted');
+      assert.equal(sessionAliasOf(fx, B), null);
+      const rows = rowButtons(api);
+      assert.ok(rows.some((b) => b.text.includes('home office')), 'the renamed row must render');
+      assert.ok(rows.every((b) => !b.text.includes('alpha')), 'the old label must be replaced');
+      assert.equal(fx.pollAllCommands().length, 0, '/alias enqueues no TUI command');
+    } finally { fx.close(); }
+  });
+
+  test('/alias clear clears the selected session alias and re-renders the dashboard', async () => {
+    const fx = makeFixture();
+    try {
+      fx.connect(A, ALPHA);
+      const api = makeFakeApi();
+      const broker = newBroker(fx, api);
+      await deliver(broker, api, cb('v1:s:aaa111'));
+      await deliver(broker, api, msg('/alias first'));
+      assert.equal(sessionAliasOf(fx, A), 'first');
+      await deliver(broker, api, msg('/alias clear'));
+      assert.equal(sessionAliasOf(fx, A), null, 'the alias must be cleared in the store');
+      const reply = api.sent[api.sent.length - 1];
+      assert.ok(reply.text.startsWith('Alias cleared.\n'));
+      const rows = rowButtons(api);
+      assert.ok(rows.some((b) => b.text.includes('alpha')), 'the row falls back to the session label');
+      assert.equal(fx.pollAllCommands().length, 0);
+    } finally { fx.close(); }
+  });
+
+  test('/alias <shortId> <name> renames that exact live session and leaves the selection untouched', async () => {
+    const fx = makeFixture();
+    try {
+      fx.connect(A, ALPHA);
+      fx.connect(B, BETA);
+      const api = makeFakeApi();
+      const broker = newBroker(fx, api);
+      await deliver(broker, api, cb('v1:s:aaa111'));
+      await deliver(broker, api, msg('/alias bbb222 garden'));
+      assert.equal(sessionAliasOf(fx, B), 'garden');
+      assert.equal(sessionAliasOf(fx, A), null, 'the selected session must be untouched');
+      const rows = rowButtons(api);
+      const alphaRow = rows.find((b) => b.callback_data === 'v1:s:aaa111');
+      const betaRow = rows.find((b) => b.callback_data === 'v1:s:bbb222');
+      assert.ok(alphaRow.text.startsWith('✓'), 'the selection must not move');
+      assert.equal(alphaRow.style, 'primary');
+      assert.ok(betaRow.text.includes('garden'), 'the targeted row shows its new alias');
+      assert.ok(!betaRow.text.includes('beta'));
+      assert.equal(fx.pollAllCommands().length, 0);
+    } finally { fx.close(); }
+  });
+
+  test('/alias <shortId> clear clears that exact live session and leaves the selection untouched', async () => {
+    const fx = makeFixture();
+    try {
+      fx.connect(A, ALPHA);
+      fx.connect(B, BETA);
+      const api = makeFakeApi();
+      const broker = newBroker(fx, api);
+      assert.equal(fx.store.setTuiSessionAlias({ trackingId: B.trackingId, alias: 'garden' }).ok, true);
+      await deliver(broker, api, cb('v1:s:aaa111'));
+      await deliver(broker, api, msg('/alias bbb222 clear'));
+      assert.equal(sessionAliasOf(fx, B), null);
+      assert.equal(sessionAliasOf(fx, A), null);
+      const rows = rowButtons(api);
+      assert.ok(rows.find((b) => b.callback_data === 'v1:s:aaa111').text.startsWith('✓'));
+      assert.equal(fx.pollAllCommands().length, 0);
+    } finally { fx.close(); }
+  });
+
+  test('a shortId-looking first word that matches nothing is the selected session alias', async () => {
+    const fx = makeFixture();
+    try {
+      fx.connect(A, ALPHA);
+      fx.connect(B, BETA);
+      const api = makeFakeApi();
+      const broker = newBroker(fx, api);
+      await deliver(broker, api, cb('v1:s:aaa111'));
+      await deliver(broker, api, msg('/alias zzz999 home pc'));
+      assert.equal(sessionAliasOf(fx, A), 'zzz999 home pc',
+        'the whole argument must become the selected session alias');
+      assert.equal(sessionAliasOf(fx, B), null);
+      const rows = rowButtons(api);
+      assert.ok(rows.some((b) => b.text.includes('zzz999 home pc')));
+      assert.equal(fx.pollAllCommands().length, 0);
+    } finally { fx.close(); }
+  });
+
+  test('/alias without a live selected session fails closed and never auto-selects', async () => {
+    const fx = makeFixture();
+    try {
+      const api = makeFakeApi();
+      const broker = newBroker(fx, api);
+      // Zero live sessions.
+      await deliver(broker, api, msg('/alias home'));
+      assert.equal(api.sent[0].text, aliasNoSelection);
+      // Exactly one live session, no selection: still no guess.
+      fx.connect(A, ALPHA);
+      await deliver(broker, api, msg('/alias home'));
+      assert.equal(api.sent[1].text, aliasNoSelection);
+      assert.equal(sessionAliasOf(fx, A), null, 'a sole session must never be auto-selected');
+      // Several live sessions, no selection.
+      fx.connect(B, BETA);
+      await deliver(broker, api, msg('/alias home'));
+      assert.equal(api.sent[2].text, aliasNoSelection);
+      // A selection that went stale fails closed the same way.
+      await deliver(broker, api, cb('v1:s:aaa111'));
+      fx.advance(31_000);
+      await deliver(broker, api, msg('/alias home'));
+      assert.equal(api.sent[4].text, aliasNoSelection,
+        'a stale selection must fail closed, never guess');
+      assert.equal(fx.pollAllCommands().length, 0);
+    } finally { fx.close(); }
+  });
+
+  test('two live windows in one project show distinct names', async () => {
+    const fx = makeFixture();
+    try {
+      fx.connect(A, ALPHA);
+      fx.connect(C, GAMMA);
+      const api = makeFakeApi();
+      const broker = newBroker(fx, api);
+      await deliver(broker, api, cb('v1:s:aaa111'));
+      await deliver(broker, api, msg('/alias garden shed'));
+      const rows = rowButtons(api);
+      const alphaRow = rows.find((b) => b.callback_data === 'v1:s:aaa111');
+      const gammaRow = rows.find((b) => b.callback_data === 'v1:s:ccc333');
+      assert.ok(alphaRow.text.includes('garden shed'));
+      assert.ok(gammaRow.text.includes('alpha two'), 'the sibling row keeps its own name');
+      const colorOf = (text) => text.match(new RegExp(`[${PROJECT_COLOR_SLOTS.join('')}]`, 'gu'))?.[0];
+      assert.equal(colorOf(alphaRow.text), colorOf(gammaRow.text),
+        'the shared project color must stay stable');
+      assert.equal(fx.pollAllCommands().length, 0);
+    } finally { fx.close(); }
+  });
+
+  test('the session alias beats the project alias on its own row only', async () => {
+    const fx = makeFixture();
+    try {
+      fx.connect(A, ALPHA);
+      fx.connect(C, GAMMA);
+      const api = makeFakeApi();
+      const broker = newBroker(fx, api);
+      const projectKey = projectKeyOf(fx, A);
+      assert.equal(fx.store.setTuiProjectAlias({ projectKey, alias: 'proj name' }).ok, true);
+      await deliver(broker, api, cb('v1:s:aaa111'));
+      await deliver(broker, api, msg('/alias mine'));
+      const rows = rowButtons(api);
+      const alphaRow = rows.find((b) => b.callback_data === 'v1:s:aaa111');
+      const gammaRow = rows.find((b) => b.callback_data === 'v1:s:ccc333');
+      assert.ok(alphaRow.text.includes('mine'),
+        'the session alias must take precedence over the project alias');
+      assert.ok(gammaRow.text.includes('proj name'),
+        'the sibling window without a session alias keeps the project alias');
+      assert.equal(fx.pollAllCommands().length, 0);
+    } finally { fx.close(); }
+  });
+
+  test('Recent stays project-level: a disconnected session alias never leaks', async () => {
+    const fx = makeFixture();
+    try {
+      fx.connect(A, ALPHA);
+      const api = makeFakeApi();
+      const broker = newBroker(fx, api);
+      const projectKey = projectKeyOf(fx, A);
+      assert.equal(fx.store.setTuiSessionAlias({ trackingId: A.trackingId, alias: 'secret window' }).ok, true);
+      assert.equal(fx.store.setTuiProjectAlias({ projectKey, alias: 'proj name' }).ok, true);
+      fx.disconnect(A);
+      await deliver(broker, api, msg('/projects'));
+      const rows = rowButtons(api);
+      assert.ok(rows.some((b) => b.text.includes('proj name')),
+        'the recent row must show the project alias');
+      assert.ok(rows.every((b) => !b.text.includes('secret window')),
+        'a disconnected session alias must never leak into Recent');
+      assert.equal(fx.pollAllCommands().length, 0);
+    } finally { fx.close(); }
+  });
+
+  test('duplicate aliases are allowed across sessions', async () => {
+    const fx = makeFixture();
+    try {
+      fx.connect(A, ALPHA);
+      fx.connect(B, BETA);
+      const api = makeFakeApi();
+      const broker = newBroker(fx, api);
+      await deliver(broker, api, cb('v1:s:aaa111'));
+      await deliver(broker, api, msg('/alias twin'));
+      await deliver(broker, api, cb('v1:s:bbb222'));
+      await deliver(broker, api, msg('/alias twin'));
+      assert.equal(sessionAliasOf(fx, A), 'twin');
+      assert.equal(sessionAliasOf(fx, B), 'twin');
+      const texts = rowButtons(api).map((b) => b.text);
+      assert.equal(texts.filter((t) => t.includes('twin')).length, 2,
+        'both rows may carry the same alias');
+      assert.equal(fx.pollAllCommands().length, 0);
+    } finally { fx.close(); }
+  });
+
+  test('alias input validation: 64 accepted, 65 rejected, control chars and leading slash rejected', async () => {
+    const fx = makeFixture();
+    try {
+      fx.connect(A, ALPHA);
+      const api = makeFakeApi();
+      const broker = newBroker(fx, api);
+      await deliver(broker, api, cb('v1:s:aaa111'));
+      await deliver(broker, api, msg(`/alias ${'x'.repeat(64)}`));
+      assert.equal(sessionAliasOf(fx, A), 'x'.repeat(64), 'a 64-char alias must be accepted');
+      assert.ok(api.sent[api.sent.length - 1].text.startsWith('Alias saved.'));
+      for (const bad of ['x'.repeat(65), 'bad\u0007name', '/etc/passwd']) {
+        const before = fx.store.getBrokerTransportOffset();
+        await deliver(broker, api, msg(`/alias ${bad}`));
+        assert.equal(api.sent[api.sent.length - 1].text, aliasInvalid,
+          'a rejected input gets the fixed safe copy, never an echo');
+        assert.equal(fx.store.getBrokerTransportOffset(), before + 1,
+          'the receipt and offset still commit for a rejected input');
+      }
+      assert.equal(sessionAliasOf(fx, A), 'x'.repeat(64),
+        'a rejected input must never touch the stored alias');
+      assert.equal(fx.pollAllCommands().length, 0);
+    } finally { fx.close(); }
+  });
+
+  test('unicode Cc/Cf characters in alias input are rejected: U+0085, U+200B, U+202E', async () => {
+    const fx = makeFixture();
+    try {
+      fx.connect(A, ALPHA);
+      const api = makeFakeApi();
+      const broker = newBroker(fx, api);
+      await deliver(broker, api, cb('v1:s:aaa111'));
+      // U+0085 NEL (Cc), U+200B zero width space (Cf), U+202E RTL override (Cf).
+      for (const bad of ['bad\u0085name', 'bad\u200Bname', 'bad\u202Ename']) {
+        const before = fx.store.getBrokerTransportOffset();
+        await deliver(broker, api, msg(`/alias ${bad}`));
+        assert.equal(api.sent[api.sent.length - 1].text, aliasInvalid,
+          'a control/format input gets the fixed safe copy, never an echo');
+        assert.equal(fx.store.getBrokerTransportOffset(), before + 1,
+          'the receipt and offset still commit for a rejected input');
+      }
+      assert.equal(sessionAliasOf(fx, A), null, 'no alias mutation for rejected input');
+      assert.equal(fx.pollAllCommands().length, 0, 'no TUI command for rejected input');
+      // Normal emoji, letters and combining marks must stay accepted.
+      const withMarks = 'café \u{1F600} e\u0301';
+      await deliver(broker, api, msg(`/alias ${withMarks}`));
+      assert.equal(sessionAliasOf(fx, A), withMarks,
+        'emoji, letters and combining marks must never be rejected');
+      assert.ok(api.sent[api.sent.length - 1].text.startsWith('Alias saved.'));
+    } finally { fx.close(); }
+  });
+
+  test('permitted joiners: ZWJ emoji, ZWNJ letters and tag-sequence emoji are accepted', async () => {
+    const fx = makeFixture();
+    try {
+      fx.connect(A, ALPHA);
+      const api = makeFakeApi();
+      const broker = newBroker(fx, api);
+      await deliver(broker, api, cb('v1:s:aaa111'));
+      const zwj = '👩\u200D💻';
+      await deliver(broker, api, msg(`/alias ${zwj}`));
+      assert.equal(sessionAliasOf(fx, A), zwj,
+        'a normal ZWJ emoji must be accepted with its joiner preserved');
+      assert.ok(api.sent[api.sent.length - 1].text.startsWith('Alias saved.'));
+      const zwnj = 'co\u200Cop';
+      await deliver(broker, api, msg(`/alias ${zwnj}`));
+      assert.equal(sessionAliasOf(fx, A), zwnj,
+        'a real letter sequence with ZWNJ must be accepted');
+      const flag = '🏴\u{E0067}\u{E0062}\u{E0073}\u{E0063}\u{E0074}\u{E007F}';
+      await deliver(broker, api, msg(`/alias ${flag}`));
+      assert.equal(sessionAliasOf(fx, A), flag,
+        'tag characters inside a valid emoji flag sequence must be accepted');
+      assert.equal(fx.pollAllCommands().length, 0);
+    } finally { fx.close(); }
+  });
+
+  test('invisible-only aliases are rejected: joiner-only, tag-only, combining-only', async () => {
+    const fx = makeFixture();
+    try {
+      fx.connect(A, ALPHA);
+      const api = makeFakeApi();
+      const broker = newBroker(fx, api);
+      await deliver(broker, api, cb('v1:s:aaa111'));
+      for (const bad of ['\u200D', '\u200C', '\u{E0067}\u{E006B}', '\u0301\u0308',
+        ' \u200D\u0301 ']) {
+        const before = fx.store.getBrokerTransportOffset();
+        await deliver(broker, api, msg(`/alias ${bad}`));
+        assert.equal(api.sent[api.sent.length - 1].text, aliasInvalid,
+          'an alias with no visible base character must get the fixed safe copy');
+        assert.equal(fx.store.getBrokerTransportOffset(), before + 1,
+          'the receipt and offset still commit for a rejected input');
+      }
+      assert.equal(sessionAliasOf(fx, A), null, 'no alias mutation for rejected input');
+      assert.equal(fx.pollAllCommands().length, 0, 'no TUI command for rejected input');
+    } finally { fx.close(); }
+  });
+
+  test('a hostile alias is stored but never rendered as a path, short id, tracking id or pid', async () => {
+    const fx = makeFixture();
+    try {
+      fx.connect(A, ALPHA);
+      const api = makeFakeApi();
+      const broker = newBroker(fx, api);
+      await deliver(broker, api, cb('v1:s:aaa111'));
+      const hostile = 'C:/Users/me tg:abc123 aaaaaaaaaaaaaaaa pid 7 office';
+      assert.ok(hostile.length <= 64);
+      await deliver(broker, api, msg(`/alias ${hostile}`));
+      assert.equal(sessionAliasOf(fx, A), hostile);
+      const alphaRow = rowButtons(api).find((b) => b.callback_data === 'v1:s:aaa111');
+      for (const forbidden of [/C:\/Users/, /tg:/, /aaaa/, /pid/]) {
+        assert.doesNotMatch(alphaRow.text, forbidden,
+          `the dashboard must sanitize the hostile alias: ${alphaRow.text}`);
+      }
+      assert.ok(alphaRow.text.includes('office'), 'the readable remainder must survive');
+    } finally { fx.close(); }
+  });
+
+  test('a store refusal or throw replies with one fixed failure, logs one fixed code and commits the receipt', async () => {
+    const fx = makeFixture();
+    try {
+      fx.connect(A, ALPHA);
+      const api = makeFakeApi();
+      const broker = newBroker(fx, api);
+      await deliver(broker, api, cb('v1:s:aaa111'));
+      const codes = [];
+      const refused = poisonStore(fx, {
+        setTuiSessionAlias: () => ({ ok: false, reason: 'unknown_session' }),
+      });
+      const refusedBroker = newBroker(fx, api, refused, (entry) => codes.push(entry.code));
+      const base = api.sent.length;
+      await deliver(refusedBroker, api, msg('/alias aaa111 home'));
+      assert.equal(api.sent[base].text, aliasFailed);
+      assert.ok(!api.sent[base].text.includes('unknown_session'),
+        'the store refusal reason must never reach the reply');
+      assert.ok(codes.includes('alias_persist_failed'), 'the fixed failure code must be logged');
+      assert.equal(fx.pollAllCommands().length, 0);
+
+      const throwCodes = [];
+      const throwing = poisonStore(fx, {
+        setTuiSessionAlias: () => { throw new Error('simulated store failure'); },
+      });
+      const throwingBroker = newBroker(fx, api, throwing, (entry) => throwCodes.push(entry.code));
+      const base2 = api.sent.length;
+      await deliver(throwingBroker, api, msg('/alias aaa111 home'));
+      assert.equal(api.sent[base2].text, aliasFailed);
+      assert.ok(throwCodes.includes('alias_persist_failed'));
+      assert.equal(fx.pollAllCommands().length, 0, 'a failed alias save enqueues nothing');
+      assert.ok(fx.store.getBrokerTransportOffset() > 0,
+        'the receipt and offset still commit through the refused updates');
+    } finally { fx.close(); }
+  });
+
+  test('/alias alone and a bare unique short id show usage and mutate nothing', async () => {
+    const fx = makeFixture();
+    try {
+      fx.connect(A, ALPHA);
+      fx.connect(B, BETA);
+      const api = makeFakeApi();
+      const broker = newBroker(fx, api);
+      await deliver(broker, api, cb('v1:s:aaa111'));
+      const base = api.sent.length;
+      await deliver(broker, api, msg('/alias'));
+      assert.match(api.sent[base].text, /Usage: \/alias/);
+      await deliver(broker, api, msg('/alias aaa111'));
+      assert.match(api.sent[base + 1].text, /Usage: \/alias/,
+        'the advanced form needs <name|clear>, so a bare short id is usage');
+      assert.equal(sessionAliasOf(fx, A), null);
+      assert.equal(sessionAliasOf(fx, B), null);
+      assert.equal(fx.pollAllCommands().length, 0);
+    } finally { fx.close(); }
+  });
+
+  test('the callback grammar is unchanged: v1:s still selects after an /alias rename', async () => {
+    const fx = makeFixture();
+    try {
+      fx.connect(A, ALPHA);
+      fx.connect(B, BETA);
+      const api = makeFakeApi();
+      const broker = newBroker(fx, api);
+      await deliver(broker, api, msg('/alias aaa111 first'));
+      assert.equal(sessionAliasOf(fx, A), 'first');
+      await deliver(broker, api, cb('v1:s:bbb222'));
+      const rows = rowButtons(api);
+      const betaRow = rows.find((b) => b.callback_data === 'v1:s:bbb222');
+      const alphaRow = rows.find((b) => b.callback_data === 'v1:s:aaa111');
+      assert.ok(betaRow.text.startsWith('✓'), 'the select callback must still move the selection');
+      assert.ok(alphaRow.text.includes('first'), 'the renamed row still renders its alias');
+      await deliver(broker, api, msg('hello there'));
+      const commands = fx.pollAllCommands();
+      assert.equal(commands.length, 1);
+      assert.equal(commands[0].kind, 'prompt', 'plain text still routes to the newly selected session');
     } finally { fx.close(); }
   });
 });

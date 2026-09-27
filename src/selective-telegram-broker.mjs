@@ -162,6 +162,8 @@ const OUTBOUND_UNCERTAIN = new Set(['network', 'timeout', 'server', 'rate_limite
 
 const USAGE = {
   use: 'Usage: /use <shortId> — see /sessions.',
+  alias: 'Usage: /alias <name> — rename the selected Pi. /alias clear — reset it. '
+    + '/alias <shortId> <name|clear> — rename a specific window.',
   status: 'Usage: /status [shortId]',
   prompt: 'Usage: /send [shortId] <text>',
   steer: 'Usage: /steer [shortId] <text>',
@@ -222,6 +224,61 @@ function hasSlashInitialLine(text) {
   return text.split('\n').some((line) => /^\s*\//.test(line));
 }
 
+/** Trim + whitespace collapse: the ONLY normalization an alias input gets. */
+function normalizeAliasInput(raw) {
+  return typeof raw === 'string' ? raw.replace(/\s+/g, ' ').trim() : '';
+}
+
+/**
+ * Alias input character policy (Unicode-aware):
+ * - ALL category Cc is rejected: C0 controls, DEL and the C1 controls
+ *   (including U+0085 NEL).
+ * - Category Cf is rejected EXCEPT the two permitted joiners and the
+ *   Unicode tag characters: this refuses every spoofing/invisible format
+ *   character (U+00AD, U+061C, U+180E, U+200B, U+200E/U+200F,
+ *   U+202A-U+202E, U+2060-U+206F, U+FEFF and any other Cf) while normal
+ *   emoji keep working.
+ * - Permitted Cf: U+200C ZWNJ and U+200D ZWJ (legitimate scripts and
+ *   emoji sequences) and U+E0000-U+E007F (tag characters used by valid
+ *   emoji flag/subdivision sequences).
+ */
+const ALIAS_CONTROL_RE = /\p{Cc}/u;
+const ALIAS_FORMAT_RE = /\p{Cf}/u;
+const ALIAS_PERMITTED_JOINER_RE = /[\u200C\u200D]/u;
+const ALIAS_PERMITTED_TAG_RE = /[\u{E0000}-\u{E007F}]/u;
+/** Everything with no visual weight: whitespace and combining marks. */
+const ALIAS_INVISIBLE_RE = /[\s\p{M}\u200C\u200D\u{E0000}-\u{E007F}]/gu;
+
+/**
+ * A visible alias must keep at least one base character once whitespace,
+ * combining marks, permitted joiners and permitted tag characters are
+ * ignored.
+ */
+function hasVisibleBase(text) {
+  return text.replace(ALIAS_INVISIBLE_RE, '').length > 0;
+}
+
+/**
+ * An alias survives only as bounded visible text: 1..64 UTF-16 chars,
+ * no leading '/', no control characters (Cc) and no format characters
+ * (Cf) beyond the permitted joiners and emoji tag characters. Normal
+ * emoji, letters and combining marks are never rejected, and an alias
+ * that is invisible-only (joiners, tags, combining marks, whitespace)
+ * is refused. Everything else is refused before the store is ever called.
+ */
+function isValidAlias(text) {
+  if (text.length === 0 || text.length > 64 || text.startsWith('/')) return false;
+  if (ALIAS_CONTROL_RE.test(text)) return false;
+  if (ALIAS_FORMAT_RE.test(text)) {
+    for (const ch of text) {
+      if (!ALIAS_FORMAT_RE.test(ch)) continue;
+      if (ALIAS_PERMITTED_JOINER_RE.test(ch) || ALIAS_PERMITTED_TAG_RE.test(ch)) continue;
+      return false;
+    }
+  }
+  return hasVisibleBase(text);
+}
+
 export class SelectiveTelegramBroker {
   /**
    * @param {object} options
@@ -264,7 +321,8 @@ export class SelectiveTelegramBroker {
       || typeof store.acknowledgeTuiEvents !== 'function'
       || typeof store.getSelectedTuiTarget !== 'function'
       || typeof store.setSelectedTuiTarget !== 'function'
-      || typeof store.clearSelectedTuiTarget !== 'function') {
+      || typeof store.clearSelectedTuiTarget !== 'function'
+      || typeof store.setTuiSessionAlias !== 'function') {
       throw new TypeError('store is missing the broker transport methods');
     }
     if (!api || typeof api !== 'object') {
@@ -855,6 +913,19 @@ export class SelectiveTelegramBroker {
     return matches.length === 1 ? matches[0] : null;
   }
 
+  /**
+   * The live session behind the current selection, or null — no
+   * auto-select and no guess (T4C2). A stale selection is cleared
+   * (memory AND durable) exactly like every other selection refresh.
+   */
+  #selectedLiveSession() {
+    if (this.#selectedTrackingId === null) return null;
+    const selected = this.#liveSessions()
+      .find((session) => session.trackingId === this.#selectedTrackingId) ?? null;
+    if (selected === null) this.#clearSelection();
+    return selected;
+  }
+
   /** Shared fail-closed paths for the T03b busy callbacks. */
   #busyActionStaleGeneration(answerId) {
     // Missing or replaced generation: never dispatch; re-render the safest
@@ -1090,7 +1161,10 @@ export class SelectiveTelegramBroker {
     const style = selected
       ? 'primary'
       : session.state === 'connected' ? 'success' : undefined;
-    const alias = typeof session.projectKey === 'string'
+    const sessionAlias = typeof session.alias === 'string' && session.alias.trim().length > 0
+      ? session.alias
+      : null;
+    const projectAlias = typeof session.projectKey === 'string'
       ? aliasByKey.get(session.projectKey)
       : undefined;
     const button = {
@@ -1098,7 +1172,7 @@ export class SelectiveTelegramBroker {
         selected,
         colorSlot: this.#colorSlotOf(session.projectKey),
         state: session.state,
-        name: alias ?? session.label,
+        name: sessionAlias ?? projectAlias ?? session.label,
         branch: session.branch,
       }),
       callback_data: pendingId !== null
@@ -1210,6 +1284,8 @@ export class SelectiveTelegramBroker {
         return this.#planSessions();
       case 'use':
         return this.#planUse(args);
+      case 'alias':
+        return this.#planAlias(args);
       case 'status':
         return this.#planRouted(args, 'status');
       case 'send':
@@ -1298,6 +1374,93 @@ export class SelectiveTelegramBroker {
       return { replies: [NO_SELECTION_NOTICE], commands: [] };
     }
     return { replies: [this.#prefixed(target.session, 'Selected.')], commands: [] };
+  }
+
+  /**
+   * T4C2 /alias: per-session human aliases. Targeting fails closed:
+   * - `/alias` alone shows usage and mutates nothing.
+   * - `/alias clear` clears the SELECTED live session's alias.
+   * - `/alias <name>` renames the SELECTED live session only — never a
+   *   guess and never a sole-session auto-select.
+   * - `/alias <shortId> <name|clear>` targets that exact unique live
+   *   session and leaves the current selection untouched. The first
+   *   token is treated as a short id ONLY while it uniquely resolves
+   *   against the live sessions; otherwise the whole argument is the
+   *   selected session's alias (so names like `home pc` never misparse).
+   * Input is normalized (trim + whitespace collapse) and refused BEFORE
+   * the store when it is empty, longer than 64 UTF-16 chars, starts with
+   * '/' or still carries control characters — fixed safe copy, never an
+   * echo of the rejected input. A store refusal or throw replies with
+   * one fixed failure line, logs one fixed code and never enqueues a TUI
+   * command; the receipt and offset still commit. On success the
+   * Projects dashboard re-renders immediately under a concise fixed
+   * acknowledgement so the renamed row is visible at once.
+   */
+  #planAlias(args) {
+    const normalized = normalizeAliasInput(args);
+    if (normalized.length === 0) {
+      return { replies: [USAGE.alias], commands: [] };
+    }
+    const spaceAt = normalized.indexOf(' ');
+    const first = spaceAt === -1 ? normalized : normalized.slice(0, spaceAt);
+    const rest = spaceAt === -1 ? '' : normalized.slice(spaceAt + 1).trim();
+
+    let target = null;
+    let aliasValue = null; // null = clear the alias
+    let valueGiven = false;
+    if (rest !== '') {
+      const matches = this.#liveSessions().filter((session) => session.shortId === first);
+      if (matches.length === 1) {
+        // The advanced form: that exact unique live session, selection untouched.
+        target = matches[0];
+        if (rest !== 'clear') {
+          aliasValue = rest;
+          valueGiven = true;
+        }
+      } else {
+        // A nonmatching first word is part of the alias, never a target.
+        aliasValue = normalized;
+        valueGiven = true;
+      }
+    } else if (first !== 'clear'
+      && this.#liveSessions().filter((session) => session.shortId === first).length === 1) {
+      // A bare unique live short id without <name|clear>: usage, no mutation.
+      return { replies: [USAGE.alias], commands: [] };
+    } else if (first !== 'clear') {
+      aliasValue = normalized;
+      valueGiven = true;
+    }
+    // `first === 'clear'` with no rest falls through: clear the selected session.
+
+    if (target === null) {
+      target = this.#selectedLiveSession();
+      if (target === null) {
+        return { replies: [copy.aliasNoSelection], commands: [] };
+      }
+    }
+    if (valueGiven && !isValidAlias(aliasValue)) {
+      this.#log('alias_input_refused');
+      return { replies: [copy.aliasInvalid], commands: [] };
+    }
+    let result = null;
+    try {
+      result = this.#store.setTuiSessionAlias({ trackingId: target.trackingId, alias: aliasValue });
+    } catch {
+      result = null;
+    }
+    if (!isPlainObject(result) || result.ok !== true) {
+      this.#log('alias_persist_failed');
+      return { replies: [copy.aliasFailed], commands: [] };
+    }
+    this.#log('alias_saved');
+    const dashboard = this.#projectsReply();
+    const ack = valueGiven ? copy.aliasSaved : copy.aliasCleared;
+    return {
+      replies: [dashboard.replyMarkup
+        ? { text: `${ack}\n${dashboard.text}`, replyMarkup: dashboard.replyMarkup }
+        : { text: ack }],
+      commands: [],
+    };
   }
 
   /**

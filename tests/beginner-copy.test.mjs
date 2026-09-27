@@ -42,6 +42,7 @@ import {
   HELP_TEXT,
   unknownCommand,
 } from '../src/beginner-copy.mjs';
+import * as copyModule from '../src/beginner-copy.mjs';
 
 /** Every beginner-visible builder, fed the same hostile label. */
 function everyBuilderOutput(label) {
@@ -246,7 +247,7 @@ describe('beginner copy: /help structure and friendly errors (BEGINNER_UX.md sec
   });
 
   test('/help keeps every existing advanced slash command listed', () => {
-    for (const command of ['/help', '/sessions', '/use', '/status', '/send', '/steer', '/followup', '/abort', '/disconnect']) {
+    for (const command of ['/help', '/sessions', '/use', '/alias', '/status', '/send', '/steer', '/followup', '/abort', '/disconnect']) {
       assert.ok(HELP_TEXT.includes(command), `the advanced help must keep ${command}`);
     }
   });
@@ -301,6 +302,7 @@ const MODULE_ROOT = fileURLToPath(new URL('..', import.meta.url));
 // Normalise once so multi-line literal searches work on CRLF checkouts too.
 const SETUP_SOURCE = readFileSync(join(MODULE_ROOT, 'scripts', 'setup.ps1'), 'utf8').replaceAll('\r\n', '\n');
 const DOC_SOURCE = readFileSync(join(MODULE_ROOT, 'docs', 'BEGINNER_UX.md'), 'utf8');
+const ADVANCED_DOC_SOURCE = readFileSync(join(MODULE_ROOT, 'docs', 'ADVANCED.md'), 'utf8');
 
 /** MSG-S12: a missing Pi is a warning with the next action, never a blocker. */
 const PI_MISSING_LINES = [
@@ -428,5 +430,46 @@ describe('beginner copy: setup.ps1 unsafe-folder refusals (MSG-E5, MSG-E6)', () 
       const statusArea = DOC_SOURCE.slice(marker, marker + 400);
       assert.match(statusArea, /implemented/i, `${id} must be marked implemented`);
     }
+  });
+});
+
+describe('beginner copy: per-session /alias (T4C2)', () => {
+  test('the fixed /alias replies are stable and jargon-free', () => {
+    assert.equal(copyModule.aliasSaved, 'Alias saved.');
+    assert.equal(copyModule.aliasCleared, 'Alias cleared.');
+    assert.equal(
+      copyModule.aliasNoSelection,
+      'No Pi window is selected. Send /projects, pick one, then try /alias <name> again.',
+    );
+    assert.equal(
+      copyModule.aliasInvalid,
+      "That name can't be used. Use up to 64 normal characters and try again.",
+    );
+    assert.equal(
+      copyModule.aliasFailed,
+      'The alias could not be saved right now. Try again in a moment.',
+    );
+    const lines = [
+      copyModule.aliasSaved,
+      copyModule.aliasCleared,
+      copyModule.aliasNoSelection,
+      copyModule.aliasInvalid,
+      copyModule.aliasFailed,
+    ];
+    for (const line of lines) {
+      for (const word of JARGON) {
+        assert.doesNotMatch(line, new RegExp(word.replace(' ', '\\s+'), 'i'),
+          `jargon "${word}" leaked into /alias copy`);
+      }
+    }
+  });
+
+  test('advanced help documents /alias <name>', () => {
+    assert.ok(HELP_TEXT.includes('/alias <name>'), 'the advanced help must list /alias <name>');
+  });
+
+  test('docs/ADVANCED.md documents the /alias command', () => {
+    assert.match(ADVANCED_DOC_SOURCE, /`\/alias <name>`/,
+      'the advanced command table must list /alias <name>');
   });
 });
