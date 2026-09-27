@@ -42,26 +42,16 @@ function New-BrokerServiceTaskSettings {
 
 <#
 .SYNOPSIS
-Builds the logon trigger with a five-minute repetition interval. The
-repetition is the SELF-HEAL path: RestartOnFailure (kept as a second line
-of defence) is not trusted, because it failed to relaunch the broker on
-the real machine after a STATUS_CONTROL_C_EXIT death. Task Scheduler
-re-fires a repeated logon trigger every 5 minutes regardless of how the
-previous run ended, and MultipleInstances=IgnoreNew (asserted below)
-makes each repetition a no-op while the broker is healthy and a relaunch
-when it is dead.
-PowerShell 5.1 cannot set a repetition directly on a logon trigger
-(mutating its CIM Repetition object throws), so the repetition object is
-built on a throwaway -Once trigger and copied over. No repetition
-duration is set, so the repetition never expires.
+Builds the PLAIN logon trigger with NO repetition. The broker is strictly
+on-demand: a sign-in may start it while the task is enabled, and the
+owner's explicit start may start it, but nothing re-fires it on a
+schedule. A repetition would be a scheduled self-heal path, which the
+owner requirement forbids; unexpected exits are covered by the bounded
+RestartOnFailure policy in New-BrokerServiceTaskSettings instead.
 #>
 function New-BrokerServiceTaskTrigger {
     param([Parameter(Mandatory = $true)][string]$UserIdentity)
-    $logonTrigger = New-ScheduledTaskTrigger -AtLogOn -User $UserIdentity
-    $repetitionSource = New-ScheduledTaskTrigger -Once -At (Get-Date) `
-        -RepetitionInterval (New-TimeSpan -Minutes 5)
-    $logonTrigger.Repetition = $repetitionSource.Repetition
-    return $logonTrigger
+    return New-ScheduledTaskTrigger -AtLogOn -User $UserIdentity
 }
 
 <#
@@ -70,9 +60,10 @@ Writes the GENERATED hidden-launcher VBS at -LauncherPath: a wscript.exe
 (GUI subsystem) script that spawns node.exe with window style 0, so no
 console window ever appears. A closed window can no longer kill the
 broker with CTRL_CLOSE. The Run call WAITS (bWaitOnReturn True) so the
-task instance stays Running while the broker lives and IgnoreNew keeps
-blocking the five-minute self-heal repetition, preserving the exact
-concurrency semantics of the old direct node.exe action. The file is a
+task instance stays Running while the broker lives, which keeps the task
+state truthful, and MultipleInstances=IgnoreNew prevents a duplicate
+instance. The task carries no scheduled repetition: the broker runs
+strictly on demand. The file is a
 generated artifact (gitignored .local directory), never a committed
 source file. The command line is built with a format string and every
 embedded quote is doubled for the VBS string literal.
@@ -99,8 +90,9 @@ function New-BrokerServiceHiddenLauncher {
         ''' appears, and window style 0 hides the node.exe console too: a closed'
         ''' window can no longer kill the broker with CTRL_CLOSE. bWaitOnReturn'
         ''' (True) keeps the task instance Running while the broker lives, so'
-        ''' MultipleInstances=IgnoreNew keeps blocking the five-minute self-heal'
-        ''' repetition exactly as the direct node.exe action did.'
+        ''' the task state stays truthful and MultipleInstances=IgnoreNew'
+        ''' prevents a duplicate instance. The task carries no scheduled'
+        ''' repetition: the broker runs strictly on demand.'
         $runLine
     )
     $content = (($lines -join "`r`n") + "`r`n")
@@ -139,7 +131,9 @@ function New-BrokerServiceTaskAction {
 <#
 .SYNOPSIS
 Fail-closed readback of the registered XML. Construction success is not
-enough: Task Scheduler must persist the settings that keep one broker alive.
+enough: Task Scheduler must persist the settings that keep one broker
+alive AND no <Repetition> anywhere, because the broker is strictly
+on-demand.
 #>
 function Assert-BrokerServiceTaskXml {
     param([Parameter(Mandatory = $true)][string]$TaskXml)
@@ -155,9 +149,6 @@ function Assert-BrokerServiceTaskXml {
         '<StartWhenAvailable>\s*true\s*</StartWhenAvailable>',
         '<RestartOnFailure>[\s\S]*?<Interval>\s*PT1M\s*</Interval>',
         '<RestartOnFailure>[\s\S]*?<Count>\s*3\s*</Count>',
-        # The repetition must be INSIDE the logon trigger: a repetition
-        # anywhere else in the document does not re-fire the logon start.
-        '<LogonTrigger>(?:(?!</LogonTrigger>)[\s\S])*?<Repetition>(?:(?!</Repetition>)[\s\S])*?<Interval>\s*PT5M\s*</Interval>',
         # The action must be the hidden launcher: System32 wscript.exe
         # running the generated .local\broker-launch.vbs, never a console
         # node.exe whose window can kill the broker on close. The persisted
@@ -168,6 +159,14 @@ function Assert-BrokerServiceTaskXml {
     foreach ($pattern in $required) {
         if ($TaskXml -notmatch $pattern) {
             throw "registered task settings verification failed ($pattern)"
+        }
+    }
+    # The broker is strictly on-demand: ANY <Repetition> in the persisted
+    # XML would re-fire the task on a schedule, which the owner forbids.
+    # Fail closed no matter where in the document the element appears.
+    foreach ($pattern in @('<Repetition>')) {
+        if ($TaskXml -match $pattern) {
+            throw "registered task settings verification failed (forbidden: $pattern)"
         }
     }
     return $true

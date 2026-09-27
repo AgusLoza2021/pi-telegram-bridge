@@ -85,13 +85,46 @@ describe('broker service task settings', () => {
     assert.equal(settings.startWhenAvailable, true);
   });
 
+  test('trigger builder installs a plain logon trigger with no repetition', () => {
+    const start = COMMON_SOURCE.indexOf('function New-BrokerServiceTaskTrigger {');
+    const end = COMMON_SOURCE.indexOf('\n}\n', start);
+    assert.ok(start >= 0 && end > start);
+    const builder = COMMON_SOURCE.slice(start, end);
+    assert.match(builder, /New-ScheduledTaskTrigger -AtLogOn -User \$UserIdentity/,
+      'the trigger must be a plain logon trigger for the given user');
+    assert.doesNotMatch(builder, /Repetition|RepetitionInterval|-Once/,
+      'the builder must install no repetition: the broker is strictly on-demand');
+  });
+
+  test('Windows PowerShell 5.1 builds the plain logon trigger with no repetition', { skip: !IS_WIN }, () => {
+    const command = [
+      `. ${quotePs(COMMON)}`,
+      "$t = New-BrokerServiceTaskTrigger -UserIdentity 'BROKERTESTUSER'",
+      '  $rep = $t.Repetition',
+      '  $interval = ""',
+      '  if ($null -ne $rep) { $p = $rep.PSObject.Properties[\'Interval\']; if ($null -ne $p) { $interval = "$($p.Value)" } }',
+      '[PSCustomObject]@{',
+      '  triggerType = $t.CimClass.CimClassName',
+      '  repetitionInterval = $interval',
+      '} | ConvertTo-Json -Compress',
+    ].join('\r\n');
+    const trigger = JSON.parse(ps(command));
+    assert.equal(trigger.triggerType, 'MSFT_TaskLogonTrigger');
+    assert.doesNotMatch(trigger.repetitionInterval, /PT\d/,
+      'the constructed trigger must carry no repetition interval');
+  });
+
+  test('generated VBS Run call waits on the broker so the task state stays truthful', () => {
+    assert.match(COMMON_SOURCE, /'CreateObject\("WScript\.Shell"\)\.Run "\{0\}", 0, True'/,
+      'the launcher Run call must use window style 0 AND bWaitOnReturn True');
+    assert.doesNotMatch(COMMON_SOURCE, /, 0, False'/,
+      'the launcher must never run the broker without waiting');
+  });
+
   test('registered XML verifier accepts the safe shape and rejects idle-stop regression', { skip: !IS_WIN }, () => {
-    // The accept fixture carries the REAL persisted logon-trigger repetition
-    // fragment from the PiTelegramBridgeRepetitionProbe probe (Task Scheduler
-    // persisted Interval PT5M with NO Duration element inside <LogonTrigger>).
-    const logonTriggerWithRepetition = '<Triggers><LogonTrigger>'
-      + '<Repetition><Interval>PT5M</Interval><StopAtDurationEnd>true</StopAtDurationEnd></Repetition>'
-      + '</LogonTrigger></Triggers>';
+    // The accept fixture is the strict on-demand shape: a PLAIN logon
+    // trigger with no repetition anywhere in the document.
+    const plainLogonTrigger = '<Triggers><LogonTrigger></LogonTrigger></Triggers>';
     const good = '<Task><Settings>'
       + '<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>'
       + '<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>'
@@ -101,7 +134,7 @@ describe('broker service task settings', () => {
       + '<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>'
       + '<RestartOnFailure><Interval>PT1M</Interval><Count>3</Count></RestartOnFailure>'
       + '</Settings>'
-      + logonTriggerWithRepetition
+      + plainLogonTrigger
       + TASK_ACTIONS_FRAGMENT
       + '</Task>';
     const command = [
@@ -117,7 +150,41 @@ describe('broker service task settings', () => {
     assert.equal(ps(command), 'OK');
   });
 
-  test('registered XML verifier rejects a logon trigger without the five-minute repetition', { skip: !IS_WIN }, () => {
+  test('registered XML verifier rejects a repetition anywhere in the persisted XML', { skip: !IS_WIN }, () => {
+    // The broker is strictly on-demand: ANY <Repetition> in the persisted
+    // XML would re-fire the task on a schedule, so the verifier must fail
+    // closed wherever the element appears - inside the logon trigger or
+    // anywhere else in the document.
+    const base = '<Task><Settings>'
+      + '<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>'
+      + '<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>'
+      + '<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>'
+      + '<StartWhenAvailable>true</StartWhenAvailable>'
+      + '<IdleSettings><StopOnIdleEnd>false</StopOnIdleEnd></IdleSettings>'
+      + '<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>'
+      + '<RestartOnFailure><Interval>PT1M</Interval><Count>3</Count></RestartOnFailure>'
+      + '</Settings>';
+    const repetition = '<Repetition><Interval>PT5M</Interval><StopAtDurationEnd>true</StopAtDurationEnd></Repetition>';
+    const command = [
+      `. ${quotePs(COMMON)}`,
+      `$base = ${quotePs(base)}`,
+      `$repetition = ${quotePs(repetition)}`,
+      `$inTrigger = $base + "<Triggers><LogonTrigger>" + $repetition + "</LogonTrigger></Triggers>" + ${quotePs(TASK_ACTIONS_FRAGMENT)}`,
+      `$outside = $base + $repetition + "<Triggers><LogonTrigger></LogonTrigger></Triggers>" + ${quotePs(TASK_ACTIONS_FRAGMENT)}`,
+      'foreach ($xml in @($inTrigger, $outside)) {',
+      '  $rejected = $false',
+      '  try { Assert-BrokerServiceTaskXml -TaskXml $xml | Out-Null } catch { $rejected = $true }',
+      '  if (-not $rejected) { throw "persisted repetition was accepted" }',
+      '}',
+      'Write-Output "OK"',
+    ].join('; ');
+    assert.equal(ps(command), 'OK');
+  });
+
+  test('registered XML verifier rejects a direct node.exe action (hidden launcher required)', { skip: !IS_WIN }, () => {
+    // The task action must be the hidden wscript.exe launcher, never a
+    // console node.exe whose window can kill the broker on close: mutating
+    // the action command to node.exe must fail the persisted-XML check.
     const good = '<Task><Settings>'
       + '<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>'
       + '<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>'
@@ -133,36 +200,11 @@ describe('broker service task settings', () => {
     const command = [
       `. ${quotePs(COMMON)}`,
       `$good = ${quotePs(good)}`,
+      'Assert-BrokerServiceTaskXml -TaskXml $good | Out-Null',
+      '$directNode = $good.Replace("wscript.exe", "node.exe")',
       '$rejected = $false',
-      'try { Assert-BrokerServiceTaskXml -TaskXml $good | Out-Null } catch { $rejected = $true }',
-      'if (-not $rejected) { throw "missing logon-trigger repetition was accepted" }',
-      'Write-Output "OK"',
-    ].join('; ');
-    assert.equal(ps(command), 'OK');
-  });
-
-  test('registered XML verifier anchors the repetition inside the logon trigger, not anywhere in the document', { skip: !IS_WIN }, () => {
-    // A repetition OUTSIDE the logon trigger must not satisfy the check:
-    // only a repetition inside <LogonTrigger> re-fires the logon start.
-    const misplaced = '<Task><Settings>'
-      + '<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>'
-      + '<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>'
-      + '<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>'
-      + '<StartWhenAvailable>true</StartWhenAvailable>'
-      + '<IdleSettings><StopOnIdleEnd>false</StopOnIdleEnd></IdleSettings>'
-      + '<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>'
-      + '<RestartOnFailure><Interval>PT1M</Interval><Count>3</Count></RestartOnFailure>'
-      + '</Settings>'
-      + '<Repetition><Interval>PT5M</Interval><StopAtDurationEnd>true</StopAtDurationEnd></Repetition>'
-      + '<Triggers><LogonTrigger></LogonTrigger></Triggers>'
-      + TASK_ACTIONS_FRAGMENT
-      + '</Task>';
-    const command = [
-      `. ${quotePs(COMMON)}`,
-      `$misplaced = ${quotePs(misplaced)}`,
-      '$rejected = $false',
-      'try { Assert-BrokerServiceTaskXml -TaskXml $misplaced | Out-Null } catch { $rejected = $true }',
-      'if (-not $rejected) { throw "repetition outside the logon trigger was accepted" }',
+      'try { Assert-BrokerServiceTaskXml -TaskXml $directNode | Out-Null } catch { $rejected = $true }',
+      'if (-not $rejected) { throw "direct node.exe action was accepted" }',
       'Write-Output "OK"',
     ].join('; ');
     assert.equal(ps(command), 'OK');
@@ -210,7 +252,7 @@ describe('broker service task settings', () => {
         `arguments must contain the quoted launcher path, got: ${result.arguments}`);
       assert.equal(result.workingDirectory, tmp);
       assert.match(result.vbs, /^' Pi Telegram Bridge - hidden broker launcher \(generated; do not edit\)\./);
-      assert.ok(result.vbs.includes(', 0, True'), 'the Run call must use window style 0 AND wait, so the task stays Running and IgnoreNew keeps blocking the self-heal repetition');
+      assert.ok(result.vbs.includes(', 0, True'), 'the Run call must use window style 0 AND wait, so the task state stays truthful and IgnoreNew prevents a duplicate instance');
       assert.ok(result.vbs.includes(`""${nodeExe}""`),
         'the node invocation must carry doubled quotes inside the VBS string literal');
       assert.ok(result.vbs.includes(`--state-dir ""${stateRoot}""`),

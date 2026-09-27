@@ -80,6 +80,8 @@ The task is registered **disabled** by whichever setup path registers it: the Be
 Once enabled, the task:
 
 - starts at user logon and when explicitly requested;
+- runs through a hidden `wscript.exe` launcher whose generated script waits on the broker (bWaitOnReturn True), so the task state stays truthful while the broker lives and `IgnoreNew` prevents duplicate instances;
+- carries no repetition on its logon trigger: nothing re-fires the broker on a schedule, it runs strictly on demand;
 - does not stop when the PC leaves Task Scheduler's idle state;
 - has no execution-time limit;
 - ignores duplicate start requests while one instance is running;

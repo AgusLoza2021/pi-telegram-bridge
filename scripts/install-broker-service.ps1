@@ -12,6 +12,8 @@
 #   can no longer kill the broker). Working directory = module root. No
 #   token, no Telegram ids, no credential material in the task XML, argv
 #   or environment.
+# - Trigger: plain AtLogOn for the current user with NO repetition: the
+#   broker runs strictly on demand, and nothing re-fires it on a schedule.
 # - Idempotent: an existing task is exported to a dated XML backup under
 #   .local\backups and re-registered in place; backups are never deleted.
 # - Prerequisites: Windows PowerShell 5.1+, Node 24+, confined state
@@ -97,10 +99,11 @@ if ($credentialsPresent) {
     Write-Host 'SETUP_REQUIRED - credentials are missing; the task was registered DISABLED.'
     Write-Host 'Run scripts/setup.ps1 to enroll, then turn the connection on with "telegram on".'
 }
-Write-Host "Task: $taskName (logon trigger, current user, Interactive, Limited)."
+Write-Host "Task: $taskName (logon trigger, current user, Interactive, Limited, no repetition)."
+Write-Host "Trigger: plain AtLogOn without repetition - the broker runs on demand only."
 Write-Host "Node: $nodeExe"
 Write-Host "Broker: $brokerScript"
-Write-Host "Launcher: $((Join-Path $moduleRoot '.local\broker-launch.vbs'))"
+Write-Host "Launcher: $((Join-Path $moduleRoot '.local\broker-launch.vbs')) (hidden wscript.exe VBS that waits on the broker)."
 Write-Host "State: $stateRoot"
 Write-Host "Manifest: $(Get-BrokerServiceManifestPath)"
 

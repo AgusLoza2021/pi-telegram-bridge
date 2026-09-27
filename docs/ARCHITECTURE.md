@@ -136,7 +136,8 @@ A generated `index.ts` binds that installation to the selected local state direc
 `PiTelegramBridgeBroker` runs as the current interactive user with limited privileges. The registered settings are verified after installation:
 
 - registered disabled initially: the Beginner path never enables or starts it, the advanced path asks once at the end (default No), and the on/off switch owns the enable bit — once turned off with `telegram off`, a sign-in stays off until the owner runs `telegram on` again;
-- logon trigger for the current user;
+- plain logon trigger for the current user with no repetition (strictly on-demand);
+- hidden `wscript.exe` launcher that waits on the broker (bWaitOnReturn True) so the task state stays truthful and `IgnoreNew` prevents duplicates;
 - no stop-on-idle or battery termination;
 - unlimited execution duration;
 - one active instance (`IgnoreNew`);
