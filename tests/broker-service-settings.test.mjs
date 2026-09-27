@@ -15,12 +15,14 @@ const INSTALLER_SOURCE = readFileSync(INSTALLER, 'utf8').replaceAll('\r\n', '\n'
 const IS_WIN = process.platform === 'win32';
 // Task action fragment added to every inline XML fixture: the verifier must
 // require the wscript.exe hidden-launcher action, so the fixtures must carry
-// one for the accept case to stay meaningful.
-const TASK_ACTIONS_FRAGMENT = '<Actions><Action>'
-  + '<Exec>C:\\Windows\\System32\\wscript.exe</Exec>'
+// one for the accept case to stay meaningful. The shape mirrors what Task
+// Scheduler actually persists: <Exec> is a CONTAINER with <Command> inside,
+// and Windows uppercases the SystemRoot segment (C:\WINDOWS\System32).
+const TASK_ACTIONS_FRAGMENT = '<Actions Context="Author"><Exec>'
+  + '<Command>C:\\WINDOWS\\System32\\wscript.exe</Command>'
   + '<Arguments>"C:\\proj\\.local\\broker-launch.vbs"</Arguments>'
   + '<WorkingDirectory>C:\\proj</WorkingDirectory>'
-  + '</Action></Actions>';
+  + '</Exec></Actions>';
 
 function ps(command) {
   const result = spawnSync('powershell.exe', [
@@ -208,7 +210,7 @@ describe('broker service task settings', () => {
         `arguments must contain the quoted launcher path, got: ${result.arguments}`);
       assert.equal(result.workingDirectory, tmp);
       assert.match(result.vbs, /^' Pi Telegram Bridge - hidden broker launcher \(generated; do not edit\)\./);
-      assert.ok(result.vbs.includes(', 0, False'), 'the Run call must use window style 0 and not wait');
+      assert.ok(result.vbs.includes(', 0, True'), 'the Run call must use window style 0 AND wait, so the task stays Running and IgnoreNew keeps blocking the self-heal repetition');
       assert.ok(result.vbs.includes(`""${nodeExe}""`),
         'the node invocation must carry doubled quotes inside the VBS string literal');
       assert.ok(result.vbs.includes(`--state-dir ""${stateRoot}""`),

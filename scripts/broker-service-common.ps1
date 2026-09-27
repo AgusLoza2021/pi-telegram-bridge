@@ -69,11 +69,13 @@ function New-BrokerServiceTaskTrigger {
 Writes the GENERATED hidden-launcher VBS at -LauncherPath: a wscript.exe
 (GUI subsystem) script that spawns node.exe with window style 0, so no
 console window ever appears. A closed window can no longer kill the
-broker with CTRL_CLOSE, and the five-minute logon-trigger self-heal
-relaunch never flashes one. The file is a generated artifact (gitignored
-.local directory), never a committed source file. The command line is
-built with a format string and every embedded quote is doubled for the
-VBS string literal.
+broker with CTRL_CLOSE. The Run call WAITS (bWaitOnReturn True) so the
+task instance stays Running while the broker lives and IgnoreNew keeps
+blocking the five-minute self-heal repetition, preserving the exact
+concurrency semantics of the old direct node.exe action. The file is a
+generated artifact (gitignored .local directory), never a committed
+source file. The command line is built with a format string and every
+embedded quote is doubled for the VBS string literal.
 #>
 function New-BrokerServiceHiddenLauncher {
     param(
@@ -88,15 +90,17 @@ function New-BrokerServiceHiddenLauncher {
         }
     }
     $vbsCommand = '""{0}"" ""{1}"" --state-dir ""{2}""' -f $NodeExe, $BrokerScript, $StateRoot
-    $runLine = 'CreateObject("WScript.Shell").Run "{0}", 0, False' -f $vbsCommand
+    $runLine = 'CreateObject("WScript.Shell").Run "{0}", 0, True' -f $vbsCommand
     # Lines are joined explicitly: Windows PowerShell 5.1 cannot parse
     # here-strings in an LF-ended source file, so no here-string here.
     $lines = @(
         ''' Pi Telegram Bridge - hidden broker launcher (generated; do not edit).'
         ''' wscript.exe hosts this GUI-subsystem script, so no console window ever'
         ''' appears, and window style 0 hides the node.exe console too: a closed'
-        ''' window can no longer kill the broker with CTRL_CLOSE, and the'
-        ''' five-minute self-heal relaunch never flashes one.'
+        ''' window can no longer kill the broker with CTRL_CLOSE. bWaitOnReturn'
+        ''' (True) keeps the task instance Running while the broker lives, so'
+        ''' MultipleInstances=IgnoreNew keeps blocking the five-minute self-heal'
+        ''' repetition exactly as the direct node.exe action did.'
         $runLine
     )
     $content = (($lines -join "`r`n") + "`r`n")
@@ -156,8 +160,9 @@ function Assert-BrokerServiceTaskXml {
         '<LogonTrigger>(?:(?!</LogonTrigger>)[\s\S])*?<Repetition>(?:(?!</Repetition>)[\s\S])*?<Interval>\s*PT5M\s*</Interval>',
         # The action must be the hidden launcher: System32 wscript.exe
         # running the generated .local\broker-launch.vbs, never a console
-        # node.exe whose window can kill the broker on close.
-        '<Exec>[^<]*\\wscript\.exe</Exec>',
+        # node.exe whose window can kill the broker on close. The persisted
+        # XML nests the program inside <Exec><Command>...</Command></Exec>.
+        '<Command>[^<]*\\wscript\.exe</Command>',
         '<Arguments>[^<]*broker-launch\.vbs[^<]*</Arguments>'
     )
     foreach ($pattern in $required) {
