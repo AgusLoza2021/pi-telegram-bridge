@@ -4746,3 +4746,212 @@ describe('SelectiveTelegramBroker: alias-aware identity headers (T4B2)', () => {
   });
 });
 
+describe('SelectiveTelegramBroker: T5B integration smoke (one coherent two-window journey)', () => {
+  // Two live windows of ONE project (same cwd) over a real file-backed
+  // Store, so the whole journey runs on durable state.
+  function makeSmokeFixture() {
+    const dir = mkdtempSync(join(TEST_RUNS, 'sel-t5b-'));
+    let t = Date.now();
+    const now = () => t;
+    const store = new Store(join(dir, 'bridge.sqlite'), { now, isProcessAlive: () => true });
+    const clientA = new TuiBridgeClient(store, { staleAfterMs: 30_000 });
+    const clientB = new TuiBridgeClient(store, { staleAfterMs: 30_000 });
+    const connect = (client, id, shortId, label, pid) => assert.equal(
+      client.connect({ ...id, shortId, label, pid, cwd: 'C:/proj/alpha', branch: 'main' }).ok, true,
+    );
+    return {
+      store, clientA, clientB, now,
+      connectA() { connect(clientA, A, 'aaa111', 'alpha', 1111); },
+      connectB() { connect(clientB, B, 'bbb222', 'beta', 2222); },
+      projectKeyOf(id) {
+        const row = store.getTuiSession({ trackingId: id.trackingId, staleCutoff: now() - 30_000 });
+        assert.notEqual(row, null);
+        return row.projectKey;
+      },
+      square: (key) => PROJECT_COLOR_SLOTS[parseInt(key.slice(0, 8), 16) % 8],
+      pollAllCommands: () => [...clientA.poll(A).commands, ...clientB.poll(B).commands],
+      close() { store.close(); },
+    };
+  }
+
+  const newBroker = (fx, api, store = fx.store, logger = () => {}) =>
+    new SelectiveTelegramBroker({ store, api, config: BROKER_CONFIG, now: fx.now, logger });
+
+  async function deliver(broker, api, update) {
+    broker.handleUpdate(update);
+    await broker.flushReplies();
+  }
+
+  /** One button per row on the last rendered dashboard. */
+  const rowButtons = (api) =>
+    (api.sent[api.sent.length - 1].replyMarkup?.inline_keyboard ?? []).map((row) => row[0]);
+
+  const BROKER_STORE_METHODS = [
+    'withTransaction', 'getBrokerTransportOffset', 'advanceBrokerTransportOffset',
+    'recordInbox', 'listTuiSessions', 'listRecentTuiProjects', 'enqueueTuiCommand',
+    'listPendingBrokerTuiEvents', 'acknowledgeTuiEvents',
+    'getSelectedTuiTarget', 'setSelectedTuiTarget', 'clearSelectedTuiTarget',
+    'setTuiSessionAlias',
+  ];
+  const poisonStore = (fx, overrides) => Object.assign(
+    Object.fromEntries(BROKER_STORE_METHODS.map((n) => [n, fx.store[n].bind(fx.store)])),
+    overrides,
+  );
+
+  test('T5B integration smoke: windows, aliases, routing, restart adoption, repeat-tap silence, poisoned history, drain, disconnect, inert Recent, leak scan', async () => {
+    const fx = makeSmokeFixture();
+    try {
+      fx.connectA(); fx.connectB();
+      const keyB = fx.projectKeyOf(B);
+      const square = fx.square(keyB);
+      assert.equal(fx.projectKeyOf(A), keyB, 'both windows share one project identity');
+      const api = makeFakeApi();
+      const broker = newBroker(fx, api);
+      await broker.drainTuiEvents(); // the two auto connected notices
+
+      // 1) Two live windows of one project: separate rows, same color identity.
+      await deliver(broker, api, msg('/projects'));
+      assert.equal(api.sent[api.sent.length - 1].text, copyModule.projectsTitle);
+      let rows = rowButtons(api);
+      for (const [row, name] of [
+        [rows.find((b) => b.callback_data === 'v1:s:aaa111'), 'alpha'],
+        [rows.find((b) => b.callback_data === 'v1:s:bbb222'), 'beta'],
+      ]) {
+        assert.match(row.text, new RegExp(`^🟢 ${square} ${name} \\(main\\) · Available$`),
+          'each live window is its own distinct dashboard row');
+      }
+
+      // 2) Alias each window individually; renaming never selects.
+      await deliver(broker, api, msg('/alias aaa111 window ay'));
+      await deliver(broker, api, msg('/alias bbb222 window bee'));
+      assert.equal(fx.store.getSelectedTuiTarget(), null);
+      rows = rowButtons(api);
+      assert.ok(rows.find((b) => b.callback_data === 'v1:s:aaa111')?.text.includes('window ay'),
+        'the A row itself carries its own alias');
+      assert.ok(rows.find((b) => b.callback_data === 'v1:s:bbb222')?.text.includes('window bee'),
+        'the B row itself carries its own alias');
+
+      // 3) Select B with one dashboard tap; the tap re-renders with ✓.
+      await deliver(broker, api, cb('v1:s:bbb222'));
+      assert.deepEqual(fx.store.getSelectedTuiTarget(), { trackingId: B.trackingId, projectKey: keyB });
+      const selectedRow = rowButtons(api).find((b) => b.callback_data === 'v1:s:bbb222');
+      assert.ok(selectedRow.text.startsWith('✓ ') && selectedRow.text.includes('window bee')
+        && selectedRow.style === 'primary');
+
+      // 4) One ordinary prompt routes ONLY to the selected B.
+      await deliver(broker, api, msg('water the bonsai'));
+      const ack = api.sent[api.sent.length - 1].text;
+      assert.match(ack, /window bee[\s\S]*Prompt queued/);
+      const commands = fx.pollAllCommands();
+      assert.deepEqual(
+        { count: commands.length, to: commands[0]?.trackingId, kind: commands[0]?.kind, text: commands[0]?.payload.text },
+        { count: 1, to: B.trackingId, kind: 'prompt', text: 'water the bonsai' },
+      );
+
+      // 5) Restart over the same file-backed Store: exact durable adoption.
+      const broker2 = newBroker(fx, api);
+      const sentBeforeRestart = api.sent.length;
+      await broker2.start();
+      assert.equal(api.sent.length, sentBeforeRestart, 'adoption itself never sends Telegram');
+      assert.deepEqual(fx.store.getSelectedTuiTarget(), { trackingId: B.trackingId, projectKey: keyB });
+
+      // 6) Five repeated taps on the ALREADY-selected B: zero new dashboards.
+      const sentBeforeTaps = api.sent.length, answeredBefore = api.answered.length;
+      const tapIds = [];
+      for (let i = 0; i < 5; i++) {
+        const update = cb('v1:s:bbb222');
+        tapIds.push(update.callback_query.id);
+        await deliver(broker2, api, update);
+      }
+      assert.equal(api.sent.length, sentBeforeTaps,
+        'a repeated same-target tap must not render another dashboard');
+      assert.deepEqual(api.answered.slice(answeredBefore), tapIds,
+        'every repeated callback query must still be answered');
+      assert.equal(fx.pollAllCommands().length, 0, 'taps enqueue nothing');
+
+      // 7) One poisoned history read: graceful live-only view, fixed log code.
+      const poisoned = poisonStore(fx, {
+        listRecentTuiProjects: () => { throw new Error('simulated history read failure'); },
+      });
+      const poisonedLogs = [];
+      const brokerP = newBroker(fx, api, poisoned, ({ code }) => poisonedLogs.push(code));
+      await deliver(brokerP, api, msg('/projects'));
+      rows = rowButtons(api);
+      assert.equal(rows.length, 4, 'Active header + two live rows + Refresh');
+      assert.deepEqual([rows[0].text, rows[rows.length - 1].text],
+        [copyModule.PROJECT_SECTION_ACTIVE, 'Refresh']);
+      assert.ok(rows.slice(1, -1).some((b) => b.text.includes('window bee')),
+        'the live rows survive the history failure');
+      assert.ok(!rows.some((b) => b.text === copyModule.PROJECT_SECTION_RECENT),
+        'no Recent section renders when the history read fails');
+      assert.deepEqual(poisonedLogs, ['projects_history_unavailable']);
+
+      // 8) Final output: one alias-aware header, whole branch, final keyboard.
+      assert.equal(fx.clientB.publishFinalOutput({ ...B, text: 'z'.repeat(3900) }).ok, true);
+      const sentBeforeDrain = api.sent.length;
+      await broker2.drainTuiEvents();
+      const chunks = api.sent.slice(sentBeforeDrain);
+      assert.ok(chunks.length >= 2, 'the final output must actually be chunked');
+      const header = `${square} Pi · window bee · main`;
+      const occurrences = chunks.reduce((sum, c) => sum + c.text.split(header).length - 1, 0);
+      assert.equal(occurrences, 1, 'exactly one alias-aware identity header across all chunks');
+      assert.ok(chunks[0].text.startsWith(`${header}\n`),
+        'the header leads the first chunk and includes the whole branch');
+      const last = chunks[chunks.length - 1];
+      assert.deepEqual(last.replyMarkup.inline_keyboard.map((row) => row.map((b) => b.text)),
+        [['Projects', 'Disconnect']]);
+      for (let i = 0; i < chunks.length - 1; i++) {
+        assert.equal(chunks[i].replyMarkup, undefined, 'no keyboard on a non-final chunk');
+      }
+      assert.equal(fx.store.listPendingBrokerTuiEvents({ limit: 50 }).length, 0);
+
+      // 9) Disconnect the selected B: it never routes; the same-project A
+      // keeps the project active and takes the text.
+      assert.equal(fx.clientB.disconnect({ ...B }).ok, true);
+      await deliver(broker2, api, msg('/projects'));
+      rows = rowButtons(api);
+      assert.ok(!rows.some((b) => b.text === copyModule.PROJECT_SECTION_RECENT),
+        'the project stays active while A lives: no Recent section, no Recent row');
+      assert.ok(rows.some((b) => b.text.includes('window ay')),
+        'the surviving live window still renders under Active');
+      await deliver(broker2, api, msg('anyone there?'));
+      assert.deepEqual(fx.pollAllCommands().map((c) => c.trackingId), [A.trackingId],
+        'the stale target never routes; the sole live replacement takes the message');
+      assert.equal(fx.clientA.disconnect({ ...A }).ok, true);
+      await broker2.drainTuiEvents();
+
+      // 10) The closed project drops to inert Recent, alias-free, untappable.
+      await deliver(broker2, api, msg('/projects'));
+      rows = rowButtons(api);
+      assert.equal(rows.length, 3, 'Recent header + one project row + Refresh');
+      assert.deepEqual(rows[0], { text: copyModule.PROJECT_SECTION_RECENT, disabled: {} });
+      const recentRow = rows[1];
+      assert.equal(recentRow.callback_data, undefined, 'a Recent row is inert: never routes');
+      assert.deepEqual(recentRow.disabled, {});
+      assert.match(recentRow.text, /^⚪ .+ · Offline$/);
+      assert.doesNotMatch(recentRow.text, /window ay|window bee/,
+        'the Recent row shows the project, never a disconnected session alias');
+
+      // 11) Aggregate leak scan over every visible text and button label.
+      const forbidden = [
+        'aaa111', 'bbb222', A.trackingId, B.trackingId, A.connectionId, B.connectionId,
+        'C:/proj/alpha', '1111', '2222', /\b[0-9a-f]{16,}\b/i, /\bpid\b/i, /pi_session/i,
+      ];
+      const visible = [];
+      for (const record of api.sent) {
+        visible.push(record.text);
+        for (const row of record.replyMarkup?.inline_keyboard ?? []) {
+          for (const button of row) visible.push(button.text);
+        }
+      }
+      assert.ok(visible.length > 10, 'the journey must have produced visible texts');
+      for (const text of visible) {
+        for (const needle of forbidden) {
+          const hit = needle instanceof RegExp ? needle.test(text) : text.includes(needle);
+          assert.ok(!hit, `leaked "${needle}" in: ${JSON.stringify(text)}`);
+        }
+      }
+    } finally { fx.close(); }
+  });
+});
+
