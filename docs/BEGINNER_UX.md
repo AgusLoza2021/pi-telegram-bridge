@@ -1,4 +1,4 @@
-# Beginner UX Contract — Pi ⇄ Telegram on Windows 11 (T01, revised through T5A)
+# Beginner UX Contract — Pi ⇄ Telegram on Windows 11 (T01, revised through T5B2)
 
 Audience: non-technical users first, implementers second. This document is a **two-tier contract**: it separates what a beginner sees today from what is still a design target. Every string in quotes is either exact user-facing copy that exists in the code today (**implemented**) or an agreed target that no code prints yet (**design**). A reader must never have to guess which one they are looking at: every `MSG-…` id carries its status inline, and §0 is the per-id status table. It is documentation only — it adds no runtime behavior by itself. Section 13 maps each UX requirement to the existing safe operations it must be built on.
 
@@ -52,6 +52,7 @@ Project library, identity headers and aliases (T3/T4A/T4B2/T4C — implemented):
 | `MSG-D2` | implemented | `src/beginner-copy.mjs` (`PROJECT_SECTION_ACTIVE`: "Active now", `PROJECT_SECTION_RECENT`: "Recent") |
 | `MSG-D3` | implemented | `src/beginner-copy.mjs` (`projectRowLabel` row grammar, `projectColor` palette, `liveStateMarker`/`liveStateText` state circle and word) |
 | `MSG-D4` | implemented | `src/selective-telegram-broker.mjs` (`Refresh` action row on the dashboard) |
+| `MSG-D5` | implemented | `src/beginner-copy.mjs` (`staleCallbackToast`): "That button is out of date. Open Projects and try again." — callback feedback only, never a chat message |
 | `MSG-H1` | implemented | `src/beginner-copy.mjs` (`identityHeader`) — every finalized answer and every session-targeted acknowledgement (§5); global/help/dashboard/cancel replies without session context stay unprefixed |
 | `MSG-A1` | implemented | `src/selective-telegram-broker.mjs` (`USAGE.alias`) |
 | `MSG-A2` | implemented | `src/beginner-copy.mjs` (`aliasNoSelection`) |
@@ -231,7 +232,7 @@ An ordinary text message (not starting with `/`) from the authorized user.
 
 Hard rules:
 
-- Exactly-once: a pending prompt is dispatched exactly once, deduplicated across retries and duplicate callback presses. The first tap of a current-generation row dispatches the held text **once** and confirms `MSG-P2`; any later tap of that row — after the generation was consumed or replaced — dispatches nothing and re-renders the fresh Projects dashboard (§6.1) as its visible answer. It never re-sends `MSG-P2`, and it is not a silent no-op: the fresh dashboard is the answer.
+- Exactly-once: a pending prompt is dispatched exactly once, deduplicated across retries and duplicate callback presses. The first tap of a current-generation row dispatches the held text **once** and confirms `MSG-P2`; any later tap of that row — after the generation was consumed or replaced — dispatches nothing and sends **no chat message and no replacement dashboard** (§6.1). Instead the tap itself is answered with `MSG-D5` as `answerCallbackQuery` text so the spinner stops. It never re-sends `MSG-P2`, and it is not a silent no-op: the toast is the answer.
 - The pending prompt's text is **never** echoed into button payloads (§10) and never dispatched to a session the user did not pick.
 
 ---
@@ -292,7 +293,7 @@ All beginner buttons are Telegram inline callbacks. Constraints, verifiable per 
 2. **Exact authorization.** Every callback and message is accepted only from the exact enrolled private chat id **and** enrolled user id (both must match); anything else is ignored silently.
 3. **Idempotent / deduped.** Telegram `callback_id`s are answered exactly once; session-choice and pending-dispatch callbacks dedupe so a double-tap cannot dispatch twice or dispatch to two sessions. Command execution keeps the existing exactly-once claim discipline.
 4. **No secrets or prompt text in transit metadata.** The held prompt text lives server-side only, keyed by the pending id; callbacks never contain it. The bot token never appears in any chat, log, callback or payload.
-5. **Fail-closed.** A malformed or oversized callback (including an unknown operation tag) is consumed silently: it is answered and logged, and it never dispatches anything. A dead, stale or ambiguous selection resolves with the friendly stale copy — the named Pi, when the bridge knew it, is reported as just closed or disconnected (`MSG-T5`) — followed by the fresh Projects dashboard (§6.1), or the no-live guidance (`MSG-P3`-family copy) when nothing is left. An expired or consumed pending-prompt generation re-renders the fresh Projects dashboard (§6.1) and never dispatches. None of these paths ever answers with a guess, an error trace, or jargon.
+5. **Fail-closed.** A malformed or oversized callback (including an unknown operation tag) is consumed silently: it is answered and logged, and it never dispatches anything. A dead, stale or ambiguous selection resolves with the friendly stale copy — the named Pi, when the bridge knew it, is reported as just closed or disconnected (`MSG-T5`) — followed by the fresh Projects dashboard (§6.1), or the no-live guidance (`MSG-P3`-family copy) when nothing is left. An expired or consumed pending-prompt generation dispatches nothing and sends no chat message or replacement dashboard: the tap is answered with `MSG-D5` (§7). None of these paths ever answers with a guess, an error trace, or jargon.
 
 ---
 

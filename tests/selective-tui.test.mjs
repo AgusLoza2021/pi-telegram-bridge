@@ -54,6 +54,7 @@ const BROKER_CONFIG = Object.freeze({
 function makeFakeApi() {
   const sent = [];
   const answered = [];
+  const answerPayloads = [];
   let queued = [];
   let failSends = 0;
   let failAnswers = 0;
@@ -61,6 +62,7 @@ function makeFakeApi() {
   return {
     sent,
     answered,
+    answerPayloads,
     queueUpdate(update) { queued.push(update); },
     setWebhook(url) { webhookUrl = url; },
     failNextSends(count) { failSends = count; },
@@ -80,12 +82,13 @@ function makeFakeApi() {
       sent.push(record);
       return { ok: true };
     },
-    async answerCallbackQuery({ callbackQueryId } = {}) {
+    async answerCallbackQuery({ callbackQueryId, text = '' } = {}) {
       if (failAnswers > 0) {
         failAnswers--;
         throw new Error('simulated answer failure');
       }
       answered.push(callbackQueryId);
+      answerPayloads.push({ callbackQueryId, text });
       return { ok: true };
     },
     async getWebhookInfo() { return { url: webhookUrl }; },
@@ -970,19 +973,36 @@ describe('SelectiveTelegramBroker: chooser keyboards + broker-memory pending pro
       const pid = lastPendingId(api);
       await deliver(broker, api, cb(`v1:p:aaa111:${pid}`));
       assert.equal(fx.clientA.poll(A).commands.length, 1);
-      // The second tap arrives as its own update (no inbox dedup), but the
-      // pending generation is already consumed. The first poll above
-      // CONSUMED the command, so the next poll must be empty.
-      await deliver(broker, api, cb(`v1:p:aaa111:${pid}`));
-      assert.equal(fx.clientA.poll(A).commands.length, 0,
-        'the duplicate tap must not enqueue a second command');
-      // The re-render is the safest current dashboard: no pending left, s-buttons.
-      const buttons = lastButtons(api);
-      assert.equal(buttons[0].text, 'Active now');
-      assert.match(buttons[1].text, /alpha · Available/);
-      assert.match(buttons[2].text, /beta · Available/);
-      assert.equal(buttons[3].text, 'Refresh');
-      assert.ok(buttons.filter((b) => (b.callback_data ?? '').startsWith('v1:s:')).length === 2);
+      // The first (current-generation) tap dispatched exactly once and its
+      // own callback answer is the plain no-toast acknowledgement.
+      const sentAfterFirstTap = api.sent.length;
+      const answeredAfterFirstTap = api.answered.length;
+      assert.equal(api.answerPayloads[api.answerPayloads.length - 1].text, '',
+        'the dispatching tap is acknowledged without a toast');
+      // Five subsequent distinct callback updates carrying the SAME old
+      // v1:p data (no inbox dedup: each is its own update and callback id).
+      // The generation is already consumed, so every one must dispatch
+      // nothing, send NO chat message or replacement dashboard, and still
+      // be answered — with the fixed out-of-date toast so the spinner stops.
+      const tapIds = [];
+      for (let i = 0; i < 5; i++) {
+        const update = cb(`v1:p:aaa111:${pid}`);
+        tapIds.push(update.callback_query.id);
+        await deliver(broker, api, update);
+        assert.equal(fx.clientA.poll(A).commands.length, 0,
+          'the duplicate tap must not enqueue a second command');
+      }
+      assert.equal(api.sent.length, sentAfterFirstTap,
+        'consumed-generation taps must never spawn a replacement chat dashboard');
+      assert.deepEqual(api.answered.slice(answeredAfterFirstTap), tapIds,
+        'every distinct tap is still answered so the spinner stops');
+      assert.deepEqual(
+        api.answerPayloads.slice(answeredAfterFirstTap).map((p) => p.text),
+        Array(5).fill(copyModule.staleCallbackToast),
+        'every consumed-generation tap is answered with the exact bounded toast');
+      assert.ok(api.answerPayloads.slice(answeredAfterFirstTap)
+        .every((p, i) => p.callbackQueryId === tapIds[i]),
+      'each toast is bound to its own callback query id');
     } finally { fx.close(); }
   });
 
@@ -1062,13 +1082,12 @@ describe('SelectiveTelegramBroker: chooser keyboards + broker-memory pending pro
       assert.equal(fx.clientA.poll(A).commands.length, 0,
         'a pre-restart keyboard must fail closed, never dispatch');
       assert.equal(fx.clientB.poll(B).commands.length, 0);
-      // The safest re-render with no pending: plain s-buttons.
-      const buttons = lastButtons(restartedApi);
-      assert.equal(buttons[0].text, 'Active now');
-      assert.match(buttons[1].text, /alpha · Available/);
-      assert.match(buttons[2].text, /beta · Available/);
-      assert.equal(buttons[3].text, 'Refresh');
-      assert.ok(buttons.every((b) => !(b.callback_data ?? '').startsWith('v1:p:')));
+      // A consumed generation is never answered with a replacement chat
+      // dashboard: no message at all, just the fixed out-of-date toast.
+      assert.equal(restartedApi.sent.length, 0,
+        'a pre-restart keyboard must not spawn a replacement chat dashboard');
+      assert.equal(restartedApi.answered.length, 1);
+      assert.equal(restartedApi.answerPayloads[0].text, copyModule.staleCallbackToast);
     } finally { fx.close(); }
   });
 

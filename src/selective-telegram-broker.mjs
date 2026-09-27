@@ -385,7 +385,11 @@ export class SelectiveTelegramBroker {
   #pendingReplies = [];
   /** Broker-memory pending prompt {pendingId, text}; a restart loses it fail-closed. */
   #pendingPrompt = null;
-  /** Bounded callback ids waiting for a best-effort answerCallbackQuery. */
+  /**
+   * Bounded callback answers waiting for a best-effort answerCallbackQuery:
+   * objects of the shape { callbackQueryId, text } where text is the
+   * optional toast (empty for every normal callback).
+   */
   #pendingAnswers = [];
 
   // --- lifecycle -----------------------------------------------------------
@@ -624,14 +628,18 @@ export class SelectiveTelegramBroker {
     const { updateId, type, payload } = parsed;
     const inboxId = `tgbroker:${updateId}`;
     const offset = updateId + 1;
-    let callbackAnswerId = null;
+    // { callbackQueryId, text } — the toast is empty for every normal
+    // callback; only the consumed/stale pending-prompt path carries text.
+    let callbackAnswer = null;
     this.#store.withTransaction(() => {
       const first = this.#store.recordInbox({ inboxId, kind: type, payload: { type } });
       if (!first) return; // re-delivery: no repeated planning, no duplicate commands
       if (type === 'callback_query') {
         const plan = this.#planCallback(payload);
         if (plan !== null) {
-          callbackAnswerId = plan.answerId;
+          callbackAnswer = plan.answerId !== null
+            ? { callbackQueryId: plan.answerId, text: plan.answerText ?? '' }
+            : null;
           if (plan.command !== null) {
             const result = this.#store.enqueueTuiCommand({
               trackingId: plan.command.trackingId,
@@ -706,11 +714,12 @@ export class SelectiveTelegramBroker {
       }
       this.#store.advanceBrokerTransportOffset(offset);
     });
-    if (callbackAnswerId !== null) {
+    if (callbackAnswer !== null) {
       // Best-effort feedback, queued only AFTER the transaction (receipt,
-      // commands and offset) committed inside the store.
+      // commands and offset) committed inside the store. Objects carry the
+      // optional toast text next to the id; the queue stays bounded.
       if (this.#pendingAnswers.length < MAX_PENDING_REPLIES) {
-        this.#pendingAnswers.push(callbackAnswerId);
+        this.#pendingAnswers.push(callbackAnswer);
       } else {
         this.#log('reply_overflow');
       }
@@ -784,7 +793,10 @@ export class SelectiveTelegramBroker {
    * queued reply (with or without an inline keyboard) and an optional
    * command to enqueue. Every dead-session, stale-generation, duplicate-tap
    * and malformed case re-renders the safest current chooser (or the
-   * no-live guidance) and never dispatches anything.
+   * no-live guidance) and never dispatches anything — EXCEPT the consumed
+   * or stale pending-prompt generation (T5B2), which sends no chat reply
+   * at all and is answered with the fixed out-of-date toast via
+   * answerText.
    */
   #planCallback(cq) {
     const messageId = isPlainObject(cq.message) ? cq.message : null;
@@ -857,12 +869,16 @@ export class SelectiveTelegramBroker {
         const pending = this.#pendingPrompt;
         if (pending === null || pending.pendingId !== parsed.pendingId) {
           // A second tap, a replaced generation or a keyboard from before a
-          // restart: the generation is consumed, never dispatched.
+          // restart: the generation is consumed, never dispatched. It is
+          // answered with the fixed out-of-date toast and sends NO chat
+          // reply — a stale tap must never spawn a replacement dashboard
+          // (T5B2); the toast is the entire visible answer.
           this.#log('callback_pending_generation_stale');
           return {
             answerId,
-            reply: this.#projectsReply(),
+            reply: null,
             command: null,
+            answerText: copy.staleCallbackToast,
           };
         }
         const live = this.#liveSessions();
@@ -1783,7 +1799,10 @@ export class SelectiveTelegramBroker {
   /**
    * Best-effort answerCallbackQuery flush: runs only when the injected API
    * implements it; a failed answer is dropped without retry and never
-   * replays the command it acknowledged.
+   * replays the command it acknowledged. Each queued answer is an object
+   * { callbackQueryId, text }; the toast text rides along only when a plan
+   * supplied one (consumed/stale pending-prompt taps) and is empty for
+   * every normal callback.
    */
   async #flushCallbackAnswers() {
     if (this.#pendingAnswers.length === 0) return;
@@ -1792,9 +1811,9 @@ export class SelectiveTelegramBroker {
       return;
     }
     while (this.#pendingAnswers.length > 0) {
-      const callbackQueryId = this.#pendingAnswers.shift();
+      const { callbackQueryId, text } = this.#pendingAnswers.shift();
       try {
-        await this.#api.answerCallbackQuery({ callbackQueryId });
+        await this.#api.answerCallbackQuery({ callbackQueryId, text });
       } catch {
         this.#log('callback_answer_failed');
       }

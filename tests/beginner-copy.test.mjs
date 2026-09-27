@@ -203,6 +203,21 @@ describe('beginner copy: busy and action builders (BEGINNER_UX.md sections 8-9)'
     );
   });
 
+  test('staleCallbackToast is the exact out-of-date callback toast, bounded and private', () => {
+    // Pinned exactly once: tests and docs/BEGINNER_UX.md §7/§10 quote this
+    // same sentence — changing it means changing them together.
+    assert.equal(
+      copyModule.staleCallbackToast,
+      'That button is out of date. Open Projects and try again.',
+    );
+    // Telegram caps answerCallbackQuery text at 200 characters.
+    assert.ok(copyModule.staleCallbackToast.length > 0);
+    assert.ok(copyModule.staleCallbackToast.length <= 200);
+    // No ids, no paths, no error details, no jargon — ever.
+    assert.doesNotMatch(copyModule.staleCallbackToast,
+      /v1:|tg:|\bpid\b|[0-9a-f]{8,}|[A-Za-z]:[\\/]|\/(?:[a-z]+)|error|failed|trace/i);
+  });
+
   test('disconnectAsk is the MSG-O1 confirmation', () => {
     assert.equal(disconnectAsk('g'), 'Unlink Pi · g? You can relink it any time from the PC.');
   });

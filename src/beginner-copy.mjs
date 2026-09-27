@@ -232,6 +232,16 @@ export const pendingSaved = 'Your message is saved. Choose which Pi should get i
 /** MSG-P2 — the held prompt was dispatched exactly once. */
 export const pendingSent = (rawLabel) => `Sent to ${displayLabel(rawLabel)}.`;
 
+/**
+ * T5B2 — the ONE fixed callback toast for a consumed or stale
+ * pending-prompt button (v1:p): answered as answerCallbackQuery text, never
+ * a chat message. Pinned exactly once by tests and quoted verbatim by
+ * docs/BEGINNER_UX.md §7/§10 — change all three together. Bounded inside
+ * Telegram's 200-character answerCallbackQuery text cap; carries no ids,
+ * paths or error details.
+ */
+export const staleCallbackToast = 'That button is out of date. Open Projects and try again.';
+
 /** MSG-T5 — the named Pi closed or disconnected (used only when it is known). */
 export const sessionGone = (rawLabel) =>
   `${displayLabel(rawLabel)} just closed or disconnected. Pick another:`;
