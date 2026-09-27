@@ -98,6 +98,32 @@ describe('telegram-api: fixed origin and method contracts', () => {
     await api.close();
   });
 
+  test('sendMessage passes button styles and the native disabled action through reply_markup untouched', async () => {
+    // Telegram Bot API 10.3: InlineKeyboardButton supports style values
+    // primary/success/danger; "disabled" is NOT a style — it is the action
+    // field `disabled: {}` (no callback_data). Both must survive the JSON
+    // request body byte-for-byte, in order, with no dropping and no rewriting.
+    const { calls, fetchImpl } = makeFakeFetch({
+      sendMessage: jsonResponse({ ok: true, result: { message_id: 8 } }),
+    });
+    const api = makeApi(fetchImpl);
+    const replyMarkup = { inline_keyboard: [
+      [{ text: 'Header', disabled: {} }],
+      [{ text: 'Selected', callback_data: 'v1:s:aaa111', style: 'primary' }],
+      [{ text: 'Available', callback_data: 'v1:s:bbb222', style: 'success' }],
+      [{ text: 'Disconnect', callback_data: 'v1:d:aaa111', style: 'danger' }],
+      [{ text: 'Default', callback_data: 'v1:s:ccc333' }],
+    ] };
+    await api.sendMessage({ chatId: 202, text: 'Your Pi projects', replyMarkup });
+    assert.deepEqual(calls[0].body.reply_markup, replyMarkup,
+      'every style value and the disabled action must survive serialization exactly as rendered');
+    const buttons = calls[0].body.reply_markup.inline_keyboard.flat();
+    assert.deepEqual(buttons[0], { text: 'Header', disabled: {} },
+      'disabled must travel as the action field, never as a style value');
+    assert.deepEqual(buttons.slice(1).map((b) => b.style), ['primary', 'success', 'danger', undefined]);
+    await api.close();
+  });
+
   test('answerCallbackQuery posts callback_query_id with bounded text', async () => {
     const { calls, fetchImpl } = makeFakeFetch({
       answerCallbackQuery: jsonResponse({ ok: true, result: true }),

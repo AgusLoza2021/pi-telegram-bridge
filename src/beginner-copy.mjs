@@ -51,6 +51,27 @@ function clip(text, maxChars) {
   return typeof text === 'string' ? (text.length > maxChars ? text.slice(0, maxChars) : text) : '';
 }
 
+/** Clip by Unicode code points so a surrogate pair is never split. */
+function clipCodePoints(text, maxCodePoints) {
+  if (typeof text !== 'string' || text.length <= maxCodePoints) return clip(text, maxCodePoints);
+  let units = 0;
+  let out = '';
+  for (const ch of text) {
+    units += ch.length;
+    if (units > maxCodePoints) break;
+    out += ch;
+  }
+  return out;
+}
+
+/** Strip unpaired surrogates so a hostile name can never produce one. */
+function stripLoneSurrogates(text) {
+  return text.replace(
+    /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g,
+    '',
+  );
+}
+
 /**
  * Bounded readable display label: `Pi · <label>`. Collapses sanitization
  * whitespace, falls back to plain `Pi`, never doubles an existing prefix
@@ -90,13 +111,104 @@ export const plainNoLive =
 
 /** MSG-P1 — the prompt is held until one Pi is chosen. */
 export const pendingSaved = 'Your message is saved. Choose which Pi should get it:';
-
 /** MSG-P2 — the held prompt was dispatched exactly once. */
 export const pendingSent = (rawLabel) => `Sent to ${displayLabel(rawLabel)}.`;
 
 /** MSG-T5 — the named Pi closed or disconnected (used only when it is known). */
 export const sessionGone = (rawLabel) =>
   `${displayLabel(rawLabel)} just closed or disconnected. Pick another:`;
+
+// --- Projects dashboard (T3) -------------------------------------------------/
+
+/** Projects card button: opens or refreshes the Projects dashboard. */
+export const BUTTON_PROJECTS = 'Projects';
+
+/** Dashboard section headers (rendered as disabled, inert rows). */
+export const PROJECT_SECTION_ACTIVE = 'Active now';
+export const PROJECT_SECTION_RECENT = 'Recent';
+
+/** Dashboard title (MSG-T4 replaced by the dashboard on the multi-session path). */
+export const projectsTitle = 'Your Pi projects';
+
+/**
+ * Stable per-project palette by color slot 0..7 (mirrors the store's
+ * `colorSlot` derivation: first 8 hex chars of the project key mod 8).
+ * Color is never the only signal: every row also carries a state marker
+ * and state text.
+ */
+export const PROJECT_COLOR_SLOTS = [
+  '🟦', // slot 0
+  '🟪', // slot 1
+  '🟧', // slot 2
+  '🟩', // slot 3
+  '🟨', // slot 4
+  '🟫', // slot 5
+  '⬛', // slot 6
+  '⬜', // slot 7
+];
+
+/** Neutral fallback for a missing or malformed color slot. */
+export const PROJECT_COLOR_FALLBACK = '⬜';
+
+export function projectColor(colorSlot) {
+  return Number.isInteger(colorSlot)
+    && colorSlot >= 0
+    && colorSlot < PROJECT_COLOR_SLOTS.length
+    ? PROJECT_COLOR_SLOTS[colorSlot]
+    : PROJECT_COLOR_FALLBACK;
+}
+
+/**
+ * Live state presentation: a marker plus state text, so the color glyph is
+ * never the only signal. Unknown or missing states fall back to offline.
+ */
+export function liveStateMarker(state) {
+  switch (state) {
+    case 'connected': return '🟢';
+    case 'busy':
+    case 'waiting': return '🟡';
+    default: return '⚪';
+  }
+}
+
+export function liveStateText(state) {
+  switch (state) {
+    case 'connected': return 'Available';
+    case 'busy': return 'Working';
+    case 'waiting': return 'Waiting';
+    default: return 'Offline';
+  }
+}
+
+/**
+ * One dashboard row label:
+ * `[✓ ]<state marker> <project color> <name>[ (<branch>)] · <state text>`.
+ * Budgeted to one Telegram button: the state word and the selected prefix
+ * always survive; the branch is truncated, then dropped entirely, before the
+ * name is trimmed. Clipping splits code points, never surrogate pairs, and
+ * sanitized against cwd/id/pid leakage, with neutral fallbacks for missing
+ * or malformed pieces — never throws.
+ */
+export function projectRowLabel({
+  selected = false, colorSlot = null, state = null, offline = false, name, branch = null,
+} = {}) {
+  const marker = offline ? '⚪' : liveStateMarker(state);
+  const stateText = offline ? 'Offline' : liveStateText(state);
+  const prefix = selected === true ? '✓ ' : '';
+  const color = projectColor(colorSlot);
+  // Fixed skeleton: prefix + "<marker> <color> " + name + " · " + stateText.
+  const fixedUnits = prefix.length + marker.length + 1 + color.length + 1 + 3 + stateText.length;
+  const nameBudget = Math.max(1, MAX_BUTTON_TEXT_CHARS - fixedUnits);
+  const dashboardName = clipCodePoints(stripLoneSurrogates(sanitizeLabelPart(name)), nameBudget) || 'Pi';
+  // The branch only appears when it fits entirely between the name and state.
+  let branchText = '';
+  if (typeof branch === 'string') {
+    const branchLabel = clipCodePoints(stripLoneSurrogates(sanitizeLabelPart(branch).replace(/\s+/g, '-')), nameBudget);
+    const room = MAX_BUTTON_TEXT_CHARS - fixedUnits - dashboardName.length - 3; // ' (x)'
+    if (branchLabel.length > 0 && branchLabel.length <= room) branchText = ` (${branchLabel})`;
+  }
+  return `${prefix}${marker} ${color} ${dashboardName}${branchText} · ${stateText}`;
+}
 
 // --- chooser / busy cards (BEGINNER_UX.md sections 7-8) ----------------------
 
@@ -130,7 +242,6 @@ export const busyDiscard =
 
 export const BUTTON_STATUS = 'Status';
 export const BUTTON_STOP = 'Stop the task';
-export const BUTTON_CHANGE_PI = 'Change Pi';
 export const BUTTON_DISCONNECT = 'Disconnect';
 export const DISCONNECT_BUTTON = 'Unlink';
 export const CANCEL_BUTTON = 'Cancel';
@@ -217,6 +328,7 @@ const BEGINNER_HELP_SENTENCES = [
 export const ADVANCED_HELP_LINES = [
   'Advanced commands:',
   '/help - this help',
+  '/projects - show your projects and pick one',
   '/sessions - live connected TUIs',
   '/use <shortId> - select the active TUI for this broker',
   '/status [shortId] - request session status',

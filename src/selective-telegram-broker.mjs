@@ -29,9 +29,9 @@
 //   and no selection it fails closed with a choice notice and NEVER
 //   guesses or exposes short ids.
 // - Inline keyboards exist ONLY for the T03a/T03b bounded cards: the
-//   session chooser (v1:r, v1:s:<sid>, v1:p:<sid>:<pid>), the busy
-//   decision card (v1:f/t/a:<sid>:<pid>, v1:n:<pid>) and the action
-//   keyboards (v1:q/x/d/D:<sid>, v1:c, v1:C). Data never carries labels,
+//   Projects dashboard (v1:r, v1:s:<sid>, v1:p:<sid>:<pid>, v1:c),
+//   the busy decision card (v1:f/t/a:<sid>:<pid>, v1:n:<pid>) and the action
+//   keyboards (v1:q/x/d/D:<sid>, v1:C). Data never carries labels,
 //   prompt text, cwd, tokens or secrets; short ids stay inside
 //   callback_data, never in beginner-visible card text. Authorized
 //   callbacks get a best-effort answerCallbackQuery queued only AFTER the
@@ -60,6 +60,7 @@
 
 import { randomBytes } from 'node:crypto';
 
+import { TUI_PROJECT_RETENTION_MS } from './store.mjs';
 import { TelegramApiError } from './telegram-api.mjs';
 import { authorize, chunkMessage, createRateLimiter } from './security.mjs';
 import { createTranscriber } from './audio-transcription.mjs';
@@ -79,6 +80,9 @@ const SHORT_ID_RE = /^[a-z0-9]{3,32}$/;
 const CALLBACK_REFRESH_RE = /^v1:r$/;
 const CALLBACK_SELECT_RE = /^v1:s:([a-z0-9]{3,32})$/;
 const CALLBACK_PROMPT_RE = /^v1:p:([a-z0-9]{3,32}):([0-9a-f]{16})$/;
+// Telegram Bot API 10.3: disabled is the button ACTION field `disabled: {}`,
+// never a style value — section headers and recent rows carry no callback
+// data at all, so they cannot be tapped or routed.
 // T03b busy-decision callbacks: the held prompt generation decides, the
 // short id only names the target session.
 const CALLBACK_FOLLOWUP_RE = /^v1:f:([a-z0-9]{3,32}):([0-9a-f]{16})$/;
@@ -254,6 +258,7 @@ export class SelectiveTelegramBroker {
       || typeof store.advanceBrokerTransportOffset !== 'function'
       || typeof store.recordInbox !== 'function'
       || typeof store.listTuiSessions !== 'function'
+      || typeof store.listRecentTuiProjects !== 'function'
       || typeof store.enqueueTuiCommand !== 'function'
       || typeof store.listPendingBrokerTuiEvents !== 'function'
       || typeof store.acknowledgeTuiEvents !== 'function') {
@@ -644,7 +649,7 @@ export class SelectiveTelegramBroker {
       case 'refresh':
         return {
           answerId,
-          reply: this.#chooserReply(this.#pendingPrompt !== null),
+          reply: this.#projectsReply(),
           command: null,
         };
       case 'select': {
@@ -652,18 +657,19 @@ export class SelectiveTelegramBroker {
         const matches = live.filter((session) => session.shortId === parsed.shortId);
         if (matches.length !== 1) {
           // Dead, stale or ambiguous target: say the named Pi closed when it
-          // is known, then re-render the safest current chooser.
+          // is known, then re-render the safest current dashboard.
           return {
             answerId,
-            reply: this.#staleChooserReply(parsed.shortId, this.#pendingPrompt !== null),
+            reply: this.#staleProjectsReply(parsed.shortId),
             command: null,
           };
         }
         this.#selectedTrackingId = matches[0].trackingId;
-        // MSG-T3 again, now naming the chosen session (BEGINNER_UX.md §6).
+        // T3: the tap re-renders the dashboard with the ✓/primary selection
+        // instead of navigating away. No command is enqueued.
         return {
           answerId,
-          reply: { text: copy.homeOne(matches[0].label) },
+          reply: this.#projectsReply(),
           command: null,
         };
       }
@@ -675,7 +681,7 @@ export class SelectiveTelegramBroker {
           this.#log('callback_pending_generation_stale');
           return {
             answerId,
-            reply: this.#chooserReply(this.#pendingPrompt !== null),
+            reply: this.#projectsReply(),
             command: null,
           };
         }
@@ -685,7 +691,7 @@ export class SelectiveTelegramBroker {
           // Dead or ambiguous session: name it when known, keep the pending
           // prompt alive and re-render the current p-choices.
           this.#log('callback_target_not_live');
-          return { answerId, reply: this.#staleChooserReply(parsed.shortId, true), command: null };
+          return { answerId, reply: this.#staleProjectsReply(parsed.shortId), command: null };
         }
         const [session] = matches;
         this.#selectedTrackingId = session.trackingId;
@@ -703,10 +709,10 @@ export class SelectiveTelegramBroker {
         };
       }
       case 'chooser':
-        // v1:c — a fresh session chooser, identical safety to v1:r.
+        // v1:c — the Projects dashboard, identical safety to v1:r.
         return {
           answerId,
-          reply: this.#chooserReply(this.#pendingPrompt !== null),
+          reply: this.#projectsReply(),
           command: null,
         };
       case 'cancel':
@@ -731,7 +737,7 @@ export class SelectiveTelegramBroker {
           this.#log('callback_target_not_live');
           return {
             answerId,
-            reply: this.#staleChooserReply(parsed.shortId, this.#pendingPrompt !== null),
+            reply: this.#staleProjectsReply(parsed.shortId),
             command: null,
           };
         }
@@ -741,7 +747,7 @@ export class SelectiveTelegramBroker {
           reply: {
             text: copy.disconnectAsk(session.label),
             replyMarkup: { inline_keyboard: [[
-              { text: copy.DISCONNECT_BUTTON, callback_data: `v1:D:${session.shortId}` },
+              { text: copy.DISCONNECT_BUTTON, callback_data: `v1:D:${session.shortId}`, style: 'danger' },
               { text: copy.CANCEL_BUTTON, callback_data: 'v1:C' },
             ]] },
           },
@@ -764,9 +770,9 @@ export class SelectiveTelegramBroker {
   /** Shared fail-closed paths for the T03b busy callbacks. */
   #busyActionStaleGeneration(answerId) {
     // Missing or replaced generation: never dispatch; re-render the safest
-    // current chooser (which carries the CURRENT generation when held).
+    // current dashboard (which carries the CURRENT generation when held).
     this.#log('callback_pending_generation_stale');
-    return { answerId, reply: this.#chooserReply(this.#pendingPrompt !== null), command: null };
+    return { answerId, reply: this.#projectsReply(), command: null };
   }
 
   #busyActionTargetNotLive(answerId, shortId) {
@@ -774,7 +780,7 @@ export class SelectiveTelegramBroker {
     // the held prompt preserved for a retry against a live target, and
     // dispatch nothing.
     this.#log('callback_target_not_live');
-    return { answerId, reply: this.#staleChooserReply(shortId, true), command: null };
+    return { answerId, reply: this.#staleProjectsReply(shortId), command: null };
   }
 
   /**
@@ -899,43 +905,144 @@ export class SelectiveTelegramBroker {
   /**
    * The stale/dead-target reply (T04): when the named Pi is known (it was
    * seen live earlier), say it just closed or disconnected, then show the
-   * fresh readable choices — or the no-live guidance when none are left.
+   * fresh Projects dashboard — or the no-live guidance when none are left.
    * Never exposes the short id itself.
    */
-  #staleChooserReply(shortId, withPending) {
-    const chooser = this.#chooserReply(withPending);
+  #staleProjectsReply(shortId) {
+    const dashboard = this.#projectsReply();
     const label = this.#lastKnownLabel(shortId);
-    if (label === null) return chooser;
+    if (label === null) return dashboard;
     return {
-      text: `${copy.sessionGone(label)}\n${chooser.text}`,
-      replyMarkup: chooser.replyMarkup,
+      text: `${copy.sessionGone(label)}\n${dashboard.text}`,
+      replyMarkup: dashboard.replyMarkup,
     };
   }
 
   /**
-   * The safest current chooser: the no-live beginner guidance, or one
-   * readable `Pi · <label>` button per live session plus Refresh. With a
-   * pending prompt the buttons dispatch the CURRENT pending generation
-   * (v1:p); without one they only select (v1:s). Short ids stay inside
-   * callback_data, never in visible text.
+   * The Projects dashboard (T3): an `Active now` row per live session, a
+   * `Recent` row per 30-day project history entry not currently active
+   * (newest first, capped by the store), plus Refresh. Selected live rows
+   * render ✓ + primary; live connected rows success; busy/waiting rows the
+   * default style; headers and recent rows are the native disabled action
+   * buttons (`disabled: {}`, no callback_data) so they cannot be tapped. With a pending
+   * prompt, live rows dispatch the CURRENT pending generation (v1:p);
+   * otherwise they select (v1:s). Recent rows never route. Short ids stay
+   * inside callback_data, never in visible text; a history read failure
+   * degrades to the live-only view instead of throwing.
    */
-  #chooserReply(withPending) {
+  #projectsReply() {
     const live = this.#liveSessions();
-    if (live.length === 0) return { text: copy.homeNoLive };
-    const pendingId = withPending && this.#pendingPrompt !== null
-      ? this.#pendingPrompt.pendingId
-      : null;
-    const rows = live.slice(0, MAX_LISTED_SESSIONS).map((session) => [{
-      text: copy.displayLabel(session.label),
+    const recent = this.#recentProjects();
+    const activeKeys = new Set(
+      live
+        .map((session) => (isPlainObject(session) ? session.projectKey : null))
+        .filter((key) => typeof key === 'string' && key.length > 0),
+    );
+    const aliasByKey = new Map();
+    const recentRows = [];
+    for (const project of recent) {
+      if (!isPlainObject(project) || typeof project.projectKey !== 'string' || project.projectKey.length === 0) continue;
+      const alias = typeof project.alias === 'string' && project.alias.trim().length > 0
+        ? project.alias
+        : null;
+      if (alias !== null) aliasByKey.set(project.projectKey, alias);
+      if (!activeKeys.has(project.projectKey)) recentRows.push(project);
+    }
+    const pendingId = this.#pendingPrompt !== null ? this.#pendingPrompt.pendingId : null;
+    const rows = [];
+    if (live.length > 0) {
+      rows.push([this.#sectionButton(copy.PROJECT_SECTION_ACTIVE)]);
+      for (const session of live.slice(0, MAX_LISTED_SESSIONS)) {
+        const button = this.#liveRowButton(session, pendingId, aliasByKey);
+        if (button !== null) rows.push([button]);
+      }
+    }
+    if (recentRows.length > 0) {
+      rows.push([this.#sectionButton(copy.PROJECT_SECTION_RECENT)]);
+      for (const project of recentRows) {
+        rows.push([{
+          text: copy.projectRowLabel({
+            colorSlot: project.colorSlot,
+            offline: true,
+            name: project.alias ?? project.label,
+            branch: project.branch,
+          }),
+          disabled: {},
+        }]);
+      }
+    }
+    if (rows.length > 0) rows.push([{ text: REFRESH_BUTTON_TEXT, callback_data: 'v1:r' }]);
+    const text = this.#pendingPrompt !== null
+      ? copy.pendingSaved
+      : live.length === 0 && recentRows.length === 0
+        ? copy.homeNoLive
+        : copy.projectsTitle;
+    return rows.length > 0
+      ? { text, replyMarkup: { inline_keyboard: rows } }
+      : { text };
+  }
+
+  /** A native disabled section header row (Telegram Bot API 10.3 action
+   * field, no callback_data, nothing to tap). */
+  #sectionButton(text) {
+    return { text, disabled: {} };
+  }
+
+  /**
+   * One live session as a dashboard row. The callback binds to the current
+   * pending generation when one is held (v1:p), otherwise it selects
+   * (v1:s). Selected → ✓ + primary; connected → success; busy/waiting →
+   * default. Unusable rows render as null and are skipped.
+   */
+  #liveRowButton(session, pendingId, aliasByKey) {
+    if (!isPlainObject(session)) return null;
+    const shortId = this.#shortIdOf(session);
+    if (shortId === null) return null;
+    const selected = session.trackingId === this.#selectedTrackingId;
+    const style = selected
+      ? 'primary'
+      : session.state === 'connected' ? 'success' : undefined;
+    const alias = typeof session.projectKey === 'string'
+      ? aliasByKey.get(session.projectKey)
+      : undefined;
+    const button = {
+      text: copy.projectRowLabel({
+        selected,
+        colorSlot: this.#colorSlotOf(session.projectKey),
+        state: session.state,
+        name: alias ?? session.label,
+        branch: session.branch,
+      }),
       callback_data: pendingId !== null
-        ? `v1:p:${session.shortId}:${pendingId}`
-        : `v1:s:${session.shortId}`,
-    }]);
-    rows.push([{ text: REFRESH_BUTTON_TEXT, callback_data: 'v1:r' }]);
-    return {
-      text: pendingId !== null ? copy.pendingSaved : copy.homeMultiple,
-      replyMarkup: { inline_keyboard: rows },
+        ? `v1:p:${shortId}:${pendingId}`
+        : `v1:s:${shortId}`,
     };
+    if (style !== undefined) button.style = style;
+    return button;
+  }
+
+  /**
+   * The stable color slot for a project key, mirroring the store's
+   * derivation (first 8 hex chars mod 8). Malformed keys fall back to the
+   * neutral palette slot instead of throwing.
+   */
+  #colorSlotOf(projectKey) {
+    if (typeof projectKey !== 'string' || !/^[0-9a-f]{8,64}$/.test(projectKey)) return null;
+    return parseInt(projectKey.slice(0, 8), 16) % 8;
+  }
+
+  /**
+   * The store's 30-day recent project history (newest first, capped).
+   * A missing or failing store degrades to an empty history: the dashboard
+   * renders the live view and never throws.
+   */
+  #recentProjects() {
+    try {
+      return this.#store.listRecentTuiProjects({ since: this.#now() - TUI_PROJECT_RETENTION_MS });
+    } catch {
+      this.#log('projects_history_unavailable');
+      return [];
+    }
   }
 
   #planMessage(message, resolvedAudio = undefined) {
@@ -1009,6 +1116,8 @@ export class SelectiveTelegramBroker {
         return this.#planStart();
       case 'help':
         return { replies: [copy.HELP_TEXT], commands: [] };
+      case 'projects':
+        return this.#planProjects();
       case 'sessions':
         return this.#planSessions();
       case 'use':
@@ -1035,7 +1144,7 @@ export class SelectiveTelegramBroker {
   /**
    * The state-aware /start home (BEGINNER_UX.md section 6, T04): zero live
    * sessions point at /tg, exactly one is auto-selected with its T03b
-   * action row, several present the readable chooser. No command is ever
+   * action row, several present the Projects dashboard. No command is ever
    * enqueued from /start itself.
    */
   #planStart() {
@@ -1056,7 +1165,16 @@ export class SelectiveTelegramBroker {
         commands: [],
       };
     }
-    return { replies: [this.#chooserReply(true)], commands: [] };
+    return { replies: [this.#projectsReply()], commands: [] };
+  }
+
+  /**
+   * /projects (T3): the Projects dashboard. Selection is preserved,
+   * nothing is ever enqueued, and a zero/zero store renders the no-live
+   * beginner guidance without buttons.
+   */
+  #planProjects() {
+    return { replies: [this.#projectsReply()], commands: [] };
   }
 
   #planSessions() {
@@ -1167,7 +1285,7 @@ export class SelectiveTelegramBroker {
           return { replies: [SLASH_LINE_NOTICE], commands: [] };
         }
         this.#pendingPrompt = { pendingId: freshPendingId(), text: clipped };
-        return { replies: [this.#chooserReply(true)], commands: [] };
+        return { replies: [this.#projectsReply()], commands: [] };
       }
       // Zero live sessions (T04): the plain-text path names the miss —
       // the message was NOT sent — with the fixed friendly guidance.
@@ -1482,39 +1600,40 @@ export class SelectiveTelegramBroker {
 
   /**
    * T03b general action row for a connected-session card: Status, Stop
-   * (rendered ONLY while the live state is busy), Change Pi, Disconnect.
+   * (rendered ONLY while the live state is busy), Projects, Disconnect.
+   * The destructive controls Stop and Disconnect carry style danger.
    */
   #sessionActionKeyboard(session) {
     const shortId = this.#shortIdOf(session);
     if (session === null || shortId === null) return null;
     const row = [{ text: copy.BUTTON_STATUS, callback_data: `v1:q:${shortId}` }];
     if (session.state === 'busy') {
-      row.push({ text: copy.BUTTON_STOP, callback_data: `v1:x:${shortId}` });
+      row.push({ text: copy.BUTTON_STOP, callback_data: `v1:x:${shortId}`, style: 'danger' });
     }
-    row.push({ text: copy.BUTTON_CHANGE_PI, callback_data: 'v1:c' });
-    row.push({ text: copy.BUTTON_DISCONNECT, callback_data: `v1:d:${shortId}` });
+    row.push({ text: copy.BUTTON_PROJECTS, callback_data: 'v1:c' });
+    row.push({ text: copy.BUTTON_DISCONNECT, callback_data: `v1:d:${shortId}`, style: 'danger' });
     return { inline_keyboard: [row] };
   }
 
   /**
-   * Final-output cards may offer ONLY Change Pi and Disconnect — never
+   * Final-output cards may offer ONLY Projects and Disconnect — never
    * Stop after a final output — and only while the originating session is
-   * still live.
+   * still live. Disconnect is destructive and carries style danger.
    */
   #finalOutputKeyboard(session) {
     const shortId = this.#shortIdOf(session);
     if (session === null || shortId === null) return null;
     return { inline_keyboard: [[
-      { text: copy.BUTTON_CHANGE_PI, callback_data: 'v1:c' },
-      { text: copy.BUTTON_DISCONNECT, callback_data: `v1:d:${shortId}` },
+      { text: copy.BUTTON_PROJECTS, callback_data: 'v1:c' },
+      { text: copy.BUTTON_DISCONNECT, callback_data: `v1:d:${shortId}`, style: 'danger' },
     ]] };
   }
 
-  /** Busy/interim status copy may expose ONLY the Stop button. */
+  /** Busy/interim status copy may expose ONLY the Stop button (danger). */
   #stopKeyboard(session) {
     const shortId = this.#shortIdOf(session);
     if (session === null || shortId === null) return null;
-    return { inline_keyboard: [[{ text: copy.BUTTON_STOP, callback_data: `v1:x:${shortId}` }]] };
+    return { inline_keyboard: [[{ text: copy.BUTTON_STOP, callback_data: `v1:x:${shortId}`, style: 'danger' }]] };
   }
 
   /**

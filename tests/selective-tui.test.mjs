@@ -20,6 +20,15 @@ import { fileURLToPath } from 'node:url';
 import { Store } from '../src/store.mjs';
 import { TuiBridgeClient } from '../src/tui-bridge-client.mjs';
 import { SelectiveTelegramBroker } from '../src/selective-telegram-broker.mjs';
+import {
+  MAX_BUTTON_TEXT_CHARS,
+  PROJECT_COLOR_SLOTS,
+  PROJECT_COLOR_FALLBACK,
+  projectColor,
+  liveStateMarker,
+  liveStateText,
+  projectRowLabel,
+} from '../src/beginner-copy.mjs';
 import { RuntimeConfigError, loadBrokerRuntimeConfig } from '../src/runtime-config.mjs';
 
 const TEST_RUNS = fileURLToPath(new URL('../.local/test-runs/', import.meta.url));
@@ -849,7 +858,7 @@ describe('SelectiveTelegramBroker: chooser keyboards + broker-memory pending pro
 
   /** The pending generation id offered by the latest p-buttons. */
   function lastPendingId(api) {
-    const button = lastButtons(api).find((b) => b.callback_data.startsWith('v1:p:'));
+    const button = lastButtons(api).find((b) => (b.callback_data ?? '').startsWith('v1:p:'));
     return button.callback_data.split(':')[3];
   }
 
@@ -899,8 +908,16 @@ describe('SelectiveTelegramBroker: chooser keyboards + broker-memory pending pro
       assert.doesNotMatch(reply.text, /aaa111|bbb222/,
         'no short id may ever appear in beginner-visible text');
       const buttons = buttonsOf(reply);
-      assert.deepEqual(buttons.map((b) => b.text), ['Pi · alpha', 'Pi · beta', 'Refresh']);
+      assert.equal(buttons[0].text, 'Active now');
+      assert.deepEqual(buttons[0], { text: 'Active now', disabled: {} },
+        'the header must be the native disabled action button with no callback_data');
+      assert.match(buttons[1].text, /🟢/);
+      assert.match(buttons[1].text, /alpha · Available/);
+      assert.match(buttons[2].text, /🟢/);
+      assert.match(buttons[2].text, /beta · Available/);
+      assert.equal(buttons[3].text, 'Refresh');
       for (const button of buttons) {
+        if (button.text === 'Active now') continue; // header asserted above
         assert.ok(Buffer.byteLength(button.callback_data, 'utf8') <= 64,
           `callback_data must stay within 64 UTF-8 bytes: ${button.callback_data}`);
         assert.match(button.callback_data, /^(v1:r|v1:p:[a-z0-9]{3,32}:[0-9a-f]{16})$/);
@@ -953,10 +970,13 @@ describe('SelectiveTelegramBroker: chooser keyboards + broker-memory pending pro
       await deliver(broker, api, cb(`v1:p:aaa111:${pid}`));
       assert.equal(fx.clientA.poll(A).commands.length, 0,
         'the duplicate tap must not enqueue a second command');
-      // The re-render is the safest current chooser: no pending left, s-buttons.
+      // The re-render is the safest current dashboard: no pending left, s-buttons.
       const buttons = lastButtons(api);
-      assert.deepEqual(buttons.map((b) => b.text), ['Pi · alpha', 'Pi · beta', 'Refresh']);
-      assert.ok(buttons.filter((b) => b.callback_data.startsWith('v1:s:')).length === 2);
+      assert.equal(buttons[0].text, 'Active now');
+      assert.match(buttons[1].text, /alpha · Available/);
+      assert.match(buttons[2].text, /beta · Available/);
+      assert.equal(buttons[3].text, 'Refresh');
+      assert.ok(buttons.filter((b) => (b.callback_data ?? '').startsWith('v1:s:')).length === 2);
     } finally { fx.close(); }
   });
 
@@ -974,11 +994,12 @@ describe('SelectiveTelegramBroker: chooser keyboards + broker-memory pending pro
       await deliver(broker, api, cb(`v1:p:aaa111:${pid}`));
       assert.equal(fx.clientA.poll(A).commands.length, 0);
       assert.equal(fx.clientB.poll(B).commands.length, 0);
-      // The chooser re-renders with only the live session and the SAME
+      // The dashboard re-renders with only the live session and the SAME
       // pending generation preserved.
-      const buttons = lastButtons(api);
-      assert.deepEqual(buttons.map((b) => b.text), ['Pi · beta', 'Refresh']);
-      const parts = buttons[0].callback_data.split(':');
+      const pButton = lastButtons(api).find((b) => (b.callback_data ?? '').startsWith('v1:p:'));
+      assert.ok(pButton !== undefined, 'the re-render must carry p-buttons again');
+      assert.match(pButton.text, /beta/);
+      const parts = pButton.callback_data.split(':');
       assert.equal(parts[2], 'bbb222');
       assert.equal(parts[3], pid, 'the pending generation must survive a dead-target tap');
       // And the preserved generation still dispatches.
@@ -1037,8 +1058,11 @@ describe('SelectiveTelegramBroker: chooser keyboards + broker-memory pending pro
       assert.equal(fx.clientB.poll(B).commands.length, 0);
       // The safest re-render with no pending: plain s-buttons.
       const buttons = lastButtons(restartedApi);
-      assert.deepEqual(buttons.map((b) => b.text), ['Pi · alpha', 'Pi · beta', 'Refresh']);
-      assert.ok(buttons.every((b) => !b.callback_data.startsWith('v1:p:')));
+      assert.equal(buttons[0].text, 'Active now');
+      assert.match(buttons[1].text, /alpha · Available/);
+      assert.match(buttons[2].text, /beta · Available/);
+      assert.equal(buttons[3].text, 'Refresh');
+      assert.ok(buttons.every((b) => !(b.callback_data ?? '').startsWith('v1:p:')));
     } finally { fx.close(); }
   });
 
@@ -1050,8 +1074,8 @@ describe('SelectiveTelegramBroker: chooser keyboards + broker-memory pending pro
       const api = makeFakeApi();
       const broker = newBroker(fx, api);
       await deliver(broker, api, cb('v1:r'));
-      assert.deepEqual(lastButtons(api).map((b) => b.text), ['Pi · alpha', 'Pi · beta', 'Refresh']);
-      assert.ok(lastButtons(api).every((b) => !b.callback_data.startsWith('v1:p:')),
+      assert.equal(lastButtons(api)[0].text, 'Active now');
+      assert.ok(lastButtons(api).every((b) => !(b.callback_data ?? '').startsWith('v1:p:')),
         'without a pending prompt the buttons must only select');
       await deliver(broker, api, msg('held for the refresh probe'));
       const pid = lastPendingId(api);
@@ -1062,7 +1086,7 @@ describe('SelectiveTelegramBroker: chooser keyboards + broker-memory pending pro
       await deliver(broker, api, cb(`v1:p:aaa111:${pid}`));
       assert.equal(fx.clientA.poll(A).commands.length, 1);
       await deliver(broker, api, cb('v1:r'));
-      assert.ok(lastButtons(api).every((b) => !b.callback_data.startsWith('v1:p:')),
+      assert.ok(lastButtons(api).every((b) => !(b.callback_data ?? '').startsWith('v1:p:')),
         'after the pending was consumed, refresh offers plain selection again');
     } finally { fx.close(); }
   });
@@ -1076,10 +1100,15 @@ describe('SelectiveTelegramBroker: chooser keyboards + broker-memory pending pro
       const broker = newBroker(fx, api);
       await deliver(broker, api, cb('v1:r'));
       await deliver(broker, api, cb('v1:s:aaa111'));
-      assert.equal(
-        api.sent[api.sent.length - 1].text,
-        'Connected to Pi · alpha. Just type a message and it goes to that Pi.',
-        'a successful select confirms MSG-T3 again, naming the chosen Pi');
+      const rendered = api.sent[api.sent.length - 1];
+      assert.equal(rendered.text, 'Your Pi projects',
+        'a successful select re-renders the Projects dashboard');
+      const renderedButtons = buttonsOf(rendered);
+      const alphaButton = renderedButtons.find((b) => b.text.includes('alpha'));
+      assert.ok(alphaButton.text.startsWith('✓'),
+        'the selected row must carry the ✓ prefix');
+      assert.equal(alphaButton.style, 'primary');
+      assert.equal(renderedButtons.find((b) => b.text.includes('beta')).style, 'success');
       assert.equal(fx.clientA.poll(A).commands.length, 0, 'a select callback must enqueue nothing');
       assert.equal(fx.clientB.poll(B).commands.length, 0);
       await deliver(broker, api, msg('routed now'));
@@ -1135,7 +1164,8 @@ describe('SelectiveTelegramBroker: chooser keyboards + broker-memory pending pro
           'only the final chunk may carry the inline keyboard');
       }
       assert.equal(typeof chunks[chunks.length - 1].replyMarkup, 'object');
-      assert.deepEqual(lastButtons(api).map((b) => b.text), ['Pi · alpha', 'Pi · beta', 'Refresh']);
+      assert.equal(lastButtons(api)[0].text, 'Active now');
+      assert.equal(lastButtons(api).length, 4, 'header + two live rows + Refresh');
       assert.equal(chunks.map((c) => c.text).join(''),
         'Your message is saved. Choose which Pi should get it:',
         'the chunked join must restore the full notice');
@@ -1222,7 +1252,7 @@ describe('SelectiveTelegramBroker: busy cards, action keyboards and extended cal
 
   /** The pending generation id offered by the latest busy card (v1:f button). */
   function busyPid(api) {
-    const button = lastButtons(api).find((b) => b.callback_data.startsWith('v1:f:'));
+    const button = lastButtons(api).find((b) => (b.callback_data ?? '').startsWith('v1:f:'));
     return button.callback_data.split(':')[3];
   }
 
@@ -1308,9 +1338,11 @@ describe('SelectiveTelegramBroker: busy cards, action keyboards and extended cal
       await deliver(broker, api, cb(`v1:f:aaa111:${pid}`));
       assert.equal(fx.clientA.poll(A).commands.length, 0,
         'the consumed generation must be gone');
-      // The safest re-render: no pending left, plain selection buttons.
-      assert.deepEqual(lastButtons(api).map((b) => b.text), ['Pi · alpha', 'Refresh']);
-      assert.ok(lastButtons(api).every((b) => !b.callback_data.startsWith('v1:f:')));
+      // The safest re-render: no pending left, the dashboard's plain
+      // selection rows with the ✓/primary selection on the target.
+      assert.deepEqual(lastButtons(api).map((b) => b.text),
+        ['Active now', '✓ 🟡 🟫 alpha · Working', 'Refresh']);
+      assert.ok(lastButtons(api).every((b) => !(b.callback_data ?? '').startsWith('v1:f:')));
     } finally { fx.close(); }
   });
 
@@ -1408,7 +1440,8 @@ describe('SelectiveTelegramBroker: busy cards, action keyboards and extended cal
       await deliver(restarted, restartedApi, cb(`v1:a:aaa111:${currentPid}`));
       assert.equal(fx.clientA.poll(A).commands.length, 0,
         'a pre-restart busy keyboard must fail closed');
-      assert.deepEqual(lastButtons(restartedApi).map((b) => b.text), ['Pi · alpha', 'Refresh']);
+      assert.deepEqual(lastButtons(restartedApi).map((b) => b.text),
+        ['Active now', '🟡 🟫 alpha · Working', 'Refresh']);
       // The live broker still honors the current generation.
       await deliver(broker, api, cb(`v1:t:aaa111:${currentPid}`));
       const commands = fx.clientA.poll(A).commands;
@@ -1438,11 +1471,12 @@ describe('SelectiveTelegramBroker: busy cards, action keyboards and extended cal
       assert.equal(fx.clientA.poll(A).commands.length, 0);
       assert.equal(fx.clientB.poll(B).commands.length, 0,
         'a dead target must never dispatch anywhere');
-      // The held prompt is preserved: the re-rendered chooser carries the
+      // The held prompt is preserved: the re-rendered dashboard carries the
       // SAME generation as p-buttons for the live session.
       const buttons = lastButtons(api);
-      assert.deepEqual(buttons.map((b) => b.text), ['Pi · beta', 'Refresh']);
-      const pButton = buttons.find((b) => b.callback_data.startsWith('v1:p:'));
+      assert.deepEqual(buttons.map((b) => b.text),
+        ['Active now', '🟢 🟪 beta · Available', 'Recent', '⚪ 🟫 alpha · Offline', 'Refresh']);
+      const pButton = buttons.find((b) => (b.callback_data ?? '').startsWith('v1:p:'));
       assert.equal(pButton.callback_data, `v1:p:bbb222:${pid}`);
       // And the preserved generation dispatches against the live target.
       await deliver(broker, api, cb(`v1:f:bbb222:${pid}`));
@@ -1512,9 +1546,11 @@ describe('SelectiveTelegramBroker: busy cards, action keyboards and extended cal
       assert.equal(commands.length, 1);
       assert.equal(commands[0].kind, 'abort');
       assert.equal(api.sent[api.sent.length - 1].text, 'Stopping the current task...');
-      // c: a fresh chooser, no dispatch.
+      // c: the Projects dashboard, no dispatch.
       await deliver(broker, api, cb('v1:c'));
-      assert.deepEqual(lastButtons(api).map((b) => b.text), ['Pi · alpha', 'Refresh']);
+      assert.equal(lastButtons(api)[0].text, 'Active now');
+      assert.match(lastButtons(api)[1].text, /alpha · Available/);
+      assert.equal(lastButtons(api)[2].text, 'Refresh');
       assert.equal(fx.clientA.poll(A).commands.length, 0);
       // d: a readable confirmation card with Unlink (D) and Cancel (C).
       await deliver(broker, api, cb('v1:d:aaa111'));
@@ -1553,8 +1589,9 @@ describe('SelectiveTelegramBroker: busy cards, action keyboards and extended cal
       assert.equal(fx.clientA.poll(A).commands.length, 0);
       assert.equal(fx.clientB.poll(B).commands.length, 0,
         'dead-target action callbacks must enqueue nothing');
-      // The safest re-render lists only the live session.
-      assert.deepEqual(lastButtons(api).map((b) => b.text), ['Pi · beta', 'Refresh']);
+      // The safest re-render lists only the live session under Active now.
+      assert.equal(lastButtons(api)[0].text, 'Active now');
+      assert.match(lastButtons(api)[1].text, /beta · Available/);
     } finally { fx.close(); }
   });
 
@@ -1565,29 +1602,29 @@ describe('SelectiveTelegramBroker: busy cards, action keyboards and extended cal
       fx.connectA();
       const api = makeFakeApi();
       const broker = newBroker(fx, api);
-      // Idle connected session: Status, Change Pi, Disconnect — no Stop.
+      // Idle connected session: Status, Projects, Disconnect — no Stop.
       assert.equal(fx.store.appendTuiEvent({ trackingId: A.trackingId, kind: 'connected', payload: null }).ok, true);
       await broker.drainTuiEvents();
       assert.match(api.sent[api.sent.length - 1].text, /Pi · alpha is connected\./);
       assert.deepEqual(lastButtons(api).map((b) => b.text),
-        ['Status', 'Change Pi', 'Disconnect']);
+        ['Status', 'Projects', 'Disconnect']);
       for (const button of lastButtons(api)) {
         assert.ok(Buffer.byteLength(button.callback_data, 'utf8') <= 64);
         assert.ok(!button.callback_data.startsWith('v1:x:'),
           'Stop must be absent while the state is not busy');
       }
-      // Busy session: the same row gains Stop between Status and Change Pi.
+      // Busy session: the same row gains Stop between Status and Projects.
       fx.busyA();
       assert.equal(fx.store.appendTuiEvent({ trackingId: A.trackingId, kind: 'connected', payload: null }).ok, true);
       await broker.drainTuiEvents();
       const busyRow = lastButtons(api);
       assert.deepEqual(busyRow.map((b) => b.text),
-        ['Status', 'Stop the task', 'Change Pi', 'Disconnect']);
+        ['Status', 'Stop the task', 'Projects', 'Disconnect']);
       assert.equal(busyRow.find((b) => b.text === 'Stop the task').callback_data, 'v1:x:aaa111');
     } finally { fx.close(); }
   });
 
-  test('final-output events carry only Change Pi and Disconnect while live — never Stop', async () => {
+  test('final-output events carry only Projects and Disconnect while live — never Stop', async () => {
     const fx = makeFixture();
     try {
       clearTransport(fx);
@@ -1599,7 +1636,7 @@ describe('SelectiveTelegramBroker: busy cards, action keyboards and extended cal
       await broker.drainTuiEvents();
       assert.match(api.sent[api.sent.length - 1].text, /HARVEST READY/);
       const buttons = lastButtons(api);
-      assert.deepEqual(buttons.map((b) => b.text), ['Change Pi', 'Disconnect']);
+      assert.deepEqual(buttons.map((b) => b.text), ['Projects', 'Disconnect']);
       assert.deepEqual(buttons.map((b) => b.callback_data), ['v1:c', 'v1:d:aaa111']);
       assert.ok(buttons.every((b) => !b.callback_data.startsWith('v1:x:')),
         'a final output must never offer Stop');
@@ -1657,7 +1694,7 @@ describe('SelectiveTelegramBroker: busy cards, action keyboards and extended cal
       assert.match(retry.text, /MUST SURVIVE/);
       assert.equal(api.sent.length, 1,
         'the successful retry appends the event exactly once');
-      assert.deepEqual(buttonsOf(retry).map((b) => b.text), ['Change Pi', 'Disconnect'],
+      assert.deepEqual(buttonsOf(retry).map((b) => b.text), ['Projects', 'Disconnect'],
         'the retried event re-renders its action keyboard');
       pending = fx.store.listPendingBrokerTuiEvents({ limit: 10 });
       assert.equal(pending.length, 0, 'acknowledged only after the full send succeeded');
@@ -1758,7 +1795,7 @@ describe('SelectiveTelegramBroker: beginner commands, stale naming and no-jargon
 
   /** The pending generation id offered by the latest p-buttons. */
   function lastPendingId(api) {
-    const button = lastButtons(api).find((b) => b.callback_data.startsWith('v1:p:'));
+    const button = lastButtons(api).find((b) => (b.callback_data ?? '').startsWith('v1:p:'));
     return button.callback_data.split(':')[3];
   }
 
@@ -1814,7 +1851,7 @@ describe('SelectiveTelegramBroker: beginner commands, stale naming and no-jargon
       assert.equal(api.sent[0].text,
         'Connected to Pi · alpha. Just type a message and it goes to that Pi.');
       assert.deepEqual(lastButtons(api).map((b) => b.text),
-        ['Status', 'Change Pi', 'Disconnect']);
+        ['Status', 'Projects', 'Disconnect']);
       // Auto-selection sticks: plain text routes without any /use.
       await deliver(broker, api, msg('straight through'));
       const commands = fx.clientA.poll(A).commands;
@@ -1824,7 +1861,7 @@ describe('SelectiveTelegramBroker: beginner commands, stale naming and no-jargon
     } finally { fx.close(); }
   });
 
-  test('/start with several live sessions: MSG-T4 question plus readable chooser, never short ids', async () => {
+  test('/start with several live sessions: opens the Projects dashboard, never short ids', async () => {
     const fx = makeBeginnerFixture();
     try {
       fx.connectA();
@@ -1832,13 +1869,19 @@ describe('SelectiveTelegramBroker: beginner commands, stale naming and no-jargon
       const api = makeFakeApi();
       const broker = newBeginnerBroker(fx, api);
       await deliver(broker, api, msg('/start'));
-      assert.equal(api.sent[0].text, 'Which Pi should I talk to?');
-      assert.deepEqual(lastButtons(api).map((b) => b.text),
-        ['Pi · alpha', 'Pi · beta', 'Refresh']);
-      for (const button of lastButtons(api)) {
-        assert.ok(!button.callback_data.includes('alpha') && !button.callback_data.includes('beta'));
+      assert.equal(api.sent[0].text, 'Your Pi projects');
+      const buttons = lastButtons(api);
+      assert.equal(buttons[0].text, 'Active now');
+      assert.match(buttons[1].text, /alpha · Available/);
+      assert.match(buttons[2].text, /beta · Available/);
+      assert.equal(buttons[3].text, 'Refresh');
+      for (const button of buttons) {
+        const callbackData = button.callback_data ?? '';
+        assert.ok(!callbackData.includes('alpha') && !callbackData.includes('beta'));
       }
       assert.doesNotMatch(api.sent[0].text, /aaa111|bbb222/);
+      assert.equal(fx.clientA.poll(A).commands.length, 0, '/start must enqueue nothing');
+      assert.equal(fx.clientB.poll(B).commands.length, 0);
     } finally { fx.close(); }
   });
 
@@ -1853,7 +1896,7 @@ describe('SelectiveTelegramBroker: beginner commands, stale naming and no-jargon
       assert.equal(lines[1], 'To link a Pi window, open Pi on your PC and type /tg.');
       assert.equal(lines[2], 'This private chat only accepts you — the enrolled owner.');
       assert.ok(lines.includes('Advanced commands:'));
-      for (const command of ['/sessions', '/use', '/status', '/send', '/steer', '/followup', '/abort', '/disconnect']) {
+      for (const command of ['/projects', '/sessions', '/use', '/status', '/send', '/steer', '/followup', '/abort', '/disconnect']) {
         assert.ok(api.sent[0].text.includes(command), `advanced help must keep ${command}`);
       }
     } finally { fx.close(); }
@@ -1903,7 +1946,8 @@ describe('SelectiveTelegramBroker: beginner commands, stale naming and no-jargon
       assert.match(reply.text, /Pi · alpha just closed or disconnected\./,
         'the stale reply must name the closed Pi when it is known');
       assert.doesNotMatch(reply.text, /aaa111/);
-      assert.deepEqual(lastButtons(api).map((b) => b.text), ['Pi · beta', 'Refresh']);
+      assert.equal(lastButtons(api)[0].text, 'Active now');
+      assert.match(lastButtons(api)[1].text, /beta · Available/);
     } finally { fx.close(); }
   });
 
@@ -1918,7 +1962,8 @@ describe('SelectiveTelegramBroker: beginner commands, stale naming and no-jargon
       const reply = api.sent[api.sent.length - 1];
       assert.doesNotMatch(reply.text, /just closed or disconnected/,
         'an unknown Pi must not be named');
-      assert.deepEqual(lastButtons(api).map((b) => b.text), ['Pi · alpha', 'Refresh']);
+      assert.equal(lastButtons(api)[0].text, 'Active now');
+      assert.match(lastButtons(api)[1].text, /alpha · Available/);
     } finally { fx.close(); }
   });
 
@@ -1940,7 +1985,7 @@ describe('SelectiveTelegramBroker: beginner commands, stale naming and no-jargon
       assert.match(all, /Pi · alpha\nHARVEST READY/);
       assert.doesNotMatch(all, /\[alpha · aaa111\]/);
       assert.doesNotMatch(all, /aaa111|C:\/proj|pid|sess9/);
-      assert.match(visibleButtons(api).join(','), /Status|Change Pi/,
+      assert.match(visibleButtons(api).join(','), /Status|Projects/,
         'action cards keep their T03b keyboards');
     } finally { fx.close(); }
   });
@@ -2043,6 +2088,497 @@ describe('SelectiveTelegramBroker: beginner commands, stale naming and no-jargon
       assert.equal(bCommands[0].kind, 'abort');
       assert.equal(fx.clientA.poll(A).commands.length, 0,
         'an explicit-id command must never leak onto another live session');
+    } finally { fx.close(); }
+  });
+});
+
+describe('SelectiveTelegramBroker: Projects dashboard (T3)', () => {
+  const C = Object.freeze({ trackingId: 'c'.repeat(32), connectionId: '3'.repeat(32) });
+  const D = Object.freeze({ trackingId: 'd'.repeat(32), connectionId: '4'.repeat(32) });
+
+  const ALPHA = Object.freeze({ shortId: 'aaa111', label: 'alpha', cwd: 'C:/proj/alpha' });
+  const BETA = Object.freeze({ shortId: 'bbb222', label: 'beta', cwd: 'C:/proj/beta' });
+  const GAMMA = Object.freeze({ shortId: 'ccc333', label: 'gamma', cwd: 'C:/proj/gamma' });
+  const DELTA = Object.freeze({ shortId: 'ddd444', label: 'delta', cwd: 'C:/proj/delta' });
+
+  /** Fresh store + per-session clients, with project history helpers. */
+  function makeFixture() {
+    const dir = mkdtempSync(join(TEST_RUNS, 'sel-projects-'));
+    let t = Date.now();
+    const now = () => t;
+    const store = new Store(join(dir, 'bridge.sqlite'), { now, isProcessAlive: () => true });
+    const sessions = [];
+    return {
+      store,
+      now,
+      advance(ms) { t += ms; },
+      connect(id, { shortId, label, cwd, branch = null, state = null }) {
+        const client = new TuiBridgeClient(store, { staleAfterMs: 30_000 });
+        assert.equal(client.connect({ ...id, shortId, label, cwd, branch, pid: 4000 + sessions.length }).ok, true);
+        if (state !== null) {
+          assert.equal(client.setState({ ...id, state }).ok, true);
+        }
+        sessions.push({ id, client });
+        return client;
+      },
+      disconnect(id) {
+        const entry = sessions.find((s) => s.id.trackingId === id.trackingId);
+        assert.ok(entry, 'the session to disconnect must exist');
+        assert.equal(entry.client.disconnect({ ...id }).ok, true);
+      },
+      /** Poll every fixture session; returns every claimed command. */
+      pollAllCommands() {
+        const commands = [];
+        for (const { id, client } of sessions) {
+          commands.push(...client.poll(id).commands);
+        }
+        return commands;
+      },
+      close() { store.close(); },
+    };
+  }
+
+  function newBroker(fx, api) {
+    return new SelectiveTelegramBroker({ store: fx.store, api, config: BROKER_CONFIG, now: fx.now });
+  }
+
+  async function deliver(broker, api, update) {
+    broker.handleUpdate(update);
+    await broker.flushReplies();
+  }
+
+  /** One button per row on the dashboard: take the first button of each row. */
+  function rowButtons(api) {
+    const markup = api.sent[api.sent.length - 1].replyMarkup;
+    return (markup?.inline_keyboard ?? []).map((row) => row[0]);
+  }
+
+  function lastPendingId(api) {
+    const markup = api.sent[api.sent.length - 1].replyMarkup;
+    const button = (markup?.inline_keyboard ?? []).flat().find((b) => (b.callback_data ?? '').startsWith('v1:p:'));
+    return button.callback_data.split(':')[3];
+  }
+
+  const colorOf = (text) => text.match(new RegExp(`[${PROJECT_COLOR_SLOTS.join('')}]`, 'gu'))?.[0];
+
+  // --- copy-layer contracts -------------------------------------------------
+
+  test('the palette maps color slots 0..7 and falls back neutrally on malformed slots', () => {
+    assert.deepEqual([...PROJECT_COLOR_SLOTS], ['🟦', '🟪', '🟧', '🟩', '🟨', '🟫', '⬛', '⬜']);
+    for (let slot = 0; slot < PROJECT_COLOR_SLOTS.length; slot++) {
+      assert.equal(projectColor(slot), PROJECT_COLOR_SLOTS[slot]);
+    }
+    for (const bad of [-1, 8, 99, 1.5, NaN, null, undefined, '2']) {
+      assert.equal(projectColor(bad), PROJECT_COLOR_FALLBACK);
+    }
+  });
+
+  test('state markers and text are dynamic and color is never the only signal', () => {
+    assert.equal(liveStateMarker('connected'), '🟢');
+    assert.equal(liveStateText('connected'), 'Available');
+    assert.equal(liveStateMarker('busy'), '🟡');
+    assert.equal(liveStateText('busy'), 'Working');
+    assert.equal(liveStateMarker('waiting'), '🟡');
+    assert.equal(liveStateText('waiting'), 'Waiting');
+    assert.equal(liveStateMarker('disconnected'), '⚪');
+    assert.equal(liveStateText('disconnected'), 'Offline');
+    assert.equal(liveStateMarker(undefined), '⚪');
+    assert.equal(liveStateText(undefined), 'Offline');
+  });
+
+  test('row labels are bounded to 64 chars, sanitized, and prefer the alias', () => {
+    const bounded = projectRowLabel({
+      colorSlot: 0, state: 'connected', name: 'x'.repeat(200), branch: 'feature/one',
+    });
+    assert.ok(bounded.length <= MAX_BUTTON_TEXT_CHARS, `row label must fit one button: ${bounded.length}`);
+    assert.match(bounded, /🟢/);
+    assert.match(bounded, /Available/);
+    assert.doesNotMatch(bounded, /feature/,
+      'the branch must be dropped before the name and state word are trimmed');
+    const withBranch = projectRowLabel({ colorSlot: 1, state: 'connected', name: 'alpha', branch: 'feature/one' });
+    assert.match(withBranch, /feature\/one/);
+    assert.ok(projectRowLabel({ colorSlot: 1, state: 'connected', name: 'alpha', branch: null }).includes('alpha'));
+    const selected = projectRowLabel({ selected: true, colorSlot: 3, state: 'connected', name: 'alpha' });
+    assert.ok(selected.startsWith('✓ '), 'the selected row must be prefixed with ✓');
+    const sanitized = projectRowLabel({
+      colorSlot: 0, state: 'connected',
+      name: `alpha tg:zzz999 ${'a'.repeat(32)} C:/secret/path pid 42`,
+      branch: null,
+    });
+    assert.doesNotMatch(sanitized, /tg:|C:\/secret|pid|aaaaaaaa/);
+    const offline = projectRowLabel({ colorSlot: null, state: null, offline: true, name: '' });
+    assert.match(offline, /⚪/);
+    assert.match(offline, /Offline/);
+  });
+
+  test('row labels always retain the state word under hostile alias+branch in every state', () => {
+    // Code-point-safe lone-surrogate probe (Telegram must never see a split pair).
+    const NO_LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+    const hostile = { name: 'x'.repeat(200), branch: `feature/${'y'.repeat(60)}` };
+    const cases = [
+      [{ state: 'connected' }, 'Available'],
+      [{ state: 'busy' }, 'Working'],
+      [{ state: 'waiting' }, 'Waiting'],
+      [{ state: 'disconnected' }, 'Offline'],
+      [{ offline: true }, 'Offline'],
+      [{ }, 'Offline'],
+    ];
+    for (const [overrides, word] of cases) {
+      const label = projectRowLabel({ selected: true, colorSlot: 2, ...hostile, ...overrides });
+      assert.ok(label.length <= MAX_BUTTON_TEXT_CHARS, `over bound for ${word}: ${label.length}`);
+      assert.ok(label.includes(`· ${word}`), `the state word must survive for ${word}: ${label}`);
+      assert.ok(label.startsWith('✓ '), `the selected prefix must survive for ${word}: ${label}`);
+      assert.match(label, /🟧/, `the color slot must survive for ${word}: ${label}`);
+      assert.doesNotMatch(label, NO_LONE_SURROGATE, `lone surrogate for ${word}: ${label}`);
+    }
+    // A branch only appears when it fits entirely; the name is budgeted first.
+    const dropped = projectRowLabel({ colorSlot: 0, state: 'connected', name: 'n'.repeat(64), branch: 'y'.repeat(60) });
+    assert.ok(dropped.length <= 64 && dropped.includes('· Available'),
+      `state word lost: ${dropped}`);
+    assert.doesNotMatch(dropped, /yyy/, 'a branch without room must be dropped entirely');
+    // Clipping must split code points, never surrogate pairs: with a naive
+    // UTF-16 slice the 46th unit would land inside the first emoji.
+    const clipped = projectRowLabel({
+      colorSlot: 0, state: 'connected',
+      name: 'a'.repeat(45) + '😀'.repeat(5) + 'b'.repeat(20),
+      branch: null,
+    });
+    assert.ok(clipped.length <= MAX_BUTTON_TEXT_CHARS);
+    assert.doesNotMatch(clipped, NO_LONE_SURROGATE, `lone surrogate: ${clipped}`);
+    assert.ok(clipped.includes('😀'), 'an emoji inside the budget must survive intact');
+  });
+
+  // --- dashboard rendering ---------------------------------------------------
+
+  test('/projects with zero live and zero recent sessions shows the no-live guidance without buttons', async () => {
+    const fx = makeFixture();
+    try {
+      const api = makeFakeApi();
+      const broker = newBroker(fx, api);
+      await deliver(broker, api, msg('/projects'));
+      assert.equal(api.sent[0].text,
+        "You're linked, but no Pi window is connected right now. Open Pi on your PC and type /tg.");
+      assert.equal(api.sent[0].replyMarkup, undefined, 'no rows without any project');
+      assert.equal(fx.pollAllCommands().length, 0, 'opening the dashboard enqueues nothing');
+    } finally { fx.close(); }
+  });
+
+  test('/projects with zero live but recent history renders only disabled Recent rows', async () => {
+    const fx = makeFixture();
+    try {
+      fx.connect(C, GAMMA);
+      fx.disconnect(C);
+      const api = makeFakeApi();
+      const broker = newBroker(fx, api);
+      await deliver(broker, api, msg('/projects'));
+      const rows = rowButtons(api);
+      assert.equal(rows.length, 3, 'Recent header + one recent row + Refresh');
+      assert.equal(rows[0].text, 'Recent');
+      assert.deepEqual(rows[0], { text: 'Recent', disabled: {} },
+        'the Recent header must be a native disabled button with no callback_data');
+      assert.match(rows[1].text, /⚪/);
+      assert.match(rows[1].text, /gamma/);
+      assert.match(rows[1].text, /Offline/);
+      assert.deepEqual({ ...rows[1], text: 'x' }, { text: 'x', disabled: {} },
+        'recent rows must be disabled and carry no callback_data');
+      assert.equal(rows[2].text, 'Refresh');
+      assert.equal(fx.pollAllCommands().length, 0, 'opening the dashboard enqueues nothing');
+    } finally { fx.close(); }
+  });
+
+  test('/projects partitions Active now and Recent, newest first, one row per item', async () => {
+    const fx = makeFixture();
+    try {
+      fx.connect(A, ALPHA);
+      fx.connect(B, BETA);
+      fx.connect(C, GAMMA);
+      fx.disconnect(C);
+      fx.advance(1_000);
+      fx.connect(D, DELTA);
+      fx.disconnect(D);
+      const api = makeFakeApi();
+      const broker = newBroker(fx, api);
+      await deliver(broker, api, msg('/projects'));
+      const rows = rowButtons(api);
+      const texts = rows.map((b) => b.text);
+      assert.equal(texts[0], 'Active now');
+      assert.match(texts[1], /alpha/);
+      assert.match(texts[2], /beta/);
+      assert.equal(texts[3], 'Recent');
+      assert.match(texts[4], /delta/, 'the most recently seen project comes first');
+      assert.match(texts[5], /gamma/);
+      assert.equal(texts.length, 7, 'two headers + two live rows + two recent rows + Refresh');
+      for (const text of texts.slice(4)) {
+        assert.doesNotMatch(text, /alpha|beta/, 'active projects are excluded from Recent');
+      }
+      for (const name of ['alpha', 'beta', 'gamma', 'delta']) {
+        assert.equal(texts.filter((t) => t.includes(name)).length, 1,
+          `${name} must appear on exactly one row`);
+      }
+      assert.deepEqual({ ...rows[4], text: 'x' }, { text: 'x', disabled: {} },
+        'the Recent header must be a native disabled button with no callback_data');
+      assert.equal(rows[1].callback_data, 'v1:s:aaa111');
+    } finally { fx.close(); }
+  });
+
+  test('multiple live sessions in one project stay separate rows with the same color', async () => {
+    const fx = makeFixture();
+    try {
+      fx.connect(A, ALPHA);
+      fx.connect(B, { ...BETA, cwd: 'C:/proj/alpha', label: 'alpha two' });
+      const api = makeFakeApi();
+      const broker = newBroker(fx, api);
+      await deliver(broker, api, msg('/projects'));
+      const texts = rowButtons(api).map((b) => b.text);
+      assert.equal(texts[0], 'Active now');
+      assert.match(texts[1], /alpha/);
+      assert.match(texts[2], /alpha two/);
+      assert.equal(texts.length, 4, 'two session rows + header + Refresh');
+      assert.ok(colorOf(texts[1]) !== undefined, 'each row carries a project color glyph');
+      assert.equal(colorOf(texts[1]), colorOf(texts[2]),
+        'the same project must render the same stable color on every row');
+    } finally { fx.close(); }
+  });
+
+  test('live rows carry the same stable color glyph the store assigns to the project', async () => {
+    const fx = makeFixture();
+    try {
+      fx.connect(A, ALPHA);
+      fx.connect(B, BETA);
+      const api = makeFakeApi();
+      const broker = newBroker(fx, api);
+      await deliver(broker, api, msg('/projects'));
+      const projects = fx.store.listRecentTuiProjects({ since: fx.now() - 60_000 });
+      const slotByLabel = new Map(projects.map((p) => [p.label, p.colorSlot]));
+      const texts = rowButtons(api).map((b) => b.text);
+      for (const [index, name] of [[1, 'alpha'], [2, 'beta']]) {
+        const slot = slotByLabel.get(name);
+        assert.ok(Number.isInteger(slot), `the store must know a color slot for ${name}`);
+        assert.ok(texts[index].includes(PROJECT_COLOR_SLOTS[slot]),
+          `the row for ${name} must carry the slot-${slot} color glyph`);
+      }
+    } finally { fx.close(); }
+  });
+
+  test('selected renders ✓ + primary, available success, busy/waiting default', async () => {
+    const fx = makeFixture();
+    try {
+      fx.connect(A, ALPHA);
+      fx.connect(B, { ...BETA, state: 'busy' });
+      fx.connect(C, { ...GAMMA, state: 'waiting' });
+      fx.connect(D, DELTA);
+      const api = makeFakeApi();
+      const broker = newBroker(fx, api);
+      await deliver(broker, api, cb('v1:s:aaa111'));
+      const rows = rowButtons(api);
+      assert.equal(rows[0].text, 'Active now');
+      const [alpha, busy, waiting, available] = rows.slice(1, 5);
+      assert.equal(alpha.style, 'primary');
+      assert.ok(alpha.text.startsWith('✓'), 'the selected row must be prefixed with ✓');
+      assert.equal(available.style, 'success');
+      assert.ok(!available.text.startsWith('✓'));
+      assert.equal(busy.style, undefined, 'busy rows use the default style');
+      assert.equal(waiting.style, undefined, 'waiting rows use the default style');
+      assert.match(busy.text, /🟡/);
+      assert.match(busy.text, /Working/);
+      assert.match(waiting.text, /Waiting/);
+      assert.equal(fx.pollAllCommands().length, 0, 'selecting enqueues nothing');
+    } finally { fx.close(); }
+  });
+
+  test('tapping another live row moves the ✓/primary selection and re-renders', async () => {
+    const fx = makeFixture();
+    try {
+      fx.connect(A, ALPHA);
+      fx.connect(B, BETA);
+      const api = makeFakeApi();
+      const broker = newBroker(fx, api);
+      await deliver(broker, api, cb('v1:s:aaa111'));
+      let rows = rowButtons(api);
+      assert.ok(rows[1].text.startsWith('✓'));
+      assert.equal(rows[1].style, 'primary');
+      assert.equal(rows[2].style, 'success');
+      await deliver(broker, api, cb('v1:s:bbb222'));
+      rows = rowButtons(api);
+      assert.ok(rows[2].text.startsWith('✓'));
+      assert.equal(rows[2].style, 'primary');
+      assert.equal(rows[1].style, 'success');
+      assert.equal(fx.pollAllCommands().length, 0);
+    } finally { fx.close(); }
+  });
+
+  test('stale and unknown taps re-render safely and never route', async () => {
+    const fx = makeFixture();
+    try {
+      fx.connect(A, ALPHA);
+      const api = makeFakeApi();
+      const broker = newBroker(fx, api);
+      await deliver(broker, api, cb('v1:s:zzz999'));
+      assert.equal(fx.pollAllCommands().length, 0);
+      assert.equal(rowButtons(api)[0].text, 'Active now');
+      fx.advance(31_000);
+      await deliver(broker, api, cb('v1:s:aaa111'));
+      assert.equal(fx.pollAllCommands().length, 0, 'a stale tap must enqueue nothing');
+      const rows = rowButtons(api);
+      assert.ok(rows.every((b) => !b.text.startsWith('✓')),
+        'a stale selection must not mark any row');
+      assert.ok(rows.some((b) => b.text === 'Recent'),
+        'the aged-out project shows under Recent');
+    } finally { fx.close(); }
+  });
+
+  test('with a held prompt, active rows carry the current generation; stale taps never dispatch', async () => {
+    const fx = makeFixture();
+    try {
+      fx.connect(A, ALPHA);
+      fx.connect(B, BETA);
+      const api = makeFakeApi();
+      const broker = newBroker(fx, api);
+      await deliver(broker, api, msg('hold this'));
+      assert.match(api.sent[api.sent.length - 1].text, /message is saved/);
+      const pid = lastPendingId(api);
+      const rows = rowButtons(api);
+      assert.equal(rows[0].text, 'Active now');
+      assert.equal(rows[1].callback_data, `v1:p:aaa111:${pid}`);
+      assert.equal(rows[2].callback_data, `v1:p:bbb222:${pid}`);
+      await deliver(broker, api, cb(`v1:p:aaa111:${'f'.repeat(16)}`));
+      assert.equal(fx.pollAllCommands().length, 0, 'a stale generation must never dispatch');
+      await deliver(broker, api, cb(`v1:p:aaa111:${pid}`));
+      const commands = fx.pollAllCommands();
+      assert.equal(commands.length, 1);
+      assert.equal(commands[0].kind, 'prompt');
+      assert.equal(commands[0].payload.text, 'hold this');
+    } finally { fx.close(); }
+  });
+
+  test('section headers render as native disabled buttons: no callback_data, no style', async () => {
+    const fx = makeFixture();
+    try {
+      fx.connect(A, ALPHA);
+      const api = makeFakeApi();
+      const broker = newBroker(fx, api);
+      await deliver(broker, api, cb('v1:c'));
+      const header = rowButtons(api)[0];
+      assert.deepEqual(header, { text: 'Active now', disabled: {} },
+        'Telegram Bot API 10.3: disabled is the action field, never a style; '
+        + 'with no action field there is nothing to tap');
+      // Defense in depth: the retired v1:i grammar is malformed now. It is
+      // consumed, answered best-effort, and never replied or dispatched.
+      const sentBefore = api.sent.length;
+      const answeredBefore = api.answered.length;
+      await deliver(broker, api, cb('v1:i'));
+      assert.equal(api.sent.length, sentBefore, 'a v1:i tap must not produce a reply');
+      assert.equal(api.answered.length, answeredBefore + 1);
+      assert.equal(fx.pollAllCommands().length, 0);
+    } finally { fx.close(); }
+  });
+
+  test('every rendered callback_data stays within 64 UTF-8 bytes', async () => {
+    const fx = makeFixture();
+    try {
+      fx.connect(A, ALPHA);
+      fx.connect(B, BETA);
+      const api = makeFakeApi();
+      const broker = newBroker(fx, api);
+      await deliver(broker, api, msg('/projects'));
+      await deliver(broker, api, msg('held for the byte check'));
+      await deliver(broker, api, cb('v1:r'));
+      for (const sent of api.sent) {
+        for (const button of (sent.replyMarkup?.inline_keyboard ?? []).flat()) {
+          if (button.callback_data === undefined) {
+            assert.deepEqual(button, { text: button.text, disabled: {} },
+              'disabled rows carry the action field, never callback_data');
+            continue;
+          }
+          assert.ok(Buffer.byteLength(button.callback_data, 'utf8') <= 64,
+            `callback_data over 64 bytes: ${button.callback_data}`);
+        }
+      }
+    } finally { fx.close(); }
+  });
+
+  test('dashboard text and buttons never expose cwd, ids, pids or internals', async () => {
+    const fx = makeFixture();
+    try {
+      fx.connect(A, { ...ALPHA, label: 'alpha C:/secret/path pid 7' });
+      fx.connect(B, BETA);
+      const api = makeFakeApi();
+      const broker = newBroker(fx, api);
+      await deliver(broker, api, msg('/projects'));
+      await deliver(broker, api, cb('v1:s:aaa111'));
+      const visible = api.sent.map((m) => {
+        const buttons = (m.replyMarkup?.inline_keyboard ?? []).flat().map((b) => b.text).join(' | ');
+        return `${m.text}\n${buttons}`;
+      }).join('\n---\n');
+      assert.match(visible, /alpha/);
+      assert.doesNotMatch(visible, /C:\/secret|C:\/proj|pid|aaa111|bbb222/);
+      assert.doesNotMatch(visible, new RegExp(A.trackingId));
+    } finally { fx.close(); }
+  });
+
+  test('unauthorized dashboard callbacks are dropped silently without answers or replies', async () => {
+    const fx = makeFixture();
+    try {
+      fx.connect(A, ALPHA);
+      const api = makeFakeApi();
+      const broker = newBroker(fx, api);
+      for (const update of [
+        cb('v1:r', { userId: 999 }),
+        cb('v1:c', { chatId: 999 }),
+        cb('v1:s:aaa111', { isBot: true }),
+      ]) {
+        await deliver(broker, api, update);
+      }
+      assert.equal(api.sent.length, 0);
+      assert.equal(api.answered.length, 0);
+      assert.equal(fx.pollAllCommands().length, 0);
+    } finally { fx.close(); }
+  });
+
+  test('destructive Stop/Disconnect/Unlink controls carry style danger — nothing else does', async () => {
+    const fx = makeFixture();
+    try {
+      fx.connect(A, ALPHA);
+      const api = makeFakeApi();
+      const broker = newBroker(fx, api);
+      await deliver(broker, api, msg('/projects'));
+      await deliver(broker, api, cb('v1:d:aaa111'));
+      assert.equal(fx.store.appendTuiEvent({ trackingId: A.trackingId, kind: 'connected', payload: null }).ok, true);
+      await broker.drainTuiEvents();
+      // Busy state renders the Stop control too, so v1:x is covered.
+      assert.equal(fx.store.setTuiSessionState({ ...A, state: 'busy' }).ok, true);
+      assert.equal(fx.store.appendTuiEvent({ trackingId: A.trackingId, kind: 'connected', payload: null }).ok, true);
+      await broker.drainTuiEvents();
+      const destructive = new Set(['Stop the task', 'Disconnect', 'Unlink']);
+      let destructiveSeen = 0;
+      for (const sent of api.sent) {
+        for (const button of (sent.replyMarkup?.inline_keyboard ?? []).flat()) {
+          if (destructive.has(button.text)) {
+            destructiveSeen++;
+            assert.equal(button.style, 'danger', `${button.text} must be styled danger`);
+          } else {
+            assert.notEqual(button.style, 'danger', `${button.text} must not be danger`);
+          }
+        }
+      }
+      assert.ok(destructiveSeen >= 3, 'Stop, Disconnect and Unlink must actually be rendered');
+    } finally { fx.close(); }
+  });
+
+  test('v1:c and v1:r open/refresh the dashboard and never enqueue a command', async () => {
+    const fx = makeFixture();
+    try {
+      fx.connect(A, ALPHA);
+      fx.connect(B, BETA);
+      const api = makeFakeApi();
+      const broker = newBroker(fx, api);
+      await deliver(broker, api, cb('v1:c'));
+      assert.equal(api.sent[0].text, 'Your Pi projects');
+      assert.equal(rowButtons(api)[0].text, 'Active now');
+      await deliver(broker, api, cb('v1:r'));
+      assert.equal(api.sent[1].text, 'Your Pi projects');
+      assert.equal(fx.pollAllCommands().length, 0,
+        'opening or refreshing the dashboard must enqueue nothing');
     } finally { fx.close(); }
   });
 });
