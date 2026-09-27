@@ -366,6 +366,16 @@ export class Store {
     // in place and old callers that omit the new fields keep working.
     this.#ensureColumn('tui_sessions', 'project_key', 'TEXT');
     this.#ensureColumn('tui_sessions', 'branch', 'TEXT');
+    // T4B1: durable bounded display-identity snapshot on each event row.
+    // Pending events can outlive both broker memory and their tui_sessions
+    // row (deleted on disconnect), so the identity the broker needs to
+    // label them (#renderEvent) is frozen onto the event at emit time.
+    // Additive nullable TEXT columns only; no cwd, pid, shortId or any
+    // connection/session id is ever stored or returned here.
+    this.#ensureColumn('tui_events', 'session_label', 'TEXT');
+    this.#ensureColumn('tui_events', 'session_alias', 'TEXT');
+    this.#ensureColumn('tui_events', 'session_branch', 'TEXT');
+    this.#ensureColumn('tui_events', 'project_key', 'TEXT');
     this.#db.exec(`
       CREATE TABLE IF NOT EXISTS tui_projects (
         project_key TEXT PRIMARY KEY,
@@ -401,6 +411,7 @@ export class Store {
       );
     `);
     this.#backfillTuiProjects();
+    this.#backfillTuiEventIdentity();
   }
 
   #ensureColumn(table, column, ddl) {
@@ -1332,14 +1343,36 @@ export class Store {
       .get(trackingId);
   }
 
-  /** Raw event insert; callers validate kind/payload before calling. */
-  #appendTuiEventRow(trackingId, kind, payloadJson, now) {
+  /** Display-identity snapshot taken from a tui_sessions row (with its
+   * per-session alias join). Every field is nullable: identity is
+   * best-effort and never invented. The alias is ONLY the per-session
+   * alias (tui_session_aliases); the project alias is never a session
+   * alias. */
+  #tuiEventSnapshotFromRow(row) {
+    return {
+      label: row?.label ?? null,
+      alias: row?.session_alias ?? null,
+      branch: row?.branch ?? null,
+      projectKey: row?.project_key ?? null,
+    };
+  }
+
+  /** Raw event insert; callers validate kind/payload before calling.
+   * `snapshot` (T4B1) is the display identity captured atomically in the
+   * SAME insert: immutable at emit time, never rewritten later. */
+  #appendTuiEventRow(trackingId, kind, payloadJson, now, snapshot) {
+    const s = snapshot ?? { label: null, alias: null, branch: null, projectKey: null };
     const info = this.#db
       .prepare(
-        `INSERT INTO tui_events (tracking_id, kind, payload_json, created_at)
-         VALUES (?, ?, ?, ?)`,
+        `INSERT INTO tui_events
+           (tracking_id, kind, payload_json, created_at,
+            session_label, session_alias, session_branch, project_key)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
       )
-      .run(trackingId, kind, payloadJson, now);
+      .run(
+        trackingId, kind, payloadJson, now,
+        s.label, s.alias, s.branch, s.projectKey,
+      );
     return Number(info.lastInsertRowid);
   }
 
@@ -1464,6 +1497,71 @@ export class Store {
         firstSeenAt: row.connected_at,
       });
     }
+  }
+
+  /** T4B1 one-time best-effort backfill: pending legacy events with no
+   * identity snapshot get the identity of the EXACT current tui_sessions
+   * row (per-session alias joined on tracking_id + project_key); when the
+   * session row is gone, the NEWEST tui_projects row whose internal
+   * last_tracking_id exactly matches (plus its matching session alias).
+   * Never guesses across a nonmatching tracking id, never uses the
+   * project alias as a session alias, and never touches acknowledged
+   * rows. Idempotent: only rows with all four snapshot columns NULL
+   * match, and a real snapshot always carries a non-null project key. */
+  #backfillTuiEventIdentity() {
+    // Pass 1: the session row still exists — copy its live identity.
+    this.#db.exec(`
+      UPDATE tui_events SET
+        session_label = (SELECT s.label FROM tui_sessions s
+                          WHERE s.tracking_id = tui_events.tracking_id),
+        session_branch = (SELECT s.branch FROM tui_sessions s
+                           WHERE s.tracking_id = tui_events.tracking_id),
+        project_key = (SELECT s.project_key FROM tui_sessions s
+                        WHERE s.tracking_id = tui_events.tracking_id),
+        session_alias = (
+          SELECT a.alias
+          FROM tui_session_aliases a
+          WHERE a.tracking_id = tui_events.tracking_id
+            AND a.project_key = (SELECT s.project_key FROM tui_sessions s
+                                  WHERE s.tracking_id = tui_events.tracking_id)
+        )
+      WHERE acknowledged_at IS NULL
+        AND session_label IS NULL AND session_alias IS NULL
+        AND session_branch IS NULL AND project_key IS NULL
+        AND EXISTS (SELECT 1 FROM tui_sessions s
+                     WHERE s.tracking_id = tui_events.tracking_id)
+    `);
+    // Pass 2: session row gone — newest project row with an EXACT
+    // last_tracking_id match; the alias only joins when its project_key
+    // equals the matched project's key.
+    this.#db.exec(`
+      UPDATE tui_events SET
+        session_label = (SELECT p.label FROM tui_projects p
+                          WHERE p.last_tracking_id = tui_events.tracking_id
+                          ORDER BY p.last_seen_at DESC, p.project_key DESC LIMIT 1),
+        session_branch = (SELECT p.branch FROM tui_projects p
+                           WHERE p.last_tracking_id = tui_events.tracking_id
+                           ORDER BY p.last_seen_at DESC, p.project_key DESC LIMIT 1),
+        project_key = (SELECT p.project_key FROM tui_projects p
+                        WHERE p.last_tracking_id = tui_events.tracking_id
+                        ORDER BY p.last_seen_at DESC, p.project_key DESC LIMIT 1),
+        session_alias = (
+          SELECT a.alias
+          FROM tui_projects p2
+          JOIN tui_session_aliases a
+            ON a.tracking_id = p2.last_tracking_id AND a.project_key = p2.project_key
+          WHERE p2.last_tracking_id = tui_events.tracking_id
+          ORDER BY p2.last_seen_at DESC, p2.project_key DESC
+          LIMIT 1
+        )
+      WHERE acknowledged_at IS NULL
+        AND session_label IS NULL AND session_alias IS NULL
+        AND session_branch IS NULL AND project_key IS NULL
+        AND NOT EXISTS (SELECT 1 FROM tui_sessions s
+                         WHERE s.tracking_id = tui_events.tracking_id)
+        AND EXISTS (SELECT 1 FROM tui_projects p
+                     WHERE p.last_tracking_id = tui_events.tracking_id)
+    `);
   }
 
   /** Transaction-core prune. Inactive = not referenced by ANY current
@@ -1621,7 +1719,12 @@ export class Store {
             connectionId, piSessionId, piSessionFile, cwd,
             label, projectKey, branch, branch, pid, projectKey, now, now, now, trackingId,
           );
-        this.#appendTuiEventRow(trackingId, 'connected', 'null', now);
+        // T4B1: snapshot AFTER the row mutation so the 'connected' event
+        // freezes the post-drift identity (alias join included).
+        this.#appendTuiEventRow(
+          trackingId, 'connected', 'null', now,
+          this.#tuiEventSnapshotFromRow(this.#getTuiSessionRow(trackingId)),
+        );
         this.#upsertTuiProjectRow({
           projectKey, label, branch, trackingId, state: 'connected', seenAt: now,
         });
@@ -1703,7 +1806,10 @@ export class Store {
           trackingId, resolvedShortId, piSessionId, piSessionFile, cwd,
           label, branch, pid, projectKey, connectionId, now, now, now,
         );
-      this.#appendTuiEventRow(trackingId, 'connected', 'null', now);
+      this.#appendTuiEventRow(
+        trackingId, 'connected', 'null', now,
+        this.#tuiEventSnapshotFromRow(this.#getTuiSessionRow(trackingId)),
+      );
       this.#upsertTuiProjectRow({
         projectKey, label, branch, trackingId, state: 'connected', seenAt: now,
       });
@@ -1800,10 +1906,16 @@ export class Store {
         return { ok: false, reason: 'not_owner' };
       }
       const projectKey = row.project_key ?? this.#deriveTuiProjectKey(row.cwd, trackingId);
+      // T4B1: the disconnected event must stay labeled after the row is
+      // gone, so the identity is frozen BEFORE the delete, in the SAME
+      // transaction. The row's alias join is the per-session alias bound
+      // to this tracking id and project identity at disconnect time.
+      const snapshot = this.#tuiEventSnapshotFromRow(row);
+      snapshot.projectKey = projectKey;
       this.#db
         .prepare('DELETE FROM tui_sessions WHERE tracking_id = ?')
         .run(trackingId);
-      this.#appendTuiEventRow(trackingId, 'disconnected', 'null', now);
+      this.#appendTuiEventRow(trackingId, 'disconnected', 'null', now, snapshot);
       const stillTracked = this.#db
         .prepare('SELECT 1 FROM tui_sessions WHERE project_key = ? LIMIT 1')
         .get(projectKey);
@@ -2058,7 +2170,10 @@ export class Store {
       if (connectionId !== undefined && row.connection_id !== connectionId) {
         return { ok: false, reason: 'not_owner' };
       }
-      const eventId = this.#appendTuiEventRow(trackingId, kind, payloadJson, this.#now());
+      const eventId = this.#appendTuiEventRow(
+        trackingId, kind, payloadJson, this.#now(),
+        this.#tuiEventSnapshotFromRow(this.#getTuiSessionRow(trackingId)),
+      );
       return { ok: true, eventId };
     });
   }
@@ -2335,18 +2450,23 @@ export class Store {
     return this.#transaction(() => {
       const rows = this.#db
         .prepare(
-          `SELECT event_id, tracking_id, kind, payload_json, created_at
+          `SELECT event_id, tracking_id, kind, payload_json, created_at,
+                  session_label, session_alias, session_branch, project_key
            FROM tui_events
            WHERE acknowledged_at IS NULL
            ORDER BY event_id LIMIT ?`,
         )
         .all(limit);
-      return rows.map((row) => ({
+      return rows.map((row) => freezeDeep({
         eventId: row.event_id,
         trackingId: row.tracking_id,
         kind: row.kind,
         payload: JSON.parse(row.payload_json),
         createdAt: row.created_at,
+        label: row.session_label,
+        alias: row.session_alias,
+        branch: row.session_branch,
+        projectKey: row.project_key,
       }));
     });
   }

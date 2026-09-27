@@ -1479,3 +1479,386 @@ describe('store: tui session aliases (T4C1)', () => {
   });
 });
 
+// T4B1: durable bounded display-identity snapshot on each TUI event.
+// Pending tui_events can outlive both broker memory and their tui_sessions
+// row, so every append path atomically snapshots the CURRENT display
+// identity (session label, per-session alias, branch, project key) into
+// nullable TEXT columns on the event row itself. The snapshot is immutable
+// at emit time; later alias/branch/label changes never rewrite old events.
+// Legacy pending events get a best-effort one-time backfill (exact current
+// session first, else the newest project row whose last_tracking_id exactly
+// matches); acknowledged legacy events are never touched.
+describe('store: tui event identity snapshots (T4B1)', () => {
+  let dir;
+  let t;
+  let store;
+  let dbPath;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(TEST_RUNS, 'tui-event-id-'));
+    t = T0;
+    dbPath = join(dir, 'main.sqlite');
+    store = new Store(dbPath, { now: () => t, isProcessAlive: () => true });
+  });
+
+  afterEach(() => {
+    store.close();
+  });
+
+  const reg = (over = {}) => ({
+    trackingId: 'a'.repeat(32),
+    connectionId: 'c'.repeat(32),
+    label: 'alpha',
+    branch: 'main',
+    pid: 1111,
+    staleCutoff: t + 30_000,
+    ...over,
+  });
+
+  const getSession = (trackingId) =>
+    store.getTuiSession({ trackingId, staleCutoff: t + 30_000 });
+
+  const brokerEvents = () => store.listPendingBrokerTuiEvents({});
+
+  const reopen = () => {
+    store.close();
+    store = new Store(dbPath, { now: () => t, isProcessAlive: () => true });
+  };
+
+  const withRawDb = (fn) => {
+    const db = new DatabaseSync(dbPath);
+    try {
+      return fn(db);
+    } finally {
+      db.close();
+    }
+  };
+
+  /** Simulate a pre-T4B1 legacy event row: only the original columns. */
+  const insertLegacyEvent = (trackingId, kind, { acked = false } = {}) => {
+    withRawDb((db) => {
+      db.prepare(
+        `INSERT INTO tui_events (tracking_id, kind, payload_json, created_at, acknowledged_at)
+         VALUES (?, ?, 'null', ?, ?)`,
+      ).run(trackingId, kind, t, acked ? t : null);
+    });
+  };
+
+  const snapshotColumns = () => withRawDb((db) =>
+    db.prepare('PRAGMA table_info(tui_events)').all().map((r) => r.name));
+
+  const snapshotRows = () => withRawDb((db) =>
+    db.prepare(
+      'SELECT session_label, session_alias, session_branch, project_key FROM tui_events ORDER BY event_id',
+    ).all());
+
+  test('every event kind snapshots the current session identity atomically', () => {
+    const trackingId = 'a'.repeat(32);
+    store.registerTuiSession(reg({ trackingId, cwd: 'C:/proj/all-kinds' }));
+    assert.equal(store.setTuiSessionAlias({ trackingId, alias: 'win-1' }).ok, true);
+    const projectKey = getSession(trackingId).projectKey;
+    t += 1000;
+    // Same-project replacement: the new 'connected' event must snapshot
+    // the PRESERVED per-session alias.
+    const replaced = store.registerTuiSession(reg({
+      trackingId, connectionId: '2'.repeat(32), cwd: 'C:/proj/all-kinds',
+    }));
+    assert.equal(replaced.ok, true);
+    assert.equal(replaced.replaced, true);
+    store.appendTuiEvent({ trackingId, kind: 'status', payload: null });
+    store.appendTuiEvent({ trackingId, kind: 'final_output', payload: { text: 'done' } });
+    store.appendTuiEvent({ trackingId, kind: 'command_result', payload: { ok: true } });
+    const events = brokerEvents().filter((e) => e.kind !== 'connected'
+      || e.createdAt === T0 + 1000);
+    const byKind = Object.fromEntries(events.map((e) => [e.kind, e]));
+    for (const kind of ['connected', 'status', 'final_output', 'command_result']) {
+      const event = byKind[kind];
+      assert.ok(event, `${kind} event is pending`);
+      assert.equal(event.label, 'alpha', `${kind} snapshots the session label`);
+      assert.equal(event.alias, 'win-1', `${kind} snapshots the per-session alias`);
+      assert.equal(event.branch, 'main', `${kind} snapshots the branch`);
+      assert.equal(event.projectKey, projectKey, `${kind} snapshots the project key`);
+    }
+  });
+
+  test('connected and disconnected events capture the alias and branch bound at emit time', () => {
+    const trackingId = 'a'.repeat(32);
+    store.registerTuiSession(reg({
+      trackingId, connectionId: '1'.repeat(32), cwd: 'C:/proj/lifecycle', branch: 'feature/x',
+    }));
+    assert.equal(store.setTuiSessionAlias({ trackingId, alias: 'window A' }).ok, true);
+    t += 1000;
+    // Same-project replacement: the 'connected' event snapshots the
+    // preserved per-session alias at emit time.
+    const replaced = store.registerTuiSession(reg({
+      trackingId, connectionId: '2'.repeat(32), cwd: 'C:/proj/lifecycle', branch: 'feature/x',
+    }));
+    assert.equal(replaced.ok, true);
+    assert.equal(replaced.replaced, true);
+    t += 1000;
+    assert.equal(store.disconnectTuiSession({ trackingId, connectionId: '2'.repeat(32) }).ok, true);
+    const events = brokerEvents();
+    const connected = events.filter((e) => e.kind === 'connected').at(-1);
+    const disconnected = events.find((e) => e.kind === 'disconnected');
+    assert.equal(connected.alias, 'window A');
+    assert.equal(connected.branch, 'feature/x');
+    assert.equal(disconnected.alias, 'window A', 'the disconnected event still carries the alias');
+    assert.equal(disconnected.branch, 'feature/x');
+    assert.equal(disconnected.label, 'alpha');
+    assert.equal(disconnected.projectKey, connected.projectKey);
+  });
+
+  test('the disconnected event remains readable after the session row is deleted', () => {
+    const trackingId = 'a'.repeat(32);
+    store.registerTuiSession(reg({ trackingId, cwd: 'C:/proj/gone-row' }));
+    assert.equal(store.setTuiSessionAlias({ trackingId, alias: 'still-readable' }).ok, true);
+    t += 1000;
+    store.disconnectTuiSession({ trackingId, connectionId: 'c'.repeat(32) });
+    assert.equal(getSession(trackingId), null, 'the live row is deleted on disconnect');
+    const disconnected = brokerEvents().find((e) => e.kind === 'disconnected');
+    assert.ok(disconnected, 'the disconnected event is still drainable');
+    assert.equal(disconnected.label, 'alpha');
+    assert.equal(disconnected.alias, 'still-readable');
+    assert.equal(disconnected.branch, 'main');
+    assert.ok(typeof disconnected.projectKey === 'string' && disconnected.projectKey.length === 64);
+  });
+
+  test('Store close/reopen preserves pending snapshots', () => {
+    const trackingId = 'a'.repeat(32);
+    store.registerTuiSession(reg({ trackingId, cwd: 'C:/proj/restart' }));
+    assert.equal(store.setTuiSessionAlias({ trackingId, alias: 'durable' }).ok, true);
+    t += 1000;
+    store.appendTuiEvent({ trackingId, kind: 'final_output', payload: { text: 'kept' } });
+    const before = brokerEvents().find((e) => e.kind === 'final_output');
+    reopen();
+    const after = brokerEvents().find((e) => e.kind === 'final_output');
+    assert.deepEqual(
+      { label: after.label, alias: after.alias, branch: after.branch, projectKey: after.projectKey },
+      { label: before.label, alias: before.alias, branch: before.branch, projectKey: before.projectKey },
+      'pending snapshots survive a broker restart',
+    );
+  });
+
+  test('later alias and branch changes never rewrite already-emitted events', () => {
+    const trackingId = 'a'.repeat(32);
+    store.registerTuiSession(reg({ trackingId, cwd: 'C:/proj/immutable', branch: 'main' }));
+    assert.equal(store.setTuiSessionAlias({ trackingId, alias: 'before' }).ok, true);
+    t += 1000;
+    store.appendTuiEvent({ trackingId, kind: 'final_output', payload: { text: 'old' } });
+    t += 1000;
+    assert.equal(store.setTuiSessionAlias({ trackingId, alias: 'after' }).ok, true);
+    assert.equal(store.heartbeatTuiSession({ trackingId, connectionId: 'c'.repeat(32), branch: 'renamed' }).ok, true);
+    t += 1000;
+    store.appendTuiEvent({ trackingId, kind: 'final_output', payload: { text: 'new' } });
+    const events = brokerEvents().filter((e) => e.kind === 'final_output');
+    assert.equal(events[0].alias, 'before', 'the old event keeps its frozen alias');
+    assert.equal(events[0].branch, 'main', 'the old event keeps its frozen branch');
+    assert.equal(events[1].alias, 'after', 'the new event snapshots the new alias');
+    assert.equal(events[1].branch, 'renamed', 'the new event snapshots the new branch');
+  });
+
+  test('same-project multiple windows retain distinct frozen aliases', () => {
+    const one = 'a'.repeat(32);
+    const two = 'b'.repeat(32);
+    store.registerTuiSession(reg({ trackingId: one, connectionId: '1'.repeat(32), cwd: 'C:/proj/shared' }));
+    store.registerTuiSession(reg({ trackingId: two, connectionId: '2'.repeat(32), cwd: 'c:/proj/shared/' }));
+    assert.equal(store.setTuiSessionAlias({ trackingId: one, alias: 'left window' }).ok, true);
+    assert.equal(store.setTuiSessionAlias({ trackingId: two, alias: 'right window' }).ok, true);
+    t += 1000;
+    store.appendTuiEvent({ trackingId: one, kind: 'status', payload: null });
+    store.appendTuiEvent({ trackingId: two, kind: 'status', payload: null });
+    const events = brokerEvents().filter((e) => e.kind === 'status');
+    assert.equal(events[0].alias, 'left window');
+    assert.equal(events[1].alias, 'right window');
+    assert.equal(events[0].projectKey, events[1].projectKey, 'same project identity, distinct aliases');
+  });
+
+  test('project drift never attaches the old alias or old project to new events', () => {
+    const trackingId = 'a'.repeat(32);
+    store.registerTuiSession(reg({ trackingId, connectionId: '1'.repeat(32), cwd: 'C:/proj/drift-old' }));
+    assert.equal(store.setTuiSessionAlias({ trackingId, alias: 'old-project alias' }).ok, true);
+    t += 1000;
+    // Refresh path onto a new project identity.
+    assert.equal(store.registerTuiSession(reg({
+      trackingId, connectionId: '1'.repeat(32), cwd: 'C:/proj/drift-new',
+    })).ok, true);
+    store.appendTuiEvent({ trackingId, kind: 'status', payload: null });
+    const refreshed = brokerEvents().filter((e) => e.kind === 'status').at(-1);
+    assert.equal(refreshed.alias, null, 'a drifted project never carries the old alias');
+    const newKey = getSession(trackingId).projectKey;
+    assert.equal(refreshed.projectKey, newKey);
+    // INSERT path after disconnect onto yet another project.
+    assert.equal(store.disconnectTuiSession({ trackingId, connectionId: '1'.repeat(32) }).ok, true);
+    t += 1000;
+    assert.equal(store.registerTuiSession(reg({
+      trackingId, connectionId: '2'.repeat(32), cwd: 'C:/proj/drift-third',
+    })).ok, true);
+    store.appendTuiEvent({ trackingId, kind: 'status', payload: null });
+    const inserted = brokerEvents().filter((e) => e.kind === 'status').at(-1);
+    assert.equal(inserted.alias, null);
+    assert.notEqual(inserted.projectKey, newKey, 'the third project has its own identity');
+    assert.equal(withRawDb((db) =>
+      db.prepare('SELECT COUNT(*) AS n FROM tui_session_aliases WHERE tracking_id = ?').get(trackingId).n,
+    ), 0, 'no stale alias row exists anywhere');
+  });
+
+  test('legacy pending events backfill from the exact current session (including its session alias)', () => {
+    const trackingId = 'a'.repeat(32);
+    store.registerTuiSession(reg({ trackingId, cwd: 'C:/proj/backfill-live', branch: 'legacy' }));
+    assert.equal(store.setTuiSessionAlias({ trackingId, alias: 'legacy alias' }).ok, true);
+    const projectKey = getSession(trackingId).projectKey;
+    reopen();
+    insertLegacyEvent(trackingId, 'status');
+    insertLegacyEvent(trackingId, 'command_result');
+    reopen();
+    const events = brokerEvents().filter((e) => e.kind === 'status' || e.kind === 'command_result');
+    assert.equal(events.length, 2);
+    for (const event of events) {
+      assert.equal(event.label, 'alpha');
+      assert.equal(event.alias, 'legacy alias', 'the session alias joins on tracking_id + project_key');
+      assert.equal(event.branch, 'legacy');
+      assert.equal(event.projectKey, projectKey);
+    }
+    // Idempotent: another reopen must not change anything.
+    reopen();
+    const after = brokerEvents().filter((e) => e.kind === 'status' || e.kind === 'command_result');
+    assert.equal(after.length, 2);
+    for (const event of after) {
+      assert.equal(event.alias, 'legacy alias');
+      assert.equal(event.projectKey, projectKey);
+    }
+  });
+
+  test('legacy pending events with a deleted session fall back to the newest exactly-matching project row', () => {
+    const trackingId = 'a'.repeat(32);
+    const otherId = 'b'.repeat(32);
+    store.registerTuiSession(reg({ trackingId, cwd: 'C:/proj/fallback', branch: 'fb-branch' }));
+    assert.equal(store.setTuiSessionAlias({ trackingId, alias: 'fb alias' }).ok, true);
+    // An unrelated window in another project must not be picked up.
+    store.registerTuiSession(reg({
+      trackingId: otherId, connectionId: '2'.repeat(32), cwd: 'C:/proj/unrelated', label: 'other',
+    }));
+    assert.equal(store.disconnectTuiSession({ trackingId, connectionId: 'c'.repeat(32) }).ok, true);
+    const projectKey = store.listRecentTuiProjects({ since: 0 })
+      .find((p) => p.label === 'alpha').projectKey;
+    reopen();
+    insertLegacyEvent(trackingId, 'command_result');
+    reopen();
+    const event = brokerEvents().find((e) => e.kind === 'command_result');
+    assert.equal(event.label, 'alpha');
+    assert.equal(event.alias, 'fb alias', 'the alias joins only on the exact matched project');
+    assert.equal(event.branch, 'fb-branch');
+    assert.equal(event.projectKey, projectKey);
+  });
+
+  test('acknowledged legacy events are never touched by the backfill', () => {
+    const trackingId = 'a'.repeat(32);
+    store.registerTuiSession(reg({ trackingId, cwd: 'C:/proj/acked' }));
+    reopen();
+    // 'command_result' is unique to the legacy row in this scenario.
+    insertLegacyEvent(trackingId, 'command_result', { acked: true });
+    reopen();
+    const rows = withRawDb((db) =>
+      db.prepare("SELECT session_label, session_alias, session_branch, project_key FROM tui_events WHERE kind = 'command_result'").all());
+    assert.equal(rows.length, 1);
+    assert.deepEqual(
+      [rows[0].session_label, rows[0].session_alias, rows[0].session_branch, rows[0].project_key],
+      [null, null, null, null],
+      'acked legacy rows stay exactly as they were',
+    );
+  });
+
+  test('missing identity stays null without throwing; the backfill never guesses', () => {
+    const trackingId = 'a'.repeat(32);
+    store.registerTuiSession(reg({ trackingId, cwd: 'C:/proj/never-again' }));
+    assert.equal(store.disconnectTuiSession({ trackingId, connectionId: 'c'.repeat(32) }).ok, true);
+    reopen();
+    // A tracking id matching NO current session and NO project row.
+    insertLegacyEvent('f'.repeat(32), 'final_output');
+    reopen();
+    const event = brokerEvents().find((e) => e.trackingId === 'f'.repeat(32));
+    assert.ok(event, 'the legacy event is still drainable');
+    assert.deepEqual(
+      { label: event.label, alias: event.alias, branch: event.branch, projectKey: event.projectKey },
+      { label: null, alias: null, branch: null, projectKey: null },
+      'no match means no invented identity',
+    );
+  });
+
+  test('the backfill never uses the project alias as a session alias', () => {
+    const trackingId = 'a'.repeat(32);
+    store.registerTuiSession(reg({ trackingId, cwd: 'C:/proj/no-project-alias' }));
+    const projectKey = getSession(trackingId).projectKey;
+    assert.equal(store.setTuiProjectAlias({ projectKey, alias: 'project-only name' }).ok, true);
+    assert.equal(store.disconnectTuiSession({ trackingId, connectionId: 'c'.repeat(32) }).ok, true);
+    reopen();
+    insertLegacyEvent(trackingId, 'disconnected');
+    reopen();
+    const event = brokerEvents().find((e) => e.kind === 'disconnected');
+    assert.equal(event.label, 'alpha', 'label/branch/project come from the project row');
+    assert.equal(event.alias, null, 'the project alias is NOT a session alias');
+  });
+
+  test('migration is additive, nullable and idempotent across reopen', () => {
+    const trackingId = 'a'.repeat(32);
+    store.registerTuiSession(reg({ trackingId, cwd: 'C:/proj/mig' }));
+    store.appendTuiEvent({ trackingId, kind: 'status', payload: null });
+    reopen();
+    reopen();
+    const columns = snapshotColumns();
+    for (const col of ['session_label', 'session_alias', 'session_branch', 'project_key']) {
+      assert.ok(columns.includes(col), `${col} exists`);
+    }
+    const rows = snapshotRows();
+    assert.equal(rows.length, 2, 'connected + status, no duplication');
+    assert.equal(rows[0].session_label, 'alpha');
+    assert.equal(rows[0].project_key, getSession(trackingId).projectKey);
+    reopen();
+    assert.equal(snapshotRows().length, 2, 'no duplication on re-migration');
+  });
+
+  test('returned broker events are frozen', () => {
+    const trackingId = 'a'.repeat(32);
+    store.registerTuiSession(reg({ trackingId, cwd: 'C:/proj/frozen-events' }));
+    store.appendTuiEvent({ trackingId, kind: 'status', payload: null });
+    const event = brokerEvents()[0];
+    assert.throws(() => { event.label = 'mutated'; }, TypeError);
+    assert.throws(() => { event.alias = 'mutated'; }, TypeError);
+    assert.throws(() => { event.projectKey = 'mutated'; }, TypeError);
+  });
+
+  test('no snapshot column or value contains cwd, pid, shortId, connection or pi-session data', () => {
+    const trackingId = 'a'.repeat(32);
+    store.registerTuiSession(reg({
+      trackingId,
+      cwd: 'C:/proj/very-secret-path',
+      piSessionId: 'pi-session-xyz',
+      piSessionFile: 'C:/proj/very-secret-path/session.jsonl',
+    }));
+    store.setTuiSessionAlias({ trackingId, alias: 'private window' });
+    t += 1000;
+    store.appendTuiEvent({ trackingId, kind: 'final_output', payload: { text: 'hello' } });
+    store.disconnectTuiSession({ trackingId, connectionId: 'c'.repeat(32) });
+    const events = brokerEvents();
+    const serialized = JSON.stringify(events);
+    assert.ok(!serialized.includes('very-secret-path'), 'no raw cwd in returned events');
+    assert.ok(!serialized.includes('pi-session-xyz'), 'no pi session id in returned events');
+    for (const forbidden of ['cwd', 'pid', 'shortId', 'connectionId', 'piSessionId', 'piSessionFile']) {
+      for (const event of events) {
+        assert.ok(!(forbidden in event), `${forbidden} must never be exposed`);
+      }
+    }
+    const columns = snapshotColumns();
+    for (const col of columns) {
+      assert.ok(
+        !['cwd', 'pid', 'short_id', 'connection_id', 'pi_session_id', 'pi_session_file'].includes(col),
+        `no forbidden column ${col}`,
+      );
+    }
+    for (const row of snapshotRows()) {
+      const values = JSON.stringify(row);
+      assert.ok(!values.includes('very-secret-path'), 'no raw cwd in stored snapshot columns');
+      assert.ok(!values.includes('pi-session-xyz'), 'no pi session id in stored snapshot columns');
+    }
+  });
+});
