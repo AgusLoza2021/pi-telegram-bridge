@@ -3211,3 +3211,364 @@ describe('SelectiveTelegramBroker: voice transcription resolves before the trans
   });
 });
 
+
+describe('SelectiveTelegramBroker: durable selected-destination parity (T4A)', () => {
+  /**
+   * Real Store fixture: identity checks, transactions and drift guards all
+   * stay real; only explicitly poisoned seams (below) are overridden.
+   */
+  function makeDurableFixture() {
+    const dir = mkdtempSync(join(TEST_RUNS, 'sel-durable-'));
+    let t = Date.now();
+    const now = () => t;
+    const store = new Store(join(dir, 'bridge.sqlite'), { now, isProcessAlive: () => true });
+    const clientA = new TuiBridgeClient(store, { staleAfterMs: 30_000 });
+    const clientB = new TuiBridgeClient(store, { staleAfterMs: 30_000 });
+    return {
+      store,
+      clientA,
+      clientB,
+      now,
+      advance(ms) { t += ms; },
+      connectA() {
+        assert.equal(clientA.connect({ ...A, shortId: 'aaa111', label: 'alpha', pid: 1111, cwd: 'C:/proj/alpha' }).ok, true);
+      },
+      connectB() {
+        assert.equal(clientB.connect({ ...B, shortId: 'bbb222', label: 'beta', pid: 2222, cwd: 'C:/proj/beta' }).ok, true);
+      },
+      close() { store.close(); },
+    };
+  }
+
+  function newDurableBroker(fx, api, store = fx.store) {
+    return new SelectiveTelegramBroker({ store, api, config: BROKER_CONFIG, now: fx.now });
+  }
+
+  async function deliverDurable(broker, api, update) {
+    broker.handleUpdate(update);
+    await broker.flushReplies();
+    return update;
+  }
+
+  /** The exact project key the store derived for a fixture session. */
+  function projectKeyOf(fx, trackingId) {
+    const session = fx.store.getTuiSession({ trackingId, staleCutoff: fx.now() - 30_000 });
+    assert.notEqual(session, null);
+    return session.projectKey;
+  }
+
+  /**
+   * A duck-typed store facade that binds the broker's FULL real-store
+   * surface to the real Store, then overrides only the named seams. Used
+   * where the store's own drift guards make an adversarial durable state
+   * unreachable through the public API: everything except the poisoned
+   * seam (identity checks, transactions, clearing) stays real.
+   */
+  const BROKER_STORE_METHODS = [
+    'withTransaction', 'getBrokerTransportOffset', 'advanceBrokerTransportOffset',
+    'recordInbox', 'listTuiSessions', 'listRecentTuiProjects', 'enqueueTuiCommand',
+    'listPendingBrokerTuiEvents', 'acknowledgeTuiEvents',
+    'getSelectedTuiTarget', 'setSelectedTuiTarget', 'clearSelectedTuiTarget',
+  ];
+  function poisonStore(fx, overrides) {
+    const bound = Object.fromEntries(
+      BROKER_STORE_METHODS.map((name) => [name, fx.store[name].bind(fx.store)]),
+    );
+    return Object.assign(bound, overrides);
+  }
+
+  test('constructor refuses a store missing the durable selection methods', () => {
+    const fx = makeDurableFixture();
+    try {
+      const api = makeFakeApi();
+      for (const missing of ['getSelectedTuiTarget', 'setSelectedTuiTarget', 'clearSelectedTuiTarget']) {
+        const partial = poisonStore(fx, {});
+        delete partial[missing];
+        assert.throws(
+          () => newDurableBroker(fx, api, partial),
+          TypeError,
+          `a store without ${missing} must be rejected`,
+        );
+      }
+    } finally { fx.close(); }
+  });
+
+  test('dashboard v1:s selection persists durably, survives broker reconstruction and routes plain text', async () => {
+    const fx = makeDurableFixture();
+    try {
+      fx.connectA();
+      fx.connectB();
+      const api1 = makeFakeApi();
+      const broker1 = newDurableBroker(fx, api1);
+      await deliverDurable(broker1, api1, cb('v1:s:aaa111'));
+      assert.deepEqual(
+        fx.store.getSelectedTuiTarget(),
+        { trackingId: A.trackingId, projectKey: projectKeyOf(fx, A.trackingId) },
+        'the dashboard tap must persist the selection durably',
+      );
+      // A brand-new broker process (memory lost) adopts the durable target.
+      const api2 = makeFakeApi();
+      const broker2 = newDurableBroker(fx, api2);
+      await broker2.start();
+      assert.equal(api2.sent.length, 0, 'adoption itself never sends Telegram');
+      assert.equal(fx.clientA.poll(A).commands.length, 0, 'adoption never enqueues commands');
+      await deliverDurable(broker2, api2, msg('hello from the garden'));
+      const commands = fx.clientA.poll(A).commands;
+      assert.equal(commands.length, 1, 'the adopted selection must route plain text to A');
+      assert.equal(commands[0].kind, 'prompt');
+      assert.equal(commands[0].payload.text, 'hello from the garden');
+      assert.equal(fx.clientB.poll(B).commands.length, 0);
+    } finally { fx.close(); }
+  });
+
+  test('/use selection persists and survives a restart', async () => {
+    const fx = makeDurableFixture();
+    try {
+      fx.connectA();
+      fx.connectB();
+      const api1 = makeFakeApi();
+      const broker1 = newDurableBroker(fx, api1);
+      await deliverDurable(broker1, api1, msg('/use aaa111'));
+      assert.deepEqual(
+        fx.store.getSelectedTuiTarget(),
+        { trackingId: A.trackingId, projectKey: projectKeyOf(fx, A.trackingId) },
+      );
+      const api2 = makeFakeApi();
+      const broker2 = newDurableBroker(fx, api2);
+      await broker2.start();
+      await deliverDurable(broker2, api2, msg('/status'));
+      const commands = fx.clientA.poll(A).commands;
+      assert.equal(commands.length, 1);
+      assert.equal(commands[0].kind, 'status');
+    } finally { fx.close(); }
+  });
+
+  test('sole-session /start auto-selection persists durably', async () => {
+    const fx = makeDurableFixture();
+    try {
+      fx.connectA();
+      const api = makeFakeApi();
+      const broker = newDurableBroker(fx, api);
+      await deliverDurable(broker, api, msg('/start'));
+      assert.deepEqual(
+        fx.store.getSelectedTuiTarget(),
+        { trackingId: A.trackingId, projectKey: projectKeyOf(fx, A.trackingId) },
+      );
+    } finally { fx.close(); }
+  });
+
+  test('sole-session plain-text auto-selection persists durably', async () => {
+    const fx = makeDurableFixture();
+    try {
+      fx.connectA();
+      const api = makeFakeApi();
+      const broker = newDurableBroker(fx, api);
+      await deliverDurable(broker, api, msg('water the tomatoes'));
+      assert.deepEqual(
+        fx.store.getSelectedTuiTarget(),
+        { trackingId: A.trackingId, projectKey: projectKeyOf(fx, A.trackingId) },
+      );
+    } finally { fx.close(); }
+  });
+
+  test('callback status selection persists durably', async () => {
+    const fx = makeDurableFixture();
+    try {
+      fx.connectA();
+      const api = makeFakeApi();
+      const broker = newDurableBroker(fx, api);
+      await deliverDurable(broker, api, cb('v1:q:aaa111'));
+      assert.deepEqual(
+        fx.store.getSelectedTuiTarget(),
+        { trackingId: A.trackingId, projectKey: projectKeyOf(fx, A.trackingId) },
+      );
+    } finally { fx.close(); }
+  });
+
+  test('a persisted stale target clears at start and never routes', async () => {
+    const fx = makeDurableFixture();
+    try {
+      fx.connectA();
+      const api1 = makeFakeApi();
+      const broker1 = newDurableBroker(fx, api1);
+      await deliverDurable(broker1, api1, msg('/use aaa111'));
+      assert.notEqual(fx.store.getSelectedTuiTarget(), null);
+      fx.advance(60_000); // the row survives but the heartbeat is stale: zero live sessions
+      const api2 = makeFakeApi();
+      const broker2 = newDurableBroker(fx, api2);
+      await broker2.start();
+      assert.equal(fx.store.getSelectedTuiTarget(), null, 'a stale durable target must clear at start');
+      await deliverDurable(broker2, api2, msg('anyone there?'));
+      assert.equal(fx.clientA.poll(A).commands.length, 0, 'a cleared target never routes');
+    } finally { fx.close(); }
+  });
+
+  test('a persisted target whose project no longer matches clears at start', async () => {
+    const fx = makeDurableFixture();
+    try {
+      fx.connectA();
+      const api1 = makeFakeApi();
+      const broker1 = newDurableBroker(fx, api1);
+      await deliverDurable(broker1, api1, msg('/use aaa111'));
+      // Poisoned READ only: simulate a project identity that changed
+      // underneath the broker; the real store keeps the real target.
+      const store = poisonStore(fx, {
+        getSelectedTuiTarget: () => ({ trackingId: A.trackingId, projectKey: 'f'.repeat(64) }),
+      });
+      const api2 = makeFakeApi();
+      const broker2 = newDurableBroker(fx, api2, store);
+      await broker2.start();
+      assert.equal(fx.store.getSelectedTuiTarget(), null, 'a project-mismatched durable target must clear');
+      assert.equal(fx.clientA.poll(A).commands.length, 0);
+      assert.equal(api2.sent.length, 0);
+    } finally { fx.close(); }
+  });
+
+  test('a persisted target naming a missing row clears at start', async () => {
+    const fx = makeDurableFixture();
+    try {
+      fx.connectA();
+      const api1 = makeFakeApi();
+      const broker1 = newDurableBroker(fx, api1);
+      await deliverDurable(broker1, api1, msg('/use aaa111'));
+      // Poisoned READ only: the durable target names a tracking id whose
+      // row is gone; the real store keeps the real (stale) target.
+      const store = poisonStore(fx, {
+        getSelectedTuiTarget: () => ({ trackingId: 'z'.repeat(32), projectKey: projectKeyOf(fx, A.trackingId) }),
+      });
+      const api2 = makeFakeApi();
+      const broker2 = newDurableBroker(fx, api2, store);
+      await broker2.start();
+      assert.equal(fx.store.getSelectedTuiTarget(), null, 'a missing-row durable target must clear');
+      assert.equal(api2.sent.length, 0);
+    } finally { fx.close(); }
+  });
+
+  test('a refused durable set fails closed: no selection, no durable state, no command', async () => {
+    const fx = makeDurableFixture();
+    try {
+      fx.connectA();
+      const store = poisonStore(fx, {
+        setSelectedTuiTarget: () => ({ ok: false, reason: 'forced' }),
+      });
+      const api = makeFakeApi();
+      const broker = newDurableBroker(fx, api, store);
+      const update = await deliverDurable(broker, api, msg('hello there'));
+      assert.equal(fx.store.getSelectedTuiTarget(), null, 'a refused selection must not persist');
+      assert.equal(fx.clientA.poll(A).commands.length, 0, 'a store-refused selection never routes');
+      assert.match(api.sent[0].text, /No session selected/);
+      assert.equal(fx.store.getBrokerTransportOffset(), update.update_id + 1, 'the receipt still commits');
+    } finally { fx.close(); }
+  });
+
+  test('a throwing durable set fails closed without wedging the update', async () => {
+    const fx = makeDurableFixture();
+    try {
+      fx.connectA();
+      const store = poisonStore(fx, {
+        setSelectedTuiTarget: () => { throw new Error('boom'); },
+      });
+      const api = makeFakeApi();
+      const broker = newDurableBroker(fx, api, store);
+      const update = await deliverDurable(broker, api, msg('hello there'));
+      assert.equal(fx.store.getSelectedTuiTarget(), null);
+      assert.equal(fx.clientA.poll(A).commands.length, 0, 'a throwing set never routes');
+      assert.equal(fx.store.getBrokerTransportOffset(), update.update_id + 1, 'the receipt still commits');
+    } finally { fx.close(); }
+  });
+
+  test('staleness of the selected session clears the durable selection', async () => {
+    const fx = makeDurableFixture();
+    try {
+      fx.connectA();
+      const api = makeFakeApi();
+      const broker = newDurableBroker(fx, api);
+      await deliverDurable(broker, api, msg('/use aaa111'));
+      assert.notEqual(fx.store.getSelectedTuiTarget(), null);
+      fx.advance(60_000); // the selected session goes stale
+      await deliverDurable(broker, api, msg('/status'));
+      assert.equal(fx.store.getSelectedTuiTarget(), null, 'a stale selected session must clear durably');
+      assert.equal(fx.clientA.poll(A).commands.length, 0);
+    } finally { fx.close(); }
+  });
+
+  test('disconnect of the selected session clears the durable selection and never resurrects it', async () => {
+    const fx = makeDurableFixture();
+    try {
+      fx.connectA();
+      const api = makeFakeApi();
+      const broker = newDurableBroker(fx, api);
+      await deliverDurable(broker, api, msg('/use aaa111'));
+      assert.notEqual(fx.store.getSelectedTuiTarget(), null);
+      fx.clientA.disconnect({ ...A });
+      assert.equal(fx.store.getSelectedTuiTarget(), null, 'the store clears on disconnect');
+      await deliverDurable(broker, api, msg('still there?'));
+      assert.equal(fx.store.getSelectedTuiTarget(), null, 'the dead selection never persists again');
+      assert.equal(fx.clientA.poll(A).commands.length, 0);
+    } finally { fx.close(); }
+  });
+
+  test('explicit short-id routing never rewrites the durable selection', async () => {
+    const fx = makeDurableFixture();
+    try {
+      fx.connectA();
+      fx.connectB();
+      const api = makeFakeApi();
+      const broker = newDurableBroker(fx, api);
+      await deliverDurable(broker, api, msg('/use aaa111'));
+      await deliverDurable(broker, api, msg('/send bbb222 hello beta'));
+      const commands = fx.clientB.poll(B).commands;
+      assert.equal(commands.length, 1, 'explicit short-id routing still works');
+      assert.equal(commands[0].kind, 'prompt');
+      assert.deepEqual(
+        fx.store.getSelectedTuiTarget(),
+        { trackingId: A.trackingId, projectKey: projectKeyOf(fx, A.trackingId) },
+        'explicit routing must not rewrite the selection',
+      );
+    } finally { fx.close(); }
+  });
+
+  test('an explicit short-id command with no selection leaves the durable selection empty', async () => {
+    const fx = makeDurableFixture();
+    try {
+      fx.connectA();
+      fx.connectB();
+      const api = makeFakeApi();
+      const broker = newDurableBroker(fx, api);
+      await deliverDurable(broker, api, msg('/send bbb222 hello beta'));
+      assert.equal(fx.clientB.poll(B).commands.length, 1);
+      assert.equal(fx.store.getSelectedTuiTarget(), null, 'explicit routing must not create a selection');
+    } finally { fx.close(); }
+  });
+
+  test('opening or refreshing Projects never rewrites the durable selection', async () => {
+    const fx = makeDurableFixture();
+    try {
+      fx.connectA();
+      fx.connectB();
+      const api = makeFakeApi();
+      const broker = newDurableBroker(fx, api);
+      await deliverDurable(broker, api, msg('/use aaa111'));
+      await deliverDurable(broker, api, msg('/projects'));
+      await deliverDurable(broker, api, cb('v1:r'));
+      assert.deepEqual(
+        fx.store.getSelectedTuiTarget(),
+        { trackingId: A.trackingId, projectKey: projectKeyOf(fx, A.trackingId) },
+        'Projects must never rewrite the selection',
+      );
+    } finally { fx.close(); }
+  });
+
+  test('opening Projects with no selection never creates a durable selection', async () => {
+    const fx = makeDurableFixture();
+    try {
+      fx.connectA();
+      fx.connectB();
+      const api = makeFakeApi();
+      const broker = newDurableBroker(fx, api);
+      await deliverDurable(broker, api, msg('/projects'));
+      await deliverDurable(broker, api, cb('v1:r'));
+      assert.equal(fx.store.getSelectedTuiTarget(), null);
+    } finally { fx.close(); }
+  });
+});

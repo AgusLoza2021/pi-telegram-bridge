@@ -261,7 +261,10 @@ export class SelectiveTelegramBroker {
       || typeof store.listRecentTuiProjects !== 'function'
       || typeof store.enqueueTuiCommand !== 'function'
       || typeof store.listPendingBrokerTuiEvents !== 'function'
-      || typeof store.acknowledgeTuiEvents !== 'function') {
+      || typeof store.acknowledgeTuiEvents !== 'function'
+      || typeof store.getSelectedTuiTarget !== 'function'
+      || typeof store.setSelectedTuiTarget !== 'function'
+      || typeof store.clearSelectedTuiTarget !== 'function') {
       throw new TypeError('store is missing the broker transport methods');
     }
     if (!api || typeof api !== 'object') {
@@ -307,7 +310,8 @@ export class SelectiveTelegramBroker {
    * timestamp instead of re-attempting (and re-logging) the limiter.
    */
   #outboundRetryNotBefore = 0;
-  /** Memory-only selected tracking id; never persisted anywhere. */
+  /** Memory-only selected tracking id; mirrored into the durable store
+   * through #selectTarget/#clearSelection only — never written directly. */
   #selectedTrackingId = null;
   /** trackingId -> { label, shortId }; identity for prefixing drained events. */
   #identityCache = new Map();
@@ -339,7 +343,91 @@ export class SelectiveTelegramBroker {
       error.code = 'GET_ME_FAILED';
       throw error;
     }
+    this.#adoptDurableSelection();
     this.#log('broker_started');
+  }
+
+  /**
+   * Durable selected-destination adoption at broker start (T4A): after the
+   * transport sanity checks, adopt the store's durable selection ONLY when
+   * EXACTLY ONE current broker-live session matches BOTH its trackingId
+   * and projectKey. Anything else — a stale/offline row, a missing row, a
+   * project mismatch, a malformed persisted target or an ambiguous match —
+   * is cleared (durable + memory) and never routed. Adoption is memory
+   * rehydration only: it never enqueues commands and never sends Telegram.
+   */
+  #adoptDurableSelection() {
+    let target = null;
+    try {
+      target = this.#store.getSelectedTuiTarget();
+    } catch {
+      target = null;
+    }
+    if (target === null) return; // nothing durable to adopt
+    if (!isPlainObject(target)
+      || typeof target.trackingId !== 'string'
+      || typeof target.projectKey !== 'string') {
+      this.#clearSelection();
+      return;
+    }
+    const matches = this.#liveSessions().filter((session) =>
+      session.trackingId === target.trackingId
+      && session.projectKey === target.projectKey);
+    if (matches.length === 1) {
+      this.#selectedTrackingId = matches[0].trackingId;
+      return;
+    }
+    this.#clearSelection();
+  }
+
+  /**
+   * The single selection mutation helper (T4A): memory and durable store
+   * move together or not at all. A session is selected only when it
+   * carries a valid trackingId AND projectKey and the store ACCEPTS the
+   * write (row identity + project match). Any refusal or throw fails
+   * closed: the memory selection is dropped and the durable selection is
+   * cleared best-effort, so a store-refused selection can never route.
+   * Called inside the handleUpdate receipt/offset transaction, the
+   * re-entrant store calls join that SAME transaction.
+   */
+  #selectTarget(session) {
+    const trackingId = isPlainObject(session)
+      && typeof session.trackingId === 'string' && session.trackingId.length > 0
+      ? session.trackingId
+      : null;
+    const projectKey = isPlainObject(session)
+      && typeof session.projectKey === 'string' && session.projectKey.length > 0
+      ? session.projectKey
+      : null;
+    if (trackingId !== null && projectKey !== null) {
+      try {
+        const result = this.#store.setSelectedTuiTarget({ trackingId, projectKey });
+        if (isPlainObject(result) && result.ok === true) {
+          this.#selectedTrackingId = trackingId;
+          return true;
+        }
+      } catch {
+        // Fall through to the fail-closed path below.
+      }
+    }
+    this.#log('selection_persist_failed');
+    this.#clearSelection();
+    return false;
+  }
+
+  /**
+   * The single selection clear helper (T4A): drops the memory selection
+   * AND the durable selection, idempotently. A durable clear failure never
+   * wedges the caller: it is logged and the memory selection is dropped
+   * regardless (fail closed).
+   */
+  #clearSelection() {
+    this.#selectedTrackingId = null;
+    try {
+      this.#store.clearSelectedTuiTarget();
+    } catch {
+      this.#log('selection_clear_failed');
+    }
   }
 
   /**
@@ -664,7 +752,7 @@ export class SelectiveTelegramBroker {
             command: null,
           };
         }
-        this.#selectedTrackingId = matches[0].trackingId;
+        this.#selectTarget(matches[0]);
         // T3: the tap re-renders the dashboard with the ✓/primary selection
         // instead of navigating away. No command is enqueued.
         return {
@@ -694,7 +782,7 @@ export class SelectiveTelegramBroker {
           return { answerId, reply: this.#staleProjectsReply(parsed.shortId), command: null };
         }
         const [session] = matches;
-        this.#selectedTrackingId = session.trackingId;
+        this.#selectTarget(session);
         this.#pendingPrompt = null;
         return {
           answerId,
@@ -799,7 +887,7 @@ export class SelectiveTelegramBroker {
       return this.#busyActionTargetNotLive(answerId, parsed.shortId);
     }
     const [session] = matches;
-    this.#selectedTrackingId = session.trackingId;
+    this.#selectTarget(session);
     return {
       answerId,
       reply: null,
@@ -831,7 +919,7 @@ export class SelectiveTelegramBroker {
       return this.#busyActionTargetNotLive(answerId);
     }
     const [session] = matches;
-    this.#selectedTrackingId = session.trackingId;
+    this.#selectTarget(session);
     return {
       answerId,
       reply: null,
@@ -880,7 +968,7 @@ export class SelectiveTelegramBroker {
     if (session === null) {
       return this.#busyActionTargetNotLive(answerId, parsed.shortId);
     }
-    this.#selectedTrackingId = session.trackingId;
+    this.#selectTarget(session);
     return {
       answerId,
       reply: null,
@@ -1150,13 +1238,15 @@ export class SelectiveTelegramBroker {
   #planStart() {
     const live = this.#liveSessions();
     if (live.length === 0) {
-      this.#selectedTrackingId = null;
+      this.#clearSelection();
       return { replies: [{ text: copy.homeNoLive }], commands: [] };
     }
     if (live.length === 1) {
       const [sole] = live;
-      // Auto-select, mirroring the beginner plain-text rule.
-      this.#selectedTrackingId = sole.trackingId;
+      // Auto-select, mirroring the beginner plain-text rule. A store
+      // refusal fails closed: the reply still renders, but nothing is
+      // selected in memory or durably.
+      this.#selectTarget(sole);
       return {
         replies: [{
           text: copy.homeOne(sole.label),
@@ -1202,7 +1292,11 @@ export class SelectiveTelegramBroker {
     if (!target.ok) {
       return { replies: [target.reply], commands: [] };
     }
-    this.#selectedTrackingId = target.session.trackingId;
+    if (!this.#selectTarget(target.session)) {
+      // A refused durable set never selects: fail closed instead of
+      // acknowledging a selection that did not happen.
+      return { replies: [NO_SELECTION_NOTICE], commands: [] };
+    }
     return { replies: [this.#prefixed(target.session, 'Selected.')], commands: [] };
   }
 
@@ -1353,7 +1447,7 @@ export class SelectiveTelegramBroker {
       return { ok: false, reply: MISSING_TARGET_NOTICE(explicitShortId) };
     }
     if (live.length === 0) {
-      this.#selectedTrackingId = null;
+      this.#clearSelection();
       // Beginner no-live guidance ONLY for the beginner-facing paths
       // (plain text and /status, i.e. allowSoleAutoSelect). Advanced
       // routed commands keep T02's selection-required fail closed even
@@ -1367,7 +1461,7 @@ export class SelectiveTelegramBroker {
       ? null
       : live.find((session) => session.trackingId === this.#selectedTrackingId) ?? null;
     if (selected !== null) return { ok: true, session: selected };
-    this.#selectedTrackingId = null;
+    this.#clearSelection();
     // Beginner auto-selection: with exactly one live session, target it
     // directly (and remember it) instead of demanding /use — but ONLY for
     // ordinary plain text and /status, which also get the choice notice
@@ -1376,7 +1470,10 @@ export class SelectiveTelegramBroker {
     if (allowSoleAutoSelect) {
       if (live.length === 1) {
         const [sole] = live;
-        this.#selectedTrackingId = sole.trackingId;
+        // A store refusal fails closed: the refused selection never routes.
+        if (!this.#selectTarget(sole)) {
+          return { ok: false, reply: NO_SELECTION_NOTICE };
+        }
         return { ok: true, session: sole };
       }
       // T03a: plain text holds this as the broker-memory pending prompt
@@ -1554,8 +1651,9 @@ export class SelectiveTelegramBroker {
       if (this.#selectedTrackingId !== null) {
         const row = sessions.find((session) => session.trackingId === this.#selectedTrackingId);
         if (!row || row.live !== true) {
-          // The selection went stale: clear it instead of routing blind.
-          this.#selectedTrackingId = null;
+          // The selection went stale: clear it (memory AND durable) instead
+          // of routing blind.
+          this.#clearSelection();
         }
       }
     } catch {
