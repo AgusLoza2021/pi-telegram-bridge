@@ -60,6 +60,7 @@ export class TuiBridgeClient {
     piSessionFile,
     cwd,
     label,
+    branch,
     pid,
     staleAfterMs,
   } = {}) {
@@ -73,6 +74,7 @@ export class TuiBridgeClient {
       piSessionFile,
       cwd,
       label,
+      branch,
       pid,
       staleCutoff: this.#cutoff(staleAfterMs),
     });
@@ -80,8 +82,12 @@ export class TuiBridgeClient {
     return { ...result, trackingId: resolvedTrackingId, connectionId: resolvedConnectionId };
   }
 
-  heartbeat({ trackingId, connectionId }) {
-    return this.#store.heartbeatTuiSession({ trackingId, connectionId });
+  /**
+   * Optional bounded `branch` (T2 metadata pipeline): forwarded unchanged;
+   * null/undefined preserves the previously stored branch.
+   */
+  heartbeat({ trackingId, connectionId, branch }) {
+    return this.#store.heartbeatTuiSession({ trackingId, connectionId, branch });
   }
 
   /** state: 'connected' | 'busy' | 'waiting'. */

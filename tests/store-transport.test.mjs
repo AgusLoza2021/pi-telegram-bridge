@@ -22,6 +22,7 @@ import {
   Store,
   TUI_PROJECT_RETENTION_MS,
 } from '../src/store.mjs';
+import { TuiBridgeClient } from '../src/tui-bridge-client.mjs';
 
 const TEST_RUNS = fileURLToPath(new URL('../.local/test-runs/', import.meta.url));
 mkdirSync(TEST_RUNS, { recursive: true });
@@ -852,5 +853,278 @@ describe('store: tui project history (T1 store foundation)', () => {
     assert.notEqual(keyA, keyB, 'drive-relative and drive root must not merge');
     assert.equal(keyA, createHash('sha256').update('c:').digest('hex'));
     assert.equal(keyB, createHash('sha256').update('c:/').digest('hex'));
+  });
+});
+
+describe('store: tui branch heartbeat refresh (T2 metadata pipeline)', () => {
+  let dir;
+  let t;
+  let store;
+  let client;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(TEST_RUNS, 'tui-branch-'));
+    t = T0;
+    store = new Store(join(dir, 'main.sqlite'), {
+      now: () => t,
+      isProcessAlive: () => true,
+    });
+    client = new TuiBridgeClient(store);
+  });
+
+  afterEach(() => {
+    store.close();
+  });
+
+  const reg = (over = {}) => ({
+    trackingId: 'a'.repeat(32),
+    connectionId: 'c'.repeat(32),
+    label: 'alpha',
+    pid: 1111,
+    staleCutoff: t + 30_000,
+    ...over,
+  });
+
+  const getSession = (trackingId) =>
+    store.getTuiSession({ trackingId, staleCutoff: t + 30_000 });
+
+  test('TuiBridgeClient forwards branch on connect and on heartbeat', () => {
+    const connected = client.connect({
+      label: 'forward',
+      pid: process.pid,
+      branch: 'main',
+    });
+    assert.equal(connected.ok, true);
+    t += 1000;
+    assert.equal(
+      client.heartbeat({
+        trackingId: connected.trackingId,
+        connectionId: connected.connectionId,
+        branch: 'feature/forwarded',
+      }).ok,
+      true,
+    );
+    const session = store.getTuiSession({
+      trackingId: connected.trackingId,
+      staleCutoff: t + 30_000,
+    });
+    assert.equal(session.branch, 'feature/forwarded');
+    const project = store.listRecentTuiProjects({ since: 0 })[0];
+    assert.equal(project.branch, 'feature/forwarded');
+  });
+
+  test('heartbeat with a changed branch updates session and project history while preserving busy/waiting state', () => {
+    const trackingId = 'a'.repeat(32);
+    const connectionId = 'c'.repeat(32);
+    store.registerTuiSession(reg({ trackingId, connectionId, cwd: 'C:/proj/branchy', branch: 'main' }));
+    t += 1000;
+    assert.equal(store.setTuiSessionState({ trackingId, connectionId, state: 'busy' }).ok, true);
+    t += 1000;
+    assert.equal(
+      store.heartbeatTuiSession({ trackingId, connectionId, branch: 'feature/refresh' }).ok,
+      true,
+    );
+    const session = getSession(trackingId);
+    assert.equal(session.branch, 'feature/refresh');
+    assert.equal(session.state, 'busy', 'heartbeat must never change state');
+    const project = store.listRecentTuiProjects({ since: 0 })[0];
+    assert.equal(project.branch, 'feature/refresh');
+    assert.equal(project.lastState, 'busy');
+    assert.equal(project.lastSeenAt, t);
+  });
+
+  test('heartbeat without a branch (undefined or null) preserves the stored session and project branch', () => {
+    const trackingId = 'a'.repeat(32);
+    const connectionId = 'c'.repeat(32);
+    store.registerTuiSession(reg({ trackingId, connectionId, cwd: 'C:/proj/keep', branch: 'keep/me' }));
+    t += 1000;
+    assert.equal(store.heartbeatTuiSession({ trackingId, connectionId }).ok, true);
+    t += 1000;
+    assert.equal(
+      store.heartbeatTuiSession({ trackingId, connectionId, branch: null }).ok,
+      true,
+    );
+    assert.equal(getSession(trackingId).branch, 'keep/me');
+    const project = store.listRecentTuiProjects({ since: 0 })[0];
+    assert.equal(project.branch, 'keep/me');
+  });
+
+  test('F4: same-connection register refresh with a null/omitted branch preserves the stored branch', () => {
+    const trackingId = 'a'.repeat(32);
+    const connectionId = 'c'.repeat(32);
+    store.registerTuiSession(reg({ trackingId, connectionId, cwd: 'C:/proj/f4refresh', branch: 'main' }));
+    t += 1000;
+    assert.equal(
+      store.registerTuiSession(reg({ trackingId, connectionId, cwd: 'C:/proj/f4refresh' })).ok,
+      true,
+    );
+    assert.equal(getSession(trackingId).branch, 'main', 'a null refresh branch must not erase the session branch');
+    assert.equal(store.listRecentTuiProjects({ since: 0 })[0].branch, 'main');
+  });
+
+  test('F4: replacement takeover with a null/omitted branch preserves the prior branch', () => {
+    const trackingId = 'a'.repeat(32);
+    store.registerTuiSession(reg({ trackingId, connectionId: '1'.repeat(32), cwd: 'C:/proj/f4replace', branch: 'main' }));
+    t += 1000;
+    assert.equal(
+      store.registerTuiSession(reg({ trackingId, connectionId: '2'.repeat(32), cwd: 'C:/proj/f4replace' })).ok,
+      true,
+    );
+    assert.equal(getSession(trackingId).branch, 'main', 'a null replacement branch must not erase the session branch');
+    assert.equal(store.listRecentTuiProjects({ since: 0 })[0].branch, 'main');
+  });
+
+  test('R1: replacement onto a changed project with a null branch clears the session branch and never crosses project histories', () => {
+    const trackingId = 'a'.repeat(32);
+    store.registerTuiSession(reg({ trackingId, connectionId: '1'.repeat(32), cwd: 'C:/proj/r1old', branch: 'main' }));
+    const oldKey = getSession(trackingId).projectKey;
+    assert.equal(store.setSelectedTuiTarget({ trackingId, projectKey: oldKey }).ok, true);
+    // The NEW project gets an independent history row with its own branch.
+    store.registerTuiSession(reg({ trackingId: 'b'.repeat(32), connectionId: '2'.repeat(32), cwd: 'C:/proj/r1new', branch: 'other' }));
+    t += 1000;
+
+    assert.equal(
+      store.registerTuiSession(reg({ trackingId, connectionId: '3'.repeat(32), cwd: 'C:/proj/r1new' })).ok,
+      true,
+    );
+    const session = getSession(trackingId);
+    assert.notEqual(session.projectKey, oldKey, 'project identity changed');
+    assert.equal(session.branch, null, 'the old project branch must never be carried into the new project');
+
+    assert.equal(store.getSelectedTuiTarget(), null, 'durable selection remains cleared (T1)');
+
+    const projects = store.listRecentTuiProjects({ since: 0 });
+    assert.equal(projects.find((p) => p.projectKey === oldKey).branch, 'main',
+      'old project history keeps its own branch');
+    assert.equal(projects.find((p) => p.projectKey === session.projectKey).branch, 'other',
+      'new project history keeps its independent branch, not the incoming null');
+  });
+
+  test('R1: same-connection refresh onto a changed project with a null branch clears the session branch', () => {
+    const trackingId = 'a'.repeat(32);
+    store.registerTuiSession(reg({ trackingId, connectionId: '1'.repeat(32), cwd: 'C:/proj/r1f-old', branch: 'main' }));
+    const oldKey = getSession(trackingId).projectKey;
+    t += 1000;
+    assert.equal(
+      store.registerTuiSession(reg({ trackingId, connectionId: '1'.repeat(32), cwd: 'C:/proj/r1f-new' })).ok,
+      true,
+    );
+    const session = getSession(trackingId);
+    assert.notEqual(session.projectKey, oldKey, 'project identity changed');
+    assert.equal(session.branch, null, 'refresh onto a new project must not carry the old branch');
+
+    const projects = store.listRecentTuiProjects({ since: 0 });
+    assert.equal(projects.find((p) => p.projectKey === oldKey).branch, 'main',
+      'old project history is untouched by the refresh');
+    assert.equal(projects.find((p) => p.projectKey === session.projectKey).branch, null,
+      'new project without independent history stays null');
+  });
+
+  test('R1a: replacement onto a changed project with a non-null branch adopts the incoming branch', () => {
+    const trackingId = 'a'.repeat(32);
+    store.registerTuiSession(reg({ trackingId, connectionId: '1'.repeat(32), cwd: 'C:/proj/r1a-old', branch: 'main' }));
+    const oldKey = getSession(trackingId).projectKey;
+    assert.equal(store.setSelectedTuiTarget({ trackingId, projectKey: oldKey }).ok, true);
+    // The NEW project gets an independent history row with its own branch.
+    store.registerTuiSession(reg({ trackingId: 'b'.repeat(32), connectionId: '2'.repeat(32), cwd: 'C:/proj/r1a-new', branch: 'other' }));
+    t += 1000;
+
+    assert.equal(
+      store.registerTuiSession(reg({ trackingId, connectionId: '3'.repeat(32), cwd: 'C:/proj/r1a-new', branch: 'incoming' })).ok,
+      true,
+    );
+    const session = getSession(trackingId);
+    assert.notEqual(session.projectKey, oldKey, 'project identity changed');
+    assert.equal(session.branch, 'incoming', 'a non-null incoming branch wins on project change');
+
+    assert.equal(store.getSelectedTuiTarget(), null, 'durable selection remains cleared (T1)');
+
+    const projects = store.listRecentTuiProjects({ since: 0 });
+    assert.equal(projects.find((p) => p.projectKey === oldKey).branch, 'main',
+      'old project history keeps its own branch');
+    assert.equal(projects.find((p) => p.projectKey === session.projectKey).branch, 'incoming',
+      'new project history matches the session branch');
+  });
+
+  test('R1a: same-connection refresh onto a changed project with a non-null branch adopts the incoming branch', () => {
+    const trackingId = 'a'.repeat(32);
+    store.registerTuiSession(reg({ trackingId, connectionId: '1'.repeat(32), cwd: 'C:/proj/r1af-old', branch: 'main' }));
+    const oldKey = getSession(trackingId).projectKey;
+    t += 1000;
+    assert.equal(
+      store.registerTuiSession(reg({ trackingId, connectionId: '1'.repeat(32), cwd: 'C:/proj/r1af-new', branch: 'incoming' })).ok,
+      true,
+    );
+    const session = getSession(trackingId);
+    assert.notEqual(session.projectKey, oldKey, 'project identity changed');
+    assert.equal(session.branch, 'incoming', 'a non-null incoming branch wins on project change');
+
+    const projects = store.listRecentTuiProjects({ since: 0 });
+    assert.equal(projects.find((p) => p.projectKey === oldKey).branch, 'main',
+      'old project history is untouched by the refresh');
+    assert.equal(projects.find((p) => p.projectKey === session.projectKey).branch, 'incoming',
+      'new project history matches the session branch');
+  });
+
+  test('a stale or replaced connection cannot update branch or history', () => {
+    const trackingId = 'a'.repeat(32);
+    store.registerTuiSession(reg({ trackingId, connectionId: '1'.repeat(32), cwd: 'C:/proj/casb', branch: 'main' }));
+    const before = store.listRecentTuiProjects({ since: 0 })[0];
+    t += 1000;
+    assert.deepEqual(
+      store.heartbeatTuiSession({ trackingId, connectionId: '9'.repeat(32), branch: 'hostile' }),
+      { ok: false, reason: 'not_owner' },
+    );
+    assert.equal(getSession(trackingId).branch, 'main');
+    let after = store.listRecentTuiProjects({ since: 0 })[0];
+    assert.equal(after.lastSeenAt, before.lastSeenAt, 'a failed CAS must not bump last_seen_at');
+    assert.equal(after.branch, 'main');
+
+    // A genuinely replaced connection (stale row takeover) also loses CAS.
+    store.registerTuiSession(reg({ trackingId, connectionId: '2'.repeat(32), branch: 'replacement' }));
+    t += 1000;
+    assert.deepEqual(
+      store.heartbeatTuiSession({ trackingId, connectionId: '1'.repeat(32), branch: 'old-owner' }),
+      { ok: false, reason: 'not_owner' },
+    );
+    after = store.listRecentTuiProjects({ since: 0 })[0];
+    assert.equal(after.branch, 'replacement', 'the old owner must not overwrite the new branch');
+  });
+
+  test('heartbeat branch validation matches the registerTuiSession contract', () => {
+    const trackingId = 'a'.repeat(32);
+    const connectionId = 'c'.repeat(32);
+    store.registerTuiSession(reg({ trackingId, connectionId, cwd: 'C:/proj/valid' }));
+    assert.throws(
+      () => store.heartbeatTuiSession({ trackingId, connectionId, branch: 'x'.repeat(129) }),
+      TypeError,
+    );
+    assert.throws(
+      () => store.heartbeatTuiSession({ trackingId, connectionId, branch: '' }),
+      TypeError,
+    );
+    assert.equal(
+      store.heartbeatTuiSession({ trackingId, connectionId, branch: 'b'.repeat(128) }).ok,
+      true,
+      'a 128-char branch is within the contract',
+    );
+    assert.equal(getSession(trackingId).branch, 'b'.repeat(128));
+  });
+
+  test('project history last_seen_at and branch never regress to an older heartbeat', () => {
+    const trackingId = 'a'.repeat(32);
+    const connectionId = 'c'.repeat(32);
+    store.registerTuiSession(reg({ trackingId, connectionId, cwd: 'C:/proj/mono', branch: 'older' }));
+    t = T0 + 5000;
+    assert.equal(store.setTuiSessionState({ trackingId, connectionId, state: 'busy' }).ok, true);
+    t = T0 + 1000; // clock moves backwards: older evidence
+    assert.equal(
+      store.heartbeatTuiSession({ trackingId, connectionId, branch: 'newer' }).ok,
+      true,
+    );
+    const project = store.listRecentTuiProjects({ since: 0 })[0];
+    assert.equal(project.lastSeenAt, T0 + 5000, 'older evidence must not regress last_seen_at');
+    assert.equal(project.branch, 'older', 'older evidence must not overwrite the stored branch');
+    assert.equal(project.lastState, 'busy');
   });
 });

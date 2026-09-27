@@ -21,7 +21,9 @@
 //   (agent_start/agent_settled, ui_prompt_start/ui_prompt_end) and, on
 //   assistant message_end, FINALIZED text blocks only. Thinking/reasoning
 //   blocks, tool calls, tool results, context and token deltas never leave
-//   the TUI (the store rejects any reasoning event kind outright).
+//   the TUI (the store rejects any reasoning event kind outright). The
+//   OPTIONAL sanitized git branch is local metadata derived only by
+//   bounded filesystem reads (readGitBranch); it never blocks linking.
 // - Opt-in survives /reload, /new, /resume and /fork ONLY inside the same
 //   OS process, via a globalThis flag (never persisted to disk, so a
 //   process restart always boots disconnected). On session replacement the
@@ -37,8 +39,9 @@
 //   or replaced connection degrades to "disconnected", it never crashes
 //   Pi and never echoes store payloads into the TUI.
 
-import { existsSync, mkdirSync, readFileSync } from 'node:fs';
-import { basename, dirname, join, resolve } from 'node:path';
+import { existsSync, lstatSync, mkdirSync, readFileSync, statSync } from 'node:fs';
+import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
+import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import type { ExtensionAPI, ExtensionContext } from '@earendil-works/pi-coding-agent';
 import { Store } from '../src/store.mjs';
@@ -58,6 +61,7 @@ const OPT_IN_KEY = '__piTelegramBridgeOptIn__';
 const MAX_LABEL_CHARS = 64;
 const MAX_IDENTITY_CHARS = 512;
 const MAX_FINAL_TEXT_CHARS = 4000;
+const MAX_BRANCH_CHARS = 128;
 
 // Heartbeat well inside the store's 30s default staleness window; the poll
 // interval keeps remote commands feeling responsive without busy-looping.
@@ -240,6 +244,192 @@ function allocateAutoLabel(
     const base = candidate.length > room ? candidate.slice(0, room).trim() : candidate;
     const proposal = `${base}${suffix}`;
     if (!used.has(proposal)) return proposal;
+  }
+}
+
+// --- Git branch detection (T2 metadata pipeline) ---------------------------
+//
+// Filesystem-only, fail-closed: the branch is OPTIONAL metadata and a
+// detection failure must never block linking or crash Pi. Only node:fs,
+// node:path and node:os are used — no child process, no git CLI, no
+// network — and malformed content or paths are never echoed anywhere:
+// every filesystem/parse failure collapses to `null`.
+
+// Branch charset mirroring the store's 128-char contract. The allowlist
+// alone rejects whitespace, control characters and backslashes.
+const GIT_BRANCH_RE = /^[A-Za-z0-9._/-]+$/;
+const GIT_REF_PREFIX = 'ref: refs/heads/';
+const GIT_DETACHED_RE = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i;
+// Traversal/read bounds: at most 64 parent levels, and only bounded reads
+// (lstat + size cap) of .git pointers and HEAD files, never unbounded.
+const MAX_GIT_WALK_LEVELS = 64;
+const MAX_GIT_FILE_BYTES = 4096;
+// UNC/network/device paths (\\server\share, //server/share, \\?\, \\.\)
+// are rejected BEFORE any stat/read: this helper must never touch the
+// network or a device namespace.
+const UNC_OR_DEVICE_PATH_RE = /^(?:\\\\|\/\/)/;
+// On Windows an absolute gitdir target must be a local drive-letter path.
+const WIN_LOCAL_ABSOLUTE_RE = /^[a-zA-Z]:[\\/]/;
+
+/**
+ * Sanitize one candidate branch name. Rejects (never repairs) anything
+ * outside the safe charset/bounds, including path-shaped escapes:
+ * leading/trailing slash, '//', any '..' path segment, '@{' and blanks.
+ */
+function sanitizeGitBranch(raw: unknown): string | null {
+  if (typeof raw !== 'string') return null;
+  const branch = raw.trim();
+  if (branch.length === 0 || branch.length > MAX_BRANCH_CHARS) return null;
+  if (!GIT_BRANCH_RE.test(branch)) return null;
+  if (branch.startsWith('/') || branch.endsWith('/') || branch.includes('//')) return null;
+  if (branch.split('/').includes('..')) return null;
+  if (branch.includes('@{')) return null;
+  return branch;
+}
+
+/** Read and parse one HEAD file; only bounded reads after an lstat check.
+ * Symlinked/junction HEAD files are rejected (fail closed), never followed. */
+function readGitHeadFile(headPath: string): string | null {
+  try {
+    const stat = lstatSync(headPath);
+    if (stat.isSymbolicLink()) return null;
+    if (!stat.isFile() || stat.size === 0 || stat.size > MAX_GIT_FILE_BYTES) return null;
+    const firstLine = readFileSync(headPath, 'utf8').split('\n', 1)[0] ?? '';
+    const line = firstLine.trim();
+    if (line.startsWith(GIT_REF_PREFIX)) {
+      return sanitizeGitBranch(line.slice(GIT_REF_PREFIX.length));
+    }
+    if (GIT_DETACHED_RE.test(line)) return 'detached';
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/** Structural mirror of the fs.Stats fields this helper relies on. */
+interface GitEntryStat {
+  isDirectory(): boolean;
+  isFile(): boolean;
+  isSymbolicLink(): boolean;
+  size: number;
+}
+
+/** Windows-tolerant directory equality (case- and trailing-slash-safe). */
+function sameGitWalkDir(a: string, b: string): boolean {
+  const left = a.replace(/[\\/]+$/, '');
+  const right = b.replace(/[\\/]+$/, '');
+  return process.platform === 'win32'
+    ? left.toLowerCase() === right.toLowerCase()
+    : left === right;
+}
+
+/** True when dir is its own parent: '/', 'C:\'. (A UNC root can never
+ * reach here: UNC cwd paths are rejected before any traversal.) */
+function isFilesystemRoot(dir: string): boolean {
+  return dirname(dir) === dir;
+}
+
+/**
+ * Inspect <dir>/.git. Returns the sanitized branch, the fixed string
+ * 'detached', null when a .git exists but is unusable (walk stops), or
+ * undefined when no .git exists at this level (walk continues).
+ */
+function inspectDotGit(dir: string): string | null | undefined {
+  const dotGit = join(dir, '.git');
+  let stat: GitEntryStat;
+  try {
+    stat = lstatSync(dotGit);
+  } catch {
+    return undefined; // not present at this level
+  }
+  if (stat.isSymbolicLink()) return null; // never follow links/junctions
+  if (stat.isDirectory()) {
+    return readGitHeadFile(join(dotGit, 'HEAD'));
+  }
+  if (stat.isFile()) {
+    if (stat.size === 0 || stat.size > MAX_GIT_FILE_BYTES) return null;
+    const content = readFileSync(dotGit, 'utf8');
+    if (!content.startsWith('gitdir:')) return null;
+    const target = content.slice('gitdir:'.length).trim();
+    if (target.length === 0) return null;
+    if (isAbsolute(target)) {
+      // UNC/network/device absolute targets are rejected; on Windows only
+      // local drive-letter absolute targets are accepted.
+      if (!WIN_LOCAL_ABSOLUTE_RE.test(target)) return null;
+      return readGitHeadFile(join(target, 'HEAD'));
+    }
+    return readGitHeadFile(join(dir, target, 'HEAD'));
+  }
+  return null; // any other node type: fail closed
+}
+
+/** Internal test-only options; production callers pass only the cwd. */
+interface ReadGitBranchOptions {
+  /** Overrides os.homedir() for hermetic boundary tests. */
+  homeDir?: string | null;
+}
+
+/**
+ * Detect the git branch for a working directory by walking UPWARD from
+ * the resolved cwd looking for `.git`, using only built-in node:fs/path.
+ * The cwd itself must EXIST and BE A DIRECTORY — anything else fails
+ * closed to null without any ancestor walk.
+ *
+ * Boundary rules (home/root inheritance): for any STRICT ancestor of the
+ * cwd, a `.git` located exactly at the user's home directory or at the
+ * filesystem root is never inspected — dotfiles repos there (e.g. a user
+ * profile or drive root) must not label unrelated projects. A cwd that
+ * IS the home/root may still use its own repo.
+ *
+ * Supported .git forms:
+ * - normal repo: `.git` directory with a HEAD file;
+ * - worktree/submodule: `.git` file whose content begins exactly with
+ *   `gitdir:` — the target is resolved as-is (local drive-letter
+ *   absolute on Windows; UNC/device rejected) or against the directory
+ *   containing `.git`, then its HEAD is parsed. Pointer chains and
+ *   symlinks/junctions are deliberately NOT followed (fail closed).
+ * Returns the sanitized branch, the fixed string 'detached' for a hex
+ * HEAD, or null for anything malformed, hostile, unreadable or absent.
+ */
+export function readGitBranch(cwd: unknown, options: ReadGitBranchOptions = {}): string | null {
+  if (
+    typeof cwd !== 'string' || cwd.length === 0 || cwd.length > MAX_IDENTITY_CHARS
+    || UNC_OR_DEVICE_PATH_RE.test(cwd)
+  ) {
+    return null;
+  }
+  let home: string | null;
+  if (options.homeDir !== undefined) {
+    home = typeof options.homeDir === 'string' && options.homeDir.length > 0
+      ? options.homeDir
+      : null;
+  } else {
+    try {
+      home = homedir();
+    } catch {
+      home = null;
+    }
+  }
+  try {
+    const start = resolve(cwd);
+    // The cwd must exist and be a directory before any ancestor walk.
+    if (!statSync(start).isDirectory()) return null;
+    let dir = start;
+    for (let level = 0; level < MAX_GIT_WALK_LEVELS; level++) {
+      // Home/root dotfiles repos never inherit into a descendant cwd.
+      const protectedBoundary = dir !== start
+        && ((home !== null && sameGitWalkDir(dir, home)) || isFilesystemRoot(dir));
+      if (!protectedBoundary) {
+        const found = inspectDotGit(dir);
+        if (found !== undefined) return found;
+      }
+      const parent = dirname(dir);
+      if (parent === dir) return null; // filesystem root reached
+      dir = parent;
+    }
+    return null;
+  } catch {
+    return null;
   }
 }
 
@@ -520,11 +710,13 @@ export class SelectiveTuiBridgeExtension {
       const store = this.#ensureStore();
       const client = new TuiBridgeClient(store);
       const identity = this.#sessionIdentity(ctx);
+      const branch = readGitBranch(identity.cwd);
       const result = client.connect({
         piSessionId: identity.piSessionId,
         piSessionFile: identity.piSessionFile,
         cwd: identity.cwd,
         label,
+        branch,
         pid: process.pid,
       });
       if (!result.ok) return { ok: false, reason: result.reason };
@@ -689,6 +881,7 @@ export class SelectiveTuiBridgeExtension {
       const store = this.#ensureStore();
       const client = new TuiBridgeClient(store);
       const identity = this.#sessionIdentity(ctx);
+      const branch = readGitBranch(identity.cwd);
       // Same trackingId + same connectionId: the old row was released in
       // session_shutdown, so this either inserts fresh or (if the release
       // failed) is an idempotent same-connection refresh — never a steal.
@@ -699,6 +892,7 @@ export class SelectiveTuiBridgeExtension {
         piSessionFile: identity.piSessionFile,
         cwd: identity.cwd,
         label: optIn.label,
+        branch,
         pid: process.pid,
       });
       if (!result.ok) return; // fail closed; opt-in retained for retry
@@ -739,9 +933,14 @@ export class SelectiveTuiBridgeExtension {
     const c = this.#connection;
     if (!c) return;
     try {
+      // Re-detect the branch every tick (a checkout may have moved). A
+      // null detection preserves the last known metadata instead of
+      // erasing it (the store COALESCEs); nothing is cached locally.
+      const branch = readGitBranch(c.cwd);
       const result = c.client.heartbeat({
         trackingId: c.trackingId,
         connectionId: c.connectionId,
+        branch,
       });
       if (!result || result.ok !== true) this.#dropConnection();
     } catch {

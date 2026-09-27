@@ -1496,6 +1496,13 @@ export class Store {
    *
    * A 'connected' event is appended atomically whenever ownership moves to
    * a new connection (insert or replace), never on idempotent refresh.
+   * An omitted/null branch on a refresh/replacement is project-aware:
+   * same project identity PRESERVES the prior session branch; a changed
+   * project identity adopts the incoming branch verbatim (null clears —
+   * the old project's branch never crosses into the new project — and a
+   * non-null branch always wins). Project history follows T1/T2: the new
+   * project's row receives the incoming branch (null preserves that
+   * project's independent history).
    */
   registerTuiSession({
     trackingId,
@@ -1545,13 +1552,15 @@ export class Store {
             `UPDATE tui_sessions SET
                connection_id = ?, state = 'connected',
                pi_session_id = ?, pi_session_file = ?, cwd = ?,
-               label = ?, branch = ?, pid = ?, project_key = ?,
+               label = ?,
+               branch = CASE WHEN project_key = ? THEN COALESCE(?, branch) ELSE ? END,
+               pid = ?, project_key = ?,
                connected_at = ?, updated_at = ?, heartbeat_at = ?
              WHERE tracking_id = ?`,
           )
           .run(
             connectionId, piSessionId, piSessionFile, cwd,
-            label, branch, pid, projectKey, now, now, now, trackingId,
+            label, projectKey, branch, branch, pid, projectKey, now, now, now, trackingId,
           );
         this.#appendTuiEventRow(trackingId, 'connected', 'null', now);
         this.#upsertTuiProjectRow({
@@ -1571,11 +1580,13 @@ export class Store {
           .prepare(
             `UPDATE tui_sessions SET
                pi_session_id = ?, pi_session_file = ?, cwd = ?,
-               label = ?, branch = ?, pid = ?, project_key = ?, state = 'connected',
+               label = ?,
+               branch = CASE WHEN project_key = ? THEN COALESCE(?, branch) ELSE ? END,
+               pid = ?, project_key = ?, state = 'connected',
                updated_at = ?, heartbeat_at = ?
              WHERE tracking_id = ? AND connection_id = ?`,
           )
-          .run(piSessionId, piSessionFile, cwd, label, branch, pid, projectKey, now, now, trackingId, connectionId);
+          .run(piSessionId, piSessionFile, cwd, label, projectKey, branch, branch, pid, projectKey, now, now, trackingId, connectionId);
         this.#upsertTuiProjectRow({
           projectKey, label, branch, trackingId, state: 'connected', seenAt: now,
         });
@@ -1621,25 +1632,39 @@ export class Store {
   }
 
   /** CAS heartbeat: fails once the connection was replaced or removed.
-   * Only a successful CAS bumps the project history's last_seen_at. */
-  heartbeatTuiSession({ trackingId, connectionId }) {
+   * Only a successful CAS bumps the project history's last_seen_at.
+   *
+   * T2 metadata pipeline: an optional bounded `branch` (same contract as
+   * registerTuiSession) is refreshed in the SAME CAS UPDATE via COALESCE
+   * — null/undefined means "not detected this tick" and preserves the
+   * stored branch — and, only after the CAS wins, the project history's
+   * branch/last_seen_at move monotonically (older or equal-evidence rules
+   * mirror the register upsert). State is never touched here. */
+  heartbeatTuiSession({ trackingId, connectionId, branch }) {
     assertTuiId(trackingId, 'trackingId');
     assertTuiId(connectionId, 'connectionId');
+    branch = assertOptionalTuiString(branch, 'branch', MAX_TUI_BRANCH_CHARS);
     return this.#transaction(() => {
       const now = this.#now();
       const info = this.#db
         .prepare(
-          `UPDATE tui_sessions SET heartbeat_at = ?, updated_at = ?
+          `UPDATE tui_sessions SET heartbeat_at = ?, updated_at = ?,
+             branch = COALESCE(?, branch)
            WHERE tracking_id = ? AND connection_id = ?`,
         )
-        .run(now, now, trackingId, connectionId);
+        .run(now, now, branch, trackingId, connectionId);
       if (info.changes !== 1) return { ok: false, reason: 'not_owner' };
       this.#db
         .prepare(
-          `UPDATE tui_projects SET last_seen_at = ?
+          `UPDATE tui_projects SET
+             last_seen_at = MAX(tui_projects.last_seen_at, ?),
+             branch = CASE
+               WHEN ? >= tui_projects.last_seen_at
+                 THEN COALESCE(?, tui_projects.branch)
+               ELSE tui_projects.branch END
            WHERE project_key = (SELECT project_key FROM tui_sessions WHERE tracking_id = ?)`,
         )
-        .run(now, trackingId);
+        .run(now, now, branch, trackingId);
       return { ok: true };
     });
   }

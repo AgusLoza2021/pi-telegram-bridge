@@ -10,13 +10,18 @@
 
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, symlinkSync, writeFileSync } from 'node:fs';
 import { basename, join } from 'node:path';
+import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 
 import { Store } from '../src/store.mjs';
 import { TuiBridgeClient } from '../src/tui-bridge-client.mjs';
-import { SelectiveTuiBridgeExtension, createSelectiveTuiExtension } from '../extension/selective-tui-extension.ts';
+import {
+  SelectiveTuiBridgeExtension,
+  createSelectiveTuiExtension,
+  readGitBranch,
+} from '../extension/selective-tui-extension.ts';
 
 const TEST_RUNS = fileURLToPath(new URL('../.local/test-runs/', import.meta.url));
 mkdirSync(TEST_RUNS, { recursive: true });
@@ -773,6 +778,315 @@ describe('no model involvement and factory wiring', () => {
       delete globalThis[OPT_IN_KEY];
     } finally {
       delete globalThis[OPT_IN_KEY];
+    }
+  });
+});
+
+// --- T2 metadata pipeline: filesystem-only git branch detection -------------
+
+/** Creates <root>/.git/HEAD with the given raw content. */
+function writeGitRepo(root, head = 'ref: refs/heads/main\n') {
+  mkdirSync(join(root, '.git'), { recursive: true });
+  writeFileSync(join(root, '.git', 'HEAD'), head);
+}
+
+describe('extension git branch detection (readGitBranch)', () => {
+  test('normal repo: a .git directory with a ref HEAD parses to a sanitized branch', () => {
+    const root = mkdtempSync(join(TEST_RUNS, 'branch-normal-'));
+    writeGitRepo(root, 'ref: refs/heads/main\n');
+    assert.equal(readGitBranch(root), 'main');
+  });
+
+  test('nested cwd below the repo root walks up to the repo .git', () => {
+    const root = mkdtempSync(join(TEST_RUNS, 'branch-nested-'));
+    writeGitRepo(root, 'ref: refs/heads/Feature/Ci.1\n');
+    const deep = join(root, 'src', 'lib', 'deep');
+    mkdirSync(deep, { recursive: true });
+    assert.equal(readGitBranch(deep), 'Feature/Ci.1');
+  });
+
+  test('worktree pointer with a relative gitdir resolves against the directory containing .git', () => {
+    const root = mkdtempSync(join(TEST_RUNS, 'branch-wt-rel-'));
+    mkdirSync(join(root, 'real', '.git', 'worktrees', 'wt'), { recursive: true });
+    writeFileSync(
+      join(root, 'real', '.git', 'worktrees', 'wt', 'HEAD'),
+      'ref: refs/heads/feature/one\n',
+    );
+    mkdirSync(join(root, 'wt'), { recursive: true });
+    writeFileSync(join(root, 'wt', '.git'), 'gitdir: ../real/.git/worktrees/wt\n');
+    assert.equal(readGitBranch(join(root, 'wt')), 'feature/one');
+  });
+
+  test('worktree pointer with an absolute gitdir target is used as-is', () => {
+    const root = mkdtempSync(join(TEST_RUNS, 'branch-wt-abs-'));
+    const gitdir = join(root, 'real', '.git', 'worktrees', 'wt2');
+    mkdirSync(gitdir, { recursive: true });
+    writeFileSync(join(gitdir, 'HEAD'), 'ref: refs/heads/feature/two\n');
+    mkdirSync(join(root, 'wt'), { recursive: true });
+    writeFileSync(join(root, 'wt', '.git'), `gitdir: ${gitdir}\n`);
+    assert.equal(readGitBranch(join(root, 'wt')), 'feature/two');
+  });
+
+  test('detached HEAD (40 or 64 hex, any case) maps to the fixed string detached', () => {
+    const root40 = mkdtempSync(join(TEST_RUNS, 'branch-det40-'));
+    writeGitRepo(root40, `${'a'.repeat(40)}\n`);
+    assert.equal(readGitBranch(root40), 'detached');
+    const root64 = mkdtempSync(join(TEST_RUNS, 'branch-det64-'));
+    writeGitRepo(root64, `${'F'.repeat(64)}\n`);
+    assert.equal(readGitBranch(root64), 'detached');
+  });
+
+  test('no repo reachable within the bounded traversal returns null', () => {
+    // A deep nonexistent path: the bounded walk exhausts before any real
+    // directory (and therefore any real .git) can be reached.
+    const deep = 'C:\\' + Array.from({ length: 70 }, () => 'x').join('\\');
+    assert.equal(readGitBranch(deep), null);
+  });
+
+  test('hostile branch strings in HEAD sanitize to null without throwing raw content', () => {
+    const hostileHeads = [
+      'ref: refs/heads/..\n',
+      'ref: refs/heads/a/../b\n',
+      'ref: refs/heads/a//b\n',
+      'ref: refs/heads//leading\n',
+      'ref: refs/heads/trailing/\n',
+      'ref: refs/heads/@{x\n',
+      'ref: refs/heads/back\\slash\n',
+      'ref: refs/heads/a b\n',
+      'ref: refs/heads/a\tb\n',
+      'ref: refs/heads/a\u0000b\n',
+      'ref: refs/heads/\n',
+      `ref: refs/heads/${'a'.repeat(129)}\n`,
+    ];
+    for (const head of hostileHeads) {
+      const root = mkdtempSync(join(TEST_RUNS, 'branch-hostile-'));
+      writeGitRepo(root, head);
+      assert.equal(
+        readGitBranch(root),
+        null,
+        `hostile HEAD must yield null: ${JSON.stringify(head)}`,
+      );
+    }
+  });
+
+  test('malformed or oversize .git pointer files return null', () => {
+    const emptyRoot = mkdtempSync(join(TEST_RUNS, 'branch-ptr-empty-'));
+    writeFileSync(join(emptyRoot, '.git'), '');
+    assert.equal(readGitBranch(emptyRoot), null);
+
+    const junkRoot = mkdtempSync(join(TEST_RUNS, 'branch-ptr-junk-'));
+    writeFileSync(join(junkRoot, '.git'), 'hello world\n');
+    assert.equal(readGitBranch(junkRoot), null);
+
+    const bigRoot = mkdtempSync(join(TEST_RUNS, 'branch-ptr-big-'));
+    writeFileSync(join(bigRoot, '.git'), `gitdir: ${'a'.repeat(5000)}\n`);
+    assert.equal(readGitBranch(bigRoot), null);
+  });
+
+  test('pointer chains are not followed: a gitdir target whose HEAD is itself a pointer yields null', () => {
+    const root = mkdtempSync(join(TEST_RUNS, 'branch-chain-'));
+    const gitdir = join(root, 'wt-gitdir');
+    mkdirSync(gitdir, { recursive: true });
+    writeFileSync(join(gitdir, 'HEAD'), 'gitdir: ../elsewhere\n');
+    writeFileSync(join(root, '.git'), `gitdir: ${gitdir}\n`);
+    assert.equal(readGitBranch(root), null);
+  });
+
+  test('missing, empty, oversize or unparseable HEAD files return null', () => {
+    const missing = mkdtempSync(join(TEST_RUNS, 'branch-head-missing-'));
+    mkdirSync(join(missing, '.git'), { recursive: true });
+    assert.equal(readGitBranch(missing), null);
+
+    const oversize = mkdtempSync(join(TEST_RUNS, 'branch-head-big-'));
+    mkdirSync(join(oversize, '.git'), { recursive: true });
+    writeFileSync(join(oversize, '.git', 'HEAD'), 'x'.repeat(5000));
+    assert.equal(readGitBranch(oversize), null);
+
+    const empty = mkdtempSync(join(TEST_RUNS, 'branch-head-empty-'));
+    mkdirSync(join(empty, '.git'), { recursive: true });
+    writeFileSync(join(empty, '.git', 'HEAD'), '');
+    assert.equal(readGitBranch(empty), null);
+
+    const garbage = mkdtempSync(join(TEST_RUNS, 'branch-head-junk-'));
+    writeGitRepo(garbage, 'this is not a ref or a hash\n');
+    assert.equal(readGitBranch(garbage), null);
+  });
+
+  test('a 128-char branch is accepted at the bound', () => {
+    const root = mkdtempSync(join(TEST_RUNS, 'branch-max-'));
+    const branch = `f${'e'.repeat(126)}t`;
+    writeGitRepo(root, `ref: refs/heads/${branch}\n`);
+    assert.equal(readGitBranch(root), branch);
+  });
+
+  test('invalid inputs return null', () => {
+    assert.equal(readGitBranch(null), null);
+    assert.equal(readGitBranch(undefined), null);
+    assert.equal(readGitBranch(''), null);
+    assert.equal(readGitBranch(123), null);
+  });
+});
+
+describe('/tg connect stores git branch metadata (T2)', () => {
+  test('beginner /tg connect stores the branch in the live session and project history', async () => {
+    const repoRoot = mkdtempSync(join(TEST_RUNS, 'branch-repo-'));
+    writeGitRepo(repoRoot, 'ref: refs/heads/feature/ci\n');
+    // The cwd must be an existing directory (F1 contract).
+    mkdirSync(join(repoRoot, 'nested'), { recursive: true });
+    const fx = makeFixture({ selectAnswer: 'Connect', cwd: join(repoRoot, 'nested') });
+    try {
+      await fx.run('tg', '');
+      const p = fx.probe();
+      const sessions = p.sessions();
+      assert.equal(sessions.length, 1);
+      assert.equal(sessions[0].branch, 'feature/ci');
+      const project = p.store.listRecentTuiProjects({ since: 0 })[0];
+      assert.equal(project.branch, 'feature/ci');
+      p.close();
+    } finally { await fx.cleanup(); }
+  });
+
+  test('connect with unusable git metadata still links with branch null', async () => {
+    const plain = mkdtempSync(join(TEST_RUNS, 'branch-plain-'));
+    // A .git that is neither a repo directory nor a gitdir pointer yields
+    // no branch; connecting must succeed anyway with branch null.
+    writeFileSync(join(plain, '.git'), 'not a gitdir pointer\n');
+    const fx = makeFixture({ selectAnswer: 'Connect', cwd: join(plain, 'work') });
+    try {
+      await fx.run('tg', '');
+      const p = fx.probe();
+      const sessions = p.sessions();
+      assert.equal(sessions.length, 1, 'branch detection failure must never block linking');
+      assert.equal(sessions[0].branch, null);
+      const project = p.store.listRecentTuiProjects({ since: 0 })[0];
+      assert.equal(project.branch, null);
+      p.close();
+    } finally { await fx.cleanup(); }
+  });
+
+  test('reconnect-from-opt-in recomputes and stores the branch', async () => {
+    const repoRoot = mkdtempSync(join(TEST_RUNS, 'branch-reconnect-'));
+    writeGitRepo(repoRoot, 'ref: refs/heads/first\n');
+    mkdirSync(join(repoRoot, 'work'), { recursive: true });
+    const fx = makeFixture({ selectAnswer: 'Connect', cwd: join(repoRoot, 'work') });
+    try {
+      await fx.run('tg', '');
+      let p = fx.probe();
+      assert.equal(p.sessions()[0].branch, 'first');
+      p.close();
+      await fx.pi.emit('session_shutdown', { reason: 'reload' }, fx.ctx);
+      // The branch moved while the session was down; the replacement
+      // context re-enters the same working directory.
+      writeFileSync(join(repoRoot, '.git', 'HEAD'), 'ref: refs/heads/second\n');
+      const replacement = new SelectiveTuiBridgeExtension(fx.stateDirectory);
+      const replacementPi = makePi();
+      replacement.register(replacementPi);
+      const replacementCtx = makeCtx({ cwd: join(repoRoot, 'work') });
+      await replacementPi.emit('session_start', {}, replacementCtx.ctx);
+      p = fx.probe();
+      const sessions = p.sessions();
+      assert.equal(sessions.length, 1);
+      assert.equal(sessions[0].branch, 'second', 'reconnect must re-detect the branch');
+      const project = p.store.listRecentTuiProjects({ since: 0 })[0];
+      assert.equal(project.branch, 'second');
+      p.close();
+      delete globalThis[OPT_IN_KEY];
+    } finally { await fx.cleanup(); }
+  });
+});
+
+describe('readGitBranch correction round (F1/F2/F3)', () => {
+  test('F1: a nonexistent cwd returns null without any ancestor walk', () => {
+    const root = mkdtempSync(join(TEST_RUNS, 'branch-f1-'));
+    writeGitRepo(root, 'ref: refs/heads/main\n');
+    // The repo is reachable by walking up, but the cwd itself does not
+    // exist: fail closed without inheriting the ancestor repo.
+    assert.equal(readGitBranch(join(root, 'does-not-exist')), null);
+  });
+
+  test('F1: a file cwd returns null', () => {
+    const root = mkdtempSync(join(TEST_RUNS, 'branch-f1file-'));
+    writeGitRepo(root, 'ref: refs/heads/main\n');
+    writeFileSync(join(root, 'plainfile'), 'x');
+    assert.equal(readGitBranch(join(root, 'plainfile')), null);
+  });
+
+  test('F2: a .git at the homedir boundary is skipped for descendants but used when cwd is the homedir itself', () => {
+    const outer = mkdtempSync(join(TEST_RUNS, 'branch-home-'));
+    writeGitRepo(outer, 'ref: refs/heads/outerboundary\n');
+    const fakeHome = join(outer, 'fakehome');
+    writeGitRepo(fakeHome, 'ref: refs/heads/homerootrepo\n');
+    writeGitRepo(join(fakeHome, 'repo'), 'ref: refs/heads/main\n');
+    const plain = join(fakeHome, 'plain');
+    mkdirSync(plain, { recursive: true });
+    const deep = join(fakeHome, 'repo', 'deep');
+    mkdirSync(deep, { recursive: true });
+
+    // A descendant of home must not inherit the home dotfiles repo: the
+    // walk skips home's .git and keeps climbing to the outer repo.
+    assert.equal(readGitBranch(plain, { homeDir: fakeHome }), 'outerboundary');
+    // A repo rooted below home is still found normally.
+    assert.equal(readGitBranch(deep, { homeDir: fakeHome }), 'main');
+    // A cwd that IS the home may still use its own repo.
+    assert.equal(readGitBranch(fakeHome, { homeDir: fakeHome }), 'homerootrepo');
+  });
+
+  test('F2: production call — a temp dir below the real homedir never inherits the home or drive-root dotfiles repos', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'branch-realhome-'));
+    // On this machine both the user profile directory and the drive root
+    // exist as real git repos (master); the boundary rules must skip both
+    // for a descendant cwd, so an unrelated temp project cannot be labeled
+    // by their dotfiles repos.
+    assert.equal(readGitBranch(dir), null);
+  });
+
+  test('F2: UNC/network/device cwd paths are rejected', () => {
+    assert.equal(readGitBranch('\\\\server\\share\\proj'), null);
+    assert.equal(readGitBranch('//server/share/proj'), null);
+    assert.equal(readGitBranch('\\\\?\\C:\\proj'), null);
+    assert.equal(readGitBranch('\\\\.\\C:\\proj'), null);
+  });
+
+  test('F2: UNC/device absolute gitdir targets are rejected; local drive-letter targets still work', () => {
+    const uncRoot = mkdtempSync(join(TEST_RUNS, 'branch-unc-'));
+    writeFileSync(join(uncRoot, '.git'), 'gitdir: \\\\server\\share\\repo\n');
+    assert.equal(readGitBranch(uncRoot), null);
+
+    const deviceRoot = mkdtempSync(join(TEST_RUNS, 'branch-device-'));
+    writeFileSync(join(deviceRoot, '.git'), 'gitdir: \\\\?\\C:\\repo\n');
+    assert.equal(readGitBranch(deviceRoot), null);
+  });
+
+  test('F3: symlink/junction .git markers are rejected without following them', () => {
+    const root = mkdtempSync(join(TEST_RUNS, 'branch-link-'));
+    const realRepo = mkdtempSync(join(TEST_RUNS, 'branch-link-target-'));
+    writeGitRepo(realRepo, 'ref: refs/heads/linked\n');
+    let made = false;
+    try {
+      symlinkSync(realRepo, join(root, '.git'), 'junction');
+      made = true;
+    } catch {
+      // Junction creation can be unavailable in restricted environments.
+    }
+    if (made) {
+      assert.equal(readGitBranch(root), null, 'a junction .git must fail closed');
+    }
+  });
+
+  test('F3: symlinked HEAD files are rejected without following them', () => {
+    const root = mkdtempSync(join(TEST_RUNS, 'branch-headlink-'));
+    const realHead = mkdtempSync(join(TEST_RUNS, 'branch-headlink-target-'));
+    writeGitRepo(realHead, 'ref: refs/heads/linkedhead\n');
+    mkdirSync(join(root, '.git'), { recursive: true });
+    let made = false;
+    try {
+      symlinkSync(join(realHead, '.git', 'HEAD'), join(root, '.git', 'HEAD'), 'file');
+      made = true;
+    } catch {
+      // File-symlink creation can require privileges on Windows.
+    }
+    if (made) {
+      assert.equal(readGitBranch(root), null, 'a symlinked HEAD must fail closed');
     }
   });
 });
