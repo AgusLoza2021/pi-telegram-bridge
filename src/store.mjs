@@ -17,7 +17,7 @@
 //   session is never silently stolen and replaced connections fail closed.
 
 import { DatabaseSync } from 'node:sqlite';
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 
 export const REQUEST_STATES = Object.freeze([
   'running',
@@ -102,6 +102,18 @@ const MAX_TUI_PATH_CHARS = 512;
 const MAX_TUI_TEXT_CHARS = 4096;
 const MAX_TUI_CODE_CHARS = 64;
 const MAX_TUI_EVENT_IDS = 256;
+const MAX_TUI_BRANCH_CHARS = 128;
+
+// T1 (project library): durable per-project history behind the live TUI
+// transport. A separate history concept: tui_sessions rows are still
+// deleted on disconnect, but each project keeps a bounded history row that
+// never exposes cwd, pids or connection/session ids. Retention is fixed by
+// policy: 30 days, at most 20 recent projects.
+export const TUI_PROJECT_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+export const MAX_TUI_RECENT_PROJECTS = 20;
+const TUI_PROJECT_KEY_RE = /^[0-9a-f]{64}$/;
+const SELECTED_TUI_TRACKING_ID_KEY = 'selected_tui_tracking_id';
+const SELECTED_TUI_PROJECT_KEY_KEY = 'selected_tui_project_key';
 
 function assertTuiId(value, name) {
   if (typeof value !== 'string' || !TUI_ID_RE.test(value)) {
@@ -346,6 +358,31 @@ export class Store {
       CREATE INDEX IF NOT EXISTS idx_tui_commands_pending
         ON tui_commands(tracking_id, state, created_at);
     `);
+    // T1 (project library): additive columns on the live-session table plus
+    // a separate bounded project-history table. The live transport
+    // semantics are untouched: tui_sessions rows keep their existing shape
+    // and are still deleted on disconnect; tui_projects is a separate
+    // history concept that never stores cwd. Old databases are migrated
+    // in place and old callers that omit the new fields keep working.
+    this.#ensureColumn('tui_sessions', 'project_key', 'TEXT');
+    this.#ensureColumn('tui_sessions', 'branch', 'TEXT');
+    this.#db.exec(`
+      CREATE TABLE IF NOT EXISTS tui_projects (
+        project_key TEXT PRIMARY KEY,
+        label TEXT,
+        alias TEXT,
+        branch TEXT,
+        color_slot INTEGER NOT NULL,
+        last_state TEXT NOT NULL,
+        last_tracking_id TEXT,
+        first_seen_at INTEGER NOT NULL,
+        last_seen_at INTEGER NOT NULL,
+        disconnected_at INTEGER
+      );
+      CREATE INDEX IF NOT EXISTS idx_tui_projects_recent
+        ON tui_projects(last_seen_at, project_key);
+    `);
+    this.#backfillTuiProjects();
   }
 
   #ensureColumn(table, column, ddl) {
@@ -1249,12 +1286,14 @@ export class Store {
       piSessionFile: row.pi_session_file,
       cwd: row.cwd,
       label: row.label,
+      branch: row.branch ?? null,
       pid: row.pid,
       connectionId: row.connection_id,
       state: row.state,
       connectedAt: row.connected_at,
       updatedAt: row.updated_at,
       heartbeatAt: row.heartbeat_at,
+      projectKey: row.project_key ?? null,
       live: this.#tuiRowLive(row, staleCutoff),
     });
   }
@@ -1282,6 +1321,167 @@ export class Store {
     }
   }
 
+  // --- Tracked TUI project history (T1: project library) -----------------
+
+  /** Windows-first cwd normalization for stable project identity:
+   * backslash -> slash, lowercase, trailing slashes stripped except the
+   * root ('/', 'C:/'). A drive-relative 'C:' stays distinct from the drive
+   * root 'C:/' so they can never false-merge. The cwd itself never leaves
+   * this method: only its SHA-256 is persisted or returned. */
+  #normalizeTuiProjectCwd(cwd) {
+    const slashed = cwd.replace(/\\/g, '/').toLowerCase();
+    if (slashed === '/') return '/';
+    const stripped = slashed.replace(/\/+$/, '');
+    if (stripped.length === 0) return '/';
+    if (stripped.length === 2 && stripped.endsWith(':')) {
+      // 'C:/' (trailing slash present = drive root) stays distinct from a
+      // drive-relative 'C:'.
+      return slashed.endsWith('/') ? `${stripped}/` : stripped;
+    }
+    return stripped;
+  }
+
+  /** Stable project identity: 64 lowercase hex SHA-256 of the normalized
+   * cwd, or of a deterministic per-session fallback (`tracking:<id>`) when
+   * cwd is unknown. Stable across disconnect/reconnect and restarts. */
+  #deriveTuiProjectKey(cwd, trackingId) {
+    return createHash('sha256')
+      .update(
+        cwd === null || cwd === undefined
+          ? `tracking:${trackingId}`
+          : this.#normalizeTuiProjectCwd(cwd),
+      )
+      .digest('hex');
+  }
+
+  /** Deterministic stable color slot 0..7 derived from the project key. */
+  #tuiProjectColorSlot(projectKey) {
+    return parseInt(projectKey.slice(0, 8), 16) % 8;
+  }
+
+  #assertTuiProjectKey(value, name = 'projectKey') {
+    if (typeof value !== 'string' || !TUI_PROJECT_KEY_RE.test(value)) {
+      throw new TypeError(`${name} must be 64 lowercase hex chars`);
+    }
+  }
+
+  /**
+   * Upsert one project history row, MONOTONICALLY: evidence with an older
+   * last_seen_at than the stored row can never regress it — a stale
+   * backfill or late upsert leaves last_seen_at, last_state,
+   * last_tracking_id, label/branch and disconnected_at untouched. Newer or
+   * equal evidence wins; a null label/branch ("not provided") keeps the
+   * stored one. The alias is deliberately NEVER touched here (renaming is
+   * an explicit API) and first_seen_at never moves.
+   */
+  #upsertTuiProjectRow({ projectKey, label, branch, trackingId, state, seenAt, firstSeenAt = seenAt, disconnectedAt = null }) {
+    this.#db
+      .prepare(
+        `INSERT INTO tui_projects
+           (project_key, label, alias, branch, color_slot, last_state,
+            last_tracking_id, first_seen_at, last_seen_at, disconnected_at)
+         VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(project_key) DO UPDATE SET
+           color_slot = excluded.color_slot,
+           last_seen_at = MAX(tui_projects.last_seen_at, excluded.last_seen_at),
+           last_state = CASE
+             WHEN excluded.last_seen_at >= tui_projects.last_seen_at
+               THEN excluded.last_state
+             ELSE tui_projects.last_state END,
+           last_tracking_id = CASE
+             WHEN excluded.last_seen_at >= tui_projects.last_seen_at
+               THEN excluded.last_tracking_id
+             ELSE tui_projects.last_tracking_id END,
+           label = CASE
+             WHEN excluded.last_seen_at >= tui_projects.last_seen_at
+               THEN COALESCE(excluded.label, tui_projects.label)
+             ELSE tui_projects.label END,
+           branch = CASE
+             WHEN excluded.last_seen_at >= tui_projects.last_seen_at
+               THEN COALESCE(excluded.branch, tui_projects.branch)
+             ELSE tui_projects.branch END,
+           disconnected_at = CASE
+             WHEN excluded.last_seen_at >= tui_projects.last_seen_at
+               THEN excluded.disconnected_at
+             ELSE tui_projects.disconnected_at END`,
+      )
+      .run(
+        projectKey, label, branch, this.#tuiProjectColorSlot(projectKey),
+        state, trackingId, firstSeenAt, seenAt, disconnectedAt,
+      );
+  }
+
+  /** One-time additive backfill: legacy tui_sessions rows without a
+   * project_key keep all their data and gain a matching history row. */
+  #backfillTuiProjects() {
+    const rows = this.#db
+      .prepare(
+        `SELECT tracking_id, cwd, label, branch, state, connected_at, updated_at
+         FROM tui_sessions WHERE project_key IS NULL`,
+      )
+      .all();
+    if (rows.length === 0) return;
+    const setKey = this.#db
+      .prepare('UPDATE tui_sessions SET project_key = ? WHERE tracking_id = ?');
+    for (const row of rows) {
+      const projectKey = this.#deriveTuiProjectKey(row.cwd, row.tracking_id);
+      setKey.run(projectKey, row.tracking_id);
+      this.#upsertTuiProjectRow({
+        projectKey,
+        label: row.label,
+        branch: row.branch,
+        trackingId: row.tracking_id,
+        state: row.state,
+        seenAt: row.updated_at,
+        firstSeenAt: row.connected_at,
+      });
+    }
+  }
+
+  /** Transaction-core prune. Inactive = not referenced by ANY current
+   * tui_sessions row (such a row is preserved regardless of its age —
+   * whether its session is actually live is a broker concern, not pruned
+   * here). Deletes inactive rows older than the cutoff, then inactive
+   * rows outside the newest `limit` (rows are ordered newest first). */
+  #pruneTuiProjectsCore({ olderThan, limit }) {
+    const rows = this.#db
+      .prepare(
+        `SELECT p.project_key, p.last_seen_at
+         FROM tui_projects p
+         WHERE NOT EXISTS (
+           SELECT 1 FROM tui_sessions s WHERE s.project_key = p.project_key
+         )
+         ORDER BY p.last_seen_at DESC, p.project_key DESC`,
+      )
+      .all();
+    const doomed = [];
+    rows.forEach((row, index) => {
+      if (row.last_seen_at < olderThan || index >= limit) doomed.push(row.project_key);
+    });
+    if (doomed.length === 0) return 0;
+    const placeholders = doomed.map(() => '?').join(', ');
+    const info = this.#db
+      .prepare(`DELETE FROM tui_projects WHERE project_key IN (${placeholders})`)
+      .run(...doomed);
+    return Number(info.changes);
+  }
+
+  /** Retention sweep for the automatic register/disconnect path. Must be
+   * called INSIDE the caller's transaction: a prune failure then rolls the
+   * primary mutation back instead of surfacing after a commit. */
+  #pruneTuiProjectsInTx(now) {
+    this.#pruneTuiProjectsCore({
+      olderThan: now - TUI_PROJECT_RETENTION_MS,
+      limit: MAX_TUI_RECENT_PROJECTS,
+    });
+  }
+
+  #clearSelectedTuiTargetKeys() {
+    for (const key of [SELECTED_TUI_TRACKING_ID_KEY, SELECTED_TUI_PROJECT_KEY_KEY]) {
+      this.#db.prepare('DELETE FROM meta WHERE key = ?').run(key);
+    }
+  }
+
   /**
    * Explicit, fail-closed registration of a live TUI connection.
    *
@@ -1305,6 +1505,7 @@ export class Store {
     piSessionFile,
     cwd,
     label,
+    branch,
     pid,
     staleCutoff,
   }) {
@@ -1319,44 +1520,66 @@ export class Store {
     piSessionFile = assertOptionalTuiString(piSessionFile, 'piSessionFile', MAX_TUI_PATH_CHARS);
     cwd = assertOptionalTuiString(cwd, 'cwd', MAX_TUI_PATH_CHARS);
     label = assertOptionalTuiString(label, 'label', MAX_TUI_LABEL_CHARS);
+    branch = assertOptionalTuiString(branch, 'branch', MAX_TUI_BRANCH_CHARS);
     if (!Number.isSafeInteger(pid) || pid <= 0) {
       throw new RangeError('pid must be a positive integer');
     }
     this.#assertTuiStaleCutoff(staleCutoff);
     const now = this.#now();
+    const projectKey = this.#deriveTuiProjectKey(cwd, trackingId);
     return this.#transaction(() => {
       const row = this.#getTuiSessionRow(trackingId);
       if (row && row.connection_id !== connectionId) {
         if (this.#tuiRowLive(row, staleCutoff)) {
           return { ok: false, reason: 'session_live_elsewhere' };
         }
+        // Selection drift guard: when this tracking id moves to a new
+        // project identity, the durable selected target must be cleared
+        // atomically — never silently rewritten onto the new project.
+        if (row.project_key !== projectKey
+          && this.#getMeta(SELECTED_TUI_TRACKING_ID_KEY) === trackingId) {
+          this.#clearSelectedTuiTargetKeys();
+        }
         this.#db
           .prepare(
             `UPDATE tui_sessions SET
                connection_id = ?, state = 'connected',
                pi_session_id = ?, pi_session_file = ?, cwd = ?,
-               label = ?, pid = ?,
+               label = ?, branch = ?, pid = ?, project_key = ?,
                connected_at = ?, updated_at = ?, heartbeat_at = ?
              WHERE tracking_id = ?`,
           )
           .run(
             connectionId, piSessionId, piSessionFile, cwd,
-            label, pid, now, now, now, trackingId,
+            label, branch, pid, projectKey, now, now, now, trackingId,
           );
         this.#appendTuiEventRow(trackingId, 'connected', 'null', now);
+        this.#upsertTuiProjectRow({
+          projectKey, label, branch, trackingId, state: 'connected', seenAt: now,
+        });
+        this.#pruneTuiProjectsInTx(now);
         return { ok: true, replaced: true, shortId: row.short_id };
       }
       if (row) {
         // Same connection: idempotent refresh, no duplicate 'connected'.
+        // Same selection drift guard as the replacement path above.
+        if (row.project_key !== projectKey
+          && this.#getMeta(SELECTED_TUI_TRACKING_ID_KEY) === trackingId) {
+          this.#clearSelectedTuiTargetKeys();
+        }
         this.#db
           .prepare(
             `UPDATE tui_sessions SET
                pi_session_id = ?, pi_session_file = ?, cwd = ?,
-               label = ?, pid = ?, state = 'connected',
+               label = ?, branch = ?, pid = ?, project_key = ?, state = 'connected',
                updated_at = ?, heartbeat_at = ?
              WHERE tracking_id = ? AND connection_id = ?`,
           )
-          .run(piSessionId, piSessionFile, cwd, label, pid, now, now, trackingId, connectionId);
+          .run(piSessionId, piSessionFile, cwd, label, branch, pid, projectKey, now, now, trackingId, connectionId);
+        this.#upsertTuiProjectRow({
+          projectKey, label, branch, trackingId, state: 'connected', seenAt: now,
+        });
+        this.#pruneTuiProjectsInTx(now);
         return { ok: true, replaced: false, shortId: row.short_id };
       }
       let resolvedShortId = shortId ?? null;
@@ -1381,19 +1604,24 @@ export class Store {
         .prepare(
           `INSERT INTO tui_sessions
              (tracking_id, short_id, pi_session_id, pi_session_file, cwd,
-              label, pid, connection_id, state, connected_at, updated_at, heartbeat_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'connected', ?, ?, ?)`,
+              label, branch, pid, project_key, connection_id, state, connected_at, updated_at, heartbeat_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'connected', ?, ?, ?)`,
         )
         .run(
           trackingId, resolvedShortId, piSessionId, piSessionFile, cwd,
-          label, pid, connectionId, now, now, now,
+          label, branch, pid, projectKey, connectionId, now, now, now,
         );
       this.#appendTuiEventRow(trackingId, 'connected', 'null', now);
+      this.#upsertTuiProjectRow({
+        projectKey, label, branch, trackingId, state: 'connected', seenAt: now,
+      });
+      this.#pruneTuiProjectsInTx(now);
       return { ok: true, replaced: false, shortId: resolvedShortId };
     });
   }
 
-  /** CAS heartbeat: fails once the connection was replaced or removed. */
+  /** CAS heartbeat: fails once the connection was replaced or removed.
+   * Only a successful CAS bumps the project history's last_seen_at. */
   heartbeatTuiSession({ trackingId, connectionId }) {
     assertTuiId(trackingId, 'trackingId');
     assertTuiId(connectionId, 'connectionId');
@@ -1405,11 +1633,19 @@ export class Store {
            WHERE tracking_id = ? AND connection_id = ?`,
         )
         .run(now, now, trackingId, connectionId);
-      return info.changes === 1 ? { ok: true } : { ok: false, reason: 'not_owner' };
+      if (info.changes !== 1) return { ok: false, reason: 'not_owner' };
+      this.#db
+        .prepare(
+          `UPDATE tui_projects SET last_seen_at = ?
+           WHERE project_key = (SELECT project_key FROM tui_sessions WHERE tracking_id = ?)`,
+        )
+        .run(now, trackingId);
+      return { ok: true };
     });
   }
 
-  /** CAS busy/waiting/connected state; fails after replacement. */
+  /** CAS busy/waiting/connected state; fails after replacement. Only a
+   * successful CAS moves the project history's state/last_seen_at. */
   setTuiSessionState({ trackingId, connectionId, state }) {
     assertTuiId(trackingId, 'trackingId');
     assertTuiId(connectionId, 'connectionId');
@@ -1417,13 +1653,21 @@ export class Store {
       throw new TypeError('state must be one of ' + TUI_SESSION_STATES.join(', '));
     }
     return this.#transaction(() => {
+      const now = this.#now();
       const info = this.#db
         .prepare(
           `UPDATE tui_sessions SET state = ?, updated_at = ?
            WHERE tracking_id = ? AND connection_id = ?`,
         )
-        .run(state, this.#now(), trackingId, connectionId);
-      return info.changes === 1 ? { ok: true } : { ok: false, reason: 'not_owner' };
+        .run(state, now, trackingId, connectionId);
+      if (info.changes !== 1) return { ok: false, reason: 'not_owner' };
+      this.#db
+        .prepare(
+          `UPDATE tui_projects SET last_state = ?, last_seen_at = ?
+           WHERE project_key = (SELECT project_key FROM tui_sessions WHERE tracking_id = ?)`,
+        )
+        .run(state, now, trackingId);
+      return { ok: true };
     });
   }
 
@@ -1431,6 +1675,13 @@ export class Store {
    * Explicit disconnect by the owning connection: deletes the session row
    * and appends a 'disconnected' event atomically. Events and commands are
    * intentionally NOT cascaded; the broker drains them before ack.
+   *
+   * The project history row survives: it is marked disconnected (only
+   * when no other current tui_sessions row still carries the project),
+   * and the durable selected target is cleared when it pointed at the
+   * disconnected session. The retention sweep runs inside the SAME
+   * transaction, so a caller never sees an exception for a disconnect
+   * that already committed its primary mutation.
    */
   disconnectTuiSession({ trackingId, connectionId }) {
     assertTuiId(trackingId, 'trackingId');
@@ -1441,10 +1692,26 @@ export class Store {
       if (!row || row.connection_id !== connectionId) {
         return { ok: false, reason: 'not_owner' };
       }
+      const projectKey = row.project_key ?? this.#deriveTuiProjectKey(row.cwd, trackingId);
       this.#db
         .prepare('DELETE FROM tui_sessions WHERE tracking_id = ?')
         .run(trackingId);
       this.#appendTuiEventRow(trackingId, 'disconnected', 'null', now);
+      const stillTracked = this.#db
+        .prepare('SELECT 1 FROM tui_sessions WHERE project_key = ? LIMIT 1')
+        .get(projectKey);
+      if (!stillTracked) {
+        this.#db
+          .prepare(
+            `UPDATE tui_projects SET last_state = 'disconnected', last_seen_at = ?, disconnected_at = ?
+             WHERE project_key = ?`,
+          )
+          .run(now, now, projectKey);
+      }
+      if (this.#getMeta(SELECTED_TUI_TRACKING_ID_KEY) === trackingId) {
+        this.#clearSelectedTuiTargetKeys();
+      }
+      this.#pruneTuiProjectsInTx(now);
       return { ok: true };
     });
   }
@@ -1464,6 +1731,131 @@ export class Store {
       .prepare('SELECT * FROM tui_sessions ORDER BY connected_at, tracking_id')
       .all();
     return rows.map((row) => this.#rowToTuiSession(row, staleCutoff));
+  }
+
+  // --- Project history APIs (T1: project library) -------------------------
+
+  /**
+   * Recent project history, newest first. Returns frozen objects with
+   * projectKey, label, alias, branch, colorSlot, lastState, firstSeenAt,
+   * lastSeenAt, disconnectedAt. NEVER cwd, pid, and NEVER any tracking,
+   * session or connection id (last_tracking_id stays an internal column).
+   * `since` (epoch ms) excludes rows last seen before it; `limit` is
+   * hard-capped at MAX_TUI_RECENT_PROJECTS.
+   */
+  listRecentTuiProjects({ since, limit = MAX_TUI_RECENT_PROJECTS } = {}) {
+    if (!Number.isSafeInteger(since)) {
+      throw new RangeError('since must be an epoch-ms integer');
+    }
+    if (!Number.isSafeInteger(limit) || limit < 1) {
+      throw new RangeError('limit must be a positive integer');
+    }
+    const effectiveLimit = Math.min(limit, MAX_TUI_RECENT_PROJECTS);
+    const rows = this.#db
+      .prepare(
+        `SELECT project_key, label, alias, branch, color_slot, last_state,
+                first_seen_at, last_seen_at, disconnected_at
+         FROM tui_projects
+         WHERE last_seen_at >= ?
+         ORDER BY last_seen_at DESC, project_key DESC
+         LIMIT ?`,
+      )
+      .all(since, effectiveLimit);
+    return rows.map((row) => freezeDeep({
+      projectKey: row.project_key,
+      label: row.label,
+      alias: row.alias,
+      branch: row.branch,
+      colorSlot: row.color_slot,
+      lastState: row.last_state,
+      firstSeenAt: row.first_seen_at,
+      lastSeenAt: row.last_seen_at,
+      disconnectedAt: row.disconnected_at,
+    }));
+  }
+
+  /**
+   * Set (or clear with null) the human alias of one project. Renaming is
+   * never activity: timestamps are deliberately left unchanged. Unknown
+   * project keys fail closed with 'unknown_project'.
+   */
+  setTuiProjectAlias({ projectKey, alias }) {
+    this.#assertTuiProjectKey(projectKey);
+    const normalizedAlias = assertOptionalTuiString(alias, 'alias', MAX_TUI_LABEL_CHARS);
+    return this.#transaction(() => {
+      const info = this.#db
+        .prepare('UPDATE tui_projects SET alias = ? WHERE project_key = ?')
+        .run(normalizedAlias, projectKey);
+      return info.changes === 1 ? { ok: true } : { ok: false, reason: 'unknown_project' };
+    });
+  }
+
+  /** Durable selected target: frozen {trackingId, projectKey} or null.
+   * Malformed or partial persisted meta fails closed to null. */
+  getSelectedTuiTarget() {
+    const trackingId = this.#getMeta(SELECTED_TUI_TRACKING_ID_KEY);
+    const projectKey = this.#getMeta(SELECTED_TUI_PROJECT_KEY_KEY);
+    if (
+      typeof trackingId !== 'string'
+      || !TUI_ID_RE.test(trackingId)
+      || typeof projectKey !== 'string'
+      || !TUI_PROJECT_KEY_RE.test(projectKey)
+    ) {
+      return null;
+    }
+    return freezeDeep({ trackingId, projectKey });
+  }
+
+  /**
+   * Durable selected target. Verifies the exact current session-row
+   * identity exists and its project_key matches (row existence only:
+   * liveness/staleness re-checks stay broker-owned). Both meta keys persist
+   * atomically.
+   */
+  setSelectedTuiTarget({ trackingId, projectKey }) {
+    assertTuiId(trackingId, 'trackingId');
+    this.#assertTuiProjectKey(projectKey);
+    return this.#transaction(() => {
+      const row = this.#db
+        .prepare('SELECT project_key FROM tui_sessions WHERE tracking_id = ?')
+        .get(trackingId);
+      if (!row) return { ok: false, reason: 'unknown_session' };
+      if (row.project_key !== projectKey) {
+        return { ok: false, reason: 'project_mismatch' };
+      }
+      this.#setMeta(SELECTED_TUI_TRACKING_ID_KEY, trackingId);
+      this.#setMeta(SELECTED_TUI_PROJECT_KEY_KEY, projectKey);
+      return { ok: true };
+    });
+  }
+
+  /** Remove the durable selected target. Idempotent, always ok. */
+  clearSelectedTuiTarget() {
+    return this.#transaction(() => {
+      this.#clearSelectedTuiTargetKeys();
+      return { ok: true };
+    });
+  }
+
+  /**
+   * Explicit retention sweep. Preserves ANY project referenced by a
+   * current tui_sessions row; deletes inactive rows older than `olderThan`,
+   * then inactive rows outside the newest `limit`. Returns the deleted
+   * count. Also runs inside each successful register/disconnect transaction
+   * with TUI_PROJECT_RETENTION_MS / MAX_TUI_RECENT_PROJECTS.
+   */
+  pruneTuiProjectHistory({ olderThan, limit = MAX_TUI_RECENT_PROJECTS }) {
+    if (!Number.isSafeInteger(olderThan)) {
+      throw new RangeError('olderThan must be an epoch-ms integer');
+    }
+    if (!Number.isSafeInteger(limit) || limit < 1) {
+      throw new RangeError('limit must be a positive integer');
+    }
+    const effectiveLimit = Math.min(limit, MAX_TUI_RECENT_PROJECTS);
+    return this.#transaction(() => ({
+      ok: true,
+      deleted: this.#pruneTuiProjectsCore({ olderThan, limit: effectiveLimit }),
+    }));
   }
 
   /**
