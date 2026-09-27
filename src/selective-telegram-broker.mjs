@@ -371,8 +371,16 @@ export class SelectiveTelegramBroker {
   /** Memory-only selected tracking id; mirrored into the durable store
    * through #selectTarget/#clearSelection only — never written directly. */
   #selectedTrackingId = null;
-  /** trackingId -> { label, shortId }; identity for prefixing drained events. */
+  /**
+   * trackingId -> { label, alias, branch, projectKey, shortId }; identity
+   * for headers and drained events (T4B2). The alias is the per-session
+   * alias only; the project alias is resolved separately through
+   * #projectAliasFor so it can act as a CURRENT project-level fallback.
+   */
   #identityCache = new Map();
+  /** projectKey -> project alias (or null for a known alias-less project);
+   * a bounded read fallback fed from listRecentTuiProjects (T4B2). */
+  #projectAliasCache = new Map();
   /** Bounded in-memory replies ({text, replyMarkup}) waiting to be flushed. */
   #pendingReplies = [];
   /** Broker-memory pending prompt {pendingId, text}; a restart loses it fail-closed. */
@@ -590,6 +598,10 @@ export class SelectiveTelegramBroker {
    *   other update and whenever transcription is disabled.
    */
   handleUpdate(update, resolvedAudio = undefined) {
+    // Keep the identity and project-alias caches CURRENT before planning:
+    // a rename (session alias set/cleared, project alias set/cleared)
+    // between cycles must be visible on the very next reply (T4B2).
+    this.#refreshIdentities();
     const parsed = this.#classifyUpdate(update);
     if (parsed === null) {
       this.#log('update_rejected');
@@ -849,8 +861,8 @@ export class SelectiveTelegramBroker {
             trackingId: session.trackingId,
             kind: 'prompt',
             payload: { text: clip(pending.text, MAX_TEXT_CHARS) },
-            ackReply: { text: copy.pendingSent(session.label) },
-            staleReply: { text: copy.sessionGone(session.label) },
+            ackReply: { text: copy.pendingSent(this.#sessionHeader(session)) },
+            staleReply: { text: copy.sessionGone(this.#sessionHeader(session)) },
           },
         };
       }
@@ -891,7 +903,7 @@ export class SelectiveTelegramBroker {
         return {
           answerId,
           reply: {
-            text: copy.disconnectAsk(session.label),
+            text: copy.disconnectAsk(this.#sessionHeader(session)),
             replyMarkup: { inline_keyboard: [[
               { text: copy.DISCONNECT_BUTTON, callback_data: `v1:D:${session.shortId}`, style: 'danger' },
               { text: copy.CANCEL_BUTTON, callback_data: 'v1:C' },
@@ -967,8 +979,8 @@ export class SelectiveTelegramBroker {
         trackingId: session.trackingId,
         kind,
         payload: { text: clip(pending.text, MAX_TEXT_CHARS) },
-        ackReply: { text: copy.cbAck(kind, session.label) },
-        staleReply: { text: copy.sessionGone(session.label) },
+        ackReply: { text: copy.cbAck(kind, this.#sessionHeader(session)) },
+        staleReply: { text: copy.sessionGone(this.#sessionHeader(session)) },
       }],
       clearPending: true,
     };
@@ -987,7 +999,7 @@ export class SelectiveTelegramBroker {
     const live = this.#liveSessions();
     const matches = live.filter((session) => session.shortId === parsed.shortId);
     if (matches.length !== 1) {
-      return this.#busyActionTargetNotLive(answerId);
+      return this.#busyActionTargetNotLive(answerId, parsed.shortId);
     }
     const [session] = matches;
     this.#selectTarget(session);
@@ -1000,15 +1012,17 @@ export class SelectiveTelegramBroker {
           trackingId: session.trackingId,
           kind: 'abort',
           payload: null,
-          ackReply: { text: copy.cbAck('abort') },
-          staleReply: { text: copy.sessionGone(session.label) },
+          // Session-scoped: the first abort acknowledgement names the
+          // session instead of staying anonymous (T4B2).
+          ackReply: { text: copy.cbAck('abort', this.#sessionHeader(session)) },
+          staleReply: { text: copy.sessionGone(this.#sessionHeader(session)) },
         },
         {
           trackingId: session.trackingId,
           kind: 'prompt',
           payload: { text: clip(pending.text, MAX_TEXT_CHARS) },
-          ackReply: { text: copy.cbAck('prompt_after_abort', session.label) },
-          staleReply: { text: copy.sessionGone(session.label) },
+          ackReply: { text: copy.cbAck('prompt_after_abort', this.#sessionHeader(session)) },
+          staleReply: { text: copy.sessionGone(this.#sessionHeader(session)) },
         },
       ],
       clearPending: true,
@@ -1047,32 +1061,42 @@ export class SelectiveTelegramBroker {
         trackingId: session.trackingId,
         kind,
         payload: null,
-        ackReply: { text: copy.cbAck(kind, session.label) },
-        staleReply: { text: copy.sessionGone(session.label) },
+        ackReply: { text: copy.cbAck(kind, this.#sessionHeader(session)) },
+        staleReply: { text: copy.sessionGone(this.#sessionHeader(session)) },
       },
     };
   }
 
-  /** The last-known label for a short id, or null when it was never seen. */
-  #lastKnownLabel(shortId) {
+  /**
+   * The last-known identity of a short id, or null when it was never
+   * seen. Used to name a dead/stale target without ever exposing the id.
+   */
+  #lastKnownIdentity(shortId) {
     for (const identity of this.#identityCache.values()) {
-      if (identity.shortId === shortId) return identity.label;
+      if (identity.shortId === shortId) return identity;
     }
     return null;
   }
 
   /**
-   * The stale/dead-target reply (T04): when the named Pi is known (it was
-   * seen live earlier), say it just closed or disconnected, then show the
-   * fresh Projects dashboard — or the no-live guidance when none are left.
-   * Never exposes the short id itself.
+   * The stale/dead-target reply (T04/T4B2): when the named Pi is known (it
+   * was seen live earlier), say it just closed or disconnected under its
+   * full identity header, then show the fresh Projects dashboard — or the
+   * no-live guidance when none are left. Never exposes the short id itself.
    */
   #staleProjectsReply(shortId) {
     const dashboard = this.#projectsReply();
-    const label = this.#lastKnownLabel(shortId);
-    if (label === null) return dashboard;
+    const identity = this.#lastKnownIdentity(shortId);
+    if (identity === null) return dashboard;
+    const header = copy.identityHeader({
+      colorSlot: this.#colorSlotOf(identity.projectKey),
+      sessionAlias: identity.alias,
+      projectAlias: this.#projectAliasFor(identity.projectKey),
+      label: identity.label,
+      branch: identity.branch,
+    });
     return {
-      text: `${copy.sessionGone(label)}\n${dashboard.text}`,
+      text: `${copy.sessionGone(header)}\n${dashboard.text}`,
       replyMarkup: dashboard.replyMarkup,
     };
   }
@@ -1325,7 +1349,7 @@ export class SelectiveTelegramBroker {
       this.#selectTarget(sole);
       return {
         replies: [{
-          text: copy.homeOne(sole.label),
+          text: copy.homeOne(this.#sessionHeader(sole)),
           replyMarkup: this.#sessionActionKeyboard(sole),
         }],
         commands: [],
@@ -1490,7 +1514,7 @@ export class SelectiveTelegramBroker {
       }
       payload = { text: clipped };
     }
-    const staleReply = { text: copy.sessionGone(target.session.label) };
+    const staleReply = { text: copy.sessionGone(this.#sessionHeader(target.session)) };
     return {
       replies: [],
       commands: [{
@@ -1511,7 +1535,7 @@ export class SelectiveTelegramBroker {
   #busyCardReply(session, pendingId) {
     const sid = session.shortId;
     return {
-      text: copy.busyCard(session.label),
+      text: copy.busyCard(this.#sessionHeader(session)),
       replyMarkup: { inline_keyboard: [
         [{ text: BUSY_BUTTON_FOLLOWUP, callback_data: `v1:f:${sid}:${pendingId}` }],
         [{ text: BUSY_BUTTON_STEER, callback_data: `v1:t:${sid}:${pendingId}` }],
@@ -1572,7 +1596,7 @@ export class SelectiveTelegramBroker {
         kind: 'prompt',
         payload: { text: clipped },
         ackReply: this.#prefixed(target.session, ACK_TEXT.prompt),
-        staleReply: { text: copy.sessionGone(target.session.label) },
+        staleReply: { text: copy.sessionGone(this.#sessionHeader(target.session)) },
       }],
     };
   }
@@ -1807,6 +1831,9 @@ export class SelectiveTelegramBroker {
   // --- event rendering ----------------------------------------------------------
 
   #refreshIdentities() {
+    // The project-alias fallback must stay CURRENT: a rename between two
+    // drains must be visible, so the cache is rebuilt once per drain cycle.
+    this.#projectAliasCache.clear();
     try {
       const cutoff = this.#now() - DEFAULT_STALE_AFTER_MS;
       const sessions = this.#store.listTuiSessions({ staleCutoff: cutoff });
@@ -1831,22 +1858,107 @@ export class SelectiveTelegramBroker {
       : 'unknown';
     this.#identityCache.set(session.trackingId, {
       label: boundedLabel(session.label),
+      alias: typeof session.alias === 'string' && session.alias.trim().length > 0
+        ? session.alias
+        : null,
+      branch: typeof session.branch === 'string' && session.branch.length > 0
+        ? session.branch
+        : null,
+      projectKey: typeof session.projectKey === 'string' && session.projectKey.length > 0
+        ? session.projectKey
+        : null,
       shortId,
     });
   }
 
   /**
-   * The readable display label of a cached identity, or null when the
-   * session was never seen. Beginner copy renders `Pi · <label>`; the
-   * short id never reaches the text layer.
+   * The CURRENT project-level alias for a project key (T4B2), or null.
+   * Backed by a bounded in-memory cache; a miss triggers ONE bounded read
+   * of the recent project history (listRecentTuiProjects) to fill it. A
+   * read failure degrades to null: the header falls to the next identity
+   * candidate instead of throwing.
    */
-  #labelFor(trackingId) {
-    const identity = this.#identityCache.get(trackingId);
-    return identity ? identity.label : null;
+  #projectAliasFor(projectKey) {
+    if (typeof projectKey !== 'string' || projectKey.length === 0) return null;
+    if (this.#projectAliasCache.has(projectKey)) return this.#projectAliasCache.get(projectKey);
+    try {
+      const recent = this.#store.listRecentTuiProjects({
+        since: this.#now() - TUI_PROJECT_RETENTION_MS,
+      });
+      for (const project of recent) {
+        if (!isPlainObject(project) || typeof project.projectKey !== 'string') continue;
+        this.#projectAliasCache.set(
+          project.projectKey,
+          typeof project.alias === 'string' && project.alias.trim().length > 0
+            ? project.alias
+            : null,
+        );
+      }
+    } catch {
+      this.#log('projects_history_unavailable');
+    }
+    return this.#projectAliasCache.get(projectKey) ?? null;
   }
 
+  /**
+   * The T4B2 identity header of a LIVE session: per-session alias, project
+   * alias fallback, label, branch and project color. Never throws; unusable
+   * metadata degrades inside the copy builder to the neutral fallback.
+   */
+  #sessionHeader(session) {
+    const source = isPlainObject(session) ? session : {};
+    return copy.identityHeader({
+      colorSlot: this.#colorSlotOf(source.projectKey),
+      sessionAlias: typeof source.alias === 'string' ? source.alias : null,
+      projectAlias: this.#projectAliasFor(source.projectKey),
+      label: source.label,
+      branch: source.branch,
+    });
+  }
+
+  /**
+   * The T4B2 identity header of a drained event. A valid T4B1 snapshot
+   * (non-null project key) is used AS A WHOLE: a snapshot alias/branch
+   * that was null stays null — never filled from later live state. The
+   * project alias MAY be the current project-level fallback by project
+   * key; the frozen session alias still wins over it. ONLY an all-null
+   * legacy snapshot may fall back to the live identity cache.
+   */
+  #eventHeader(event) {
+    const projectKey = isPlainObject(event)
+      && typeof event.projectKey === 'string' && event.projectKey.length > 0
+      ? event.projectKey
+      : null;
+    if (projectKey !== null) {
+      return copy.identityHeader({
+        colorSlot: this.#colorSlotOf(projectKey),
+        sessionAlias: typeof event.alias === 'string' ? event.alias : null,
+        projectAlias: this.#projectAliasFor(projectKey),
+        label: typeof event.label === 'string' ? event.label : null,
+        branch: typeof event.branch === 'string' ? event.branch : null,
+      });
+    }
+    const identity = isPlainObject(event)
+      ? this.#identityCache.get(event.trackingId)
+      : undefined;
+    if (identity !== undefined) {
+      return copy.identityHeader({
+        colorSlot: this.#colorSlotOf(identity.projectKey),
+        sessionAlias: identity.alias,
+        projectAlias: this.#projectAliasFor(identity.projectKey),
+        label: identity.label,
+        branch: identity.branch,
+      });
+    }
+    return copy.identityHeader({});
+  }
+
+  /**
+   * Session-scoped one-line acknowledgement under the session's full T4B2
+   * identity header (the builder re-renders a prebuilt header verbatim).
+   */
   #prefixed(session, message) {
-    return copy.sessionNotice(session.label, message);
+    return copy.sessionNotice(this.#sessionHeader(session), message);
   }
 
   /** The exactly-one live session with this tracking id, or null. */
@@ -1905,27 +2017,32 @@ export class SelectiveTelegramBroker {
    * attached by #sendChunks to exactly one deterministic chunk.
    */
   #renderEvent(event) {
-    // T04: the label-only `Pi · <label>` identity replaces the old
-    // [label · shortId] prefix on the whole normal event path.
-    const label = this.#labelFor(event.trackingId) ?? '';
+    // T4B2: the alias-aware identity header replaces the old label-only
+    // prefix on the whole normal event path. A valid T4B1 snapshot is used
+    // as a whole; only an all-null legacy snapshot falls back to the live
+    // identity cache (see #eventHeader).
+    const header = this.#eventHeader(event);
     const payload = isPlainObject(event.payload) ? event.payload : {};
     switch (event.kind) {
       case 'connected': {
         const session = this.#liveByTrackingId(event.trackingId);
         return {
-          text: copy.eventConnected(label),
+          text: copy.eventConnected(header),
           replyMarkup: this.#sessionActionKeyboard(session),
         };
       }
       case 'disconnected':
-        return { text: copy.eventDisconnected(label), replyMarkup: null };
+        return { text: copy.eventDisconnected(header), replyMarkup: null };
       case 'final_output': {
         const text = typeof payload.text === 'string' && payload.text.length > 0
           ? payload.text
           : null;
         if (text === null) return null;
+        // Built ONCE as a single string; #sendChunks splits it, so the
+        // header appears exactly once and the keyboard stays on the final
+        // chunk.
         return {
-          text: `${copy.displayLabel(label)}\n${clip(text, MAX_TEXT_CHARS)}`,
+          text: `${copy.displayLabel(header)}\n${clip(text, MAX_TEXT_CHARS)}`,
           replyMarkup: this.#finalOutputKeyboard(this.#liveByTrackingId(event.trackingId)),
         };
       }
@@ -1933,8 +2050,9 @@ export class SelectiveTelegramBroker {
         const state = typeof payload.state === 'string' ? payload.state : null;
         return {
           // Beginner status shows state and model only — never cwd, pid or
-          // session ids (BEGINNER_UX.md sections 2 and 11).
-          text: copy.eventStatus(label, payload),
+          // session ids (BEGINNER_UX.md sections 2 and 11). The model stays
+          // body-only: the header is identity.
+          text: copy.eventStatus(header, payload),
           replyMarkup: state === 'busy'
             ? this.#stopKeyboard(this.#liveByTrackingId(event.trackingId))
             : null,
@@ -1943,7 +2061,7 @@ export class SelectiveTelegramBroker {
       case 'command_result': {
         const ok = payload.ok === true;
         return {
-          text: copy.eventCommandResult(label, ok, payload.resultCode),
+          text: copy.eventCommandResult(header, ok, payload.resultCode),
           replyMarkup: null,
         };
       }

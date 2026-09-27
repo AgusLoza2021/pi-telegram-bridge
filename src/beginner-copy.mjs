@@ -16,11 +16,42 @@
 /** Telegram inline-button text limit; every rendered label fits one button. */
 export const MAX_BUTTON_TEXT_CHARS = 64;
 
-/** A label that already carries a readable prefix is reused, never doubled. */
-const PREFIXED_LABEL_RE = /^pi\s*(?:·|-|:|—)\s*/i;
+/**
+ * T4B2 identity-header budget in Unicode code points: a header is identity
+ * only and must stay compact at the top of any session-scoped message.
+ */
+export const MAX_IDENTITY_HEADER_CODE_POINTS = 64;
+
+/**
+ * Exactly the eight project-square glyphs (🟦🟪🟧🟩🟨🟫⬛⬜): the ONLY
+ * glyphs that grant prebuilt identity-header passthrough. State circles
+ * (🟢🟡⚪🔴⚫) are presentation, never identity, and must never gain this
+ * privilege.
+ */
+const PROJECT_SQUARE_CLASS = '[\\u{1F7E6}-\\u{1F7EB}\\u{2B1B}\\u{2B1C}]';
 const BARE_PI_RE = /^pi$/i;
 /** Words that must never survive into beginner-visible text (BEGINNER_UX.md §2). */
 const JARGON_RE = /\b(?:dpapi|broker|sqlite|argv|acl|pid|long poll|scheduled task)\b/gi;
+
+/**
+ * Leading state-circle markers are presentation, never identity: they are
+ * stripped from the start of any label so a spoofed `<circle> Pi · name`
+ * can never ride the prebuilt-header passthrough.
+ */
+const LEADING_STATE_CIRCLES_RE = /^[🟢🟡⚪🔴⚫]+(?:\s+|$)/u;
+
+/** The exact bad-metadata fallback header: `<square> Pi`. */
+const PREBUILT_FALLBACK_HEADER_RE = new RegExp(`^${PROJECT_SQUARE_CLASS}\\s*pi$`, 'iu');
+/**
+ * A prebuilt identity header (optional project square, then `Pi ·`) or a
+ * legacy prefixed label without one. Also the normalization rule for
+ * identityHeader name candidates: stripping it repeatedly reduces a
+ * prefixed or nested candidate to its bare name.
+ */
+const PREBUILT_PREFIXED_RE = new RegExp(
+  `^(?:${PROJECT_SQUARE_CLASS}\\s)?pi\\s*(?:·|-|:|—)\\s*`,
+  'iu',
+);
 
 /**
  * Strip everything a beginner label must never carry: short ids, tracking
@@ -30,6 +61,8 @@ const JARGON_RE = /\b(?:dpapi|broker|sqlite|argv|acl|pid|long poll|scheduled tas
  */
 function sanitizeLabelPart(raw) {
   let text = typeof raw === 'string' ? raw : '';
+  // A leading state circle is presentation, never identity (F5).
+  text = text.replace(LEADING_STATE_CIRCLES_RE, ' ');
   text = text.replace(/tg:[A-Za-z0-9_-]+/g, ' ');
   text = text.replace(/\b[0-9a-f]{16,}\b/gi, ' ');
   text = text.replace(/\bpid\s*[=:#]?\s*\d+\b/gi, ' ');
@@ -64,25 +97,110 @@ function clipCodePoints(text, maxCodePoints) {
   return out;
 }
 
+/** Clip to at most max REAL Unicode code points; a pair is one code point. */
+function clipToCodePoints(text, maxCodePoints) {
+  if (typeof text !== 'string' || maxCodePoints <= 0) return '';
+  let count = 0;
+  let out = '';
+  for (const ch of text) {
+    if (count >= maxCodePoints) break;
+    out += ch;
+    count++;
+  }
+  return out;
+}
+
 /** Strip unpaired surrogates so a hostile name can never produce one. */
 function stripLoneSurrogates(text) {
-  return text.replace(
-    /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g,
-    '',
-  );
+  return typeof text === 'string'
+    ? text.replace(
+      /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g,
+      '',
+    )
+    : text;
+}
+
+/**
+ * Reduce one identityHeader name candidate to its bare, sanitized name:
+ * sanitization first, then repeated stripping of any leading identity
+ * prefix (optionally project-square-led), so a candidate like `Pi · alpha`,
+ * `Pi - alpha` or `<square> Pi · alpha` normalizes to `alpha` and the built
+ * header carries exactly ONE identity prefix — never `Pi · Pi ·` and never
+ * nested squares. Stripping still runs after full path/id/jargon hygiene.
+ */
+function normalizeIdentityCandidate(raw) {
+  let text = sanitizeLabelPart(stripLoneSurrogates(raw));
+  let previous = '';
+  while (previous !== text) {
+    previous = text;
+    text = text.replace(PREBUILT_PREFIXED_RE, '').trim();
+  }
+  return text;
 }
 
 /**
  * Bounded readable display label: `Pi · <label>`. Collapses sanitization
  * whitespace, falls back to plain `Pi`, never doubles an existing prefix
- * and always fits one Telegram button.
+ * and always fits one Telegram button. A valid prebuilt identity header
+ * (T4B2, with or without its leading project square) passes through
+ * unchanged, so session-scoped copy can re-render a full header without
+ * ever producing `Pi · Pi`.
  */
 export function displayLabel(raw) {
-  const text = sanitizeLabelPart(raw);
+  const text = sanitizeLabelPart(stripLoneSurrogates(raw));
   if (text.length === 0) return 'Pi';
+  if (PREBUILT_FALLBACK_HEADER_RE.test(text)) return text;
   if (BARE_PI_RE.test(text)) return 'Pi';
-  if (PREFIXED_LABEL_RE.test(text)) return clip(text, MAX_BUTTON_TEXT_CHARS);
-  return clip(`Pi · ${text}`, MAX_BUTTON_TEXT_CHARS);
+  if (PREBUILT_PREFIXED_RE.test(text)) {
+    // A prebuilt identity header re-renders under the header's own 64
+    // CODE POINT contract — never a UTF-16 slice, which could split a
+    // surrogate pair (F1).
+    return clipToCodePoints(text, MAX_IDENTITY_HEADER_CODE_POINTS);
+  }
+  return clipToCodePoints(`Pi · ${text}`, MAX_BUTTON_TEXT_CHARS);
+}
+
+/**
+ * T4B2 session-scoped identity header:
+ * `<project square> Pi · <session alias | project alias | label>[ · <branch>]`.
+ *
+ * Pure identity: never a state or liveness word, never cwd, pid, short or
+ * tracking ids, tokens, raw errors or a model name (those are not inputs).
+ * Every name candidate goes through the same sanitization as a button
+ * label; the FIRST candidate that survives (non-empty, not bare `Pi`)
+ * wins — session alias, then project alias, then label. The whole header
+ * is clipped to 64 Unicode code points without splitting a surrogate pair,
+ * and the branch appears only when its ENTIRE sanitized form fits inside
+ * the budget — otherwise it is omitted, never half-shown. Bad or missing
+ * metadata degrades to the neutral `⬜ Pi`.
+ */
+export function identityHeader({
+  colorSlot = null, sessionAlias = null, projectAlias = null, label = null, branch = null,
+} = {}) {
+  const square = projectColor(colorSlot);
+  const prefix = `${square} Pi · `;
+  const budget = MAX_IDENTITY_HEADER_CODE_POINTS - [...prefix].length;
+  let name = '';
+  for (const candidate of [sessionAlias, projectAlias, label]) {
+    const sanitized = clipToCodePoints(normalizeIdentityCandidate(candidate), budget);
+    if (sanitized.length > 0 && !BARE_PI_RE.test(sanitized)) {
+      name = sanitized;
+      break;
+    }
+  }
+  if (name.length === 0) return `${PROJECT_COLOR_FALLBACK} Pi`;
+  let branchText = '';
+  if (typeof branch === 'string') {
+    const sanitizedBranch =
+      stripLoneSurrogates(sanitizeLabelPart(branch).replace(/\s+/g, '-'));
+    if (sanitizedBranch.length > 0) {
+      const suffix = ` · ${sanitizedBranch}`;
+      // Both sides count REAL code points (F2): a UTF-16 name.length would
+      // over-count an astral name and drop a branch that actually fits.
+      if ([...name].length + [...suffix].length <= budget) branchText = suffix;
+    }
+  }
+  return `${prefix}${name}${branchText}`;
 }
 
 // --- /start home (BEGINNER_UX.md section 6) ---------------------------------
@@ -224,8 +342,12 @@ export const busyFollowup = (rawLabel) =>
 export const busySteer = (rawLabel) =>
   `Done — ${displayLabel(rawLabel)} got your message and will adjust what it's doing.`;
 
-/** First acknowledgement of the stop-and-send choice (abort enqueued). */
-export const busyAborting = 'Stopping the current task...';
+/**
+ * First acknowledgement of the stop-and-send choice (abort enqueued).
+ * Session-scoped: it names the session/header instead of staying anonymous.
+ */
+export const busyAborting = (rawLabel) =>
+  sessionNotice(rawLabel, 'Stopping the current task...');
 
 /** MSG-B3 — stop-and-send: the held prompt is on its way. */
 export const busyAbortSent = (rawLabel) =>
@@ -265,7 +387,7 @@ export function cbAck(op, rawLabel) {
   switch (op) {
     case 'followup': return busyFollowup(rawLabel);
     case 'steer': return busySteer(rawLabel);
-    case 'abort': return busyAborting;
+    case 'abort': return busyAborting(rawLabel);
     case 'prompt_after_abort': return busyAbortSent(rawLabel);
     case 'prompt': return pendingSent(rawLabel);
     case 'stop': return stopAck(rawLabel);

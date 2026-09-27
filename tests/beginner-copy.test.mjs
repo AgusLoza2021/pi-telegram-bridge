@@ -21,7 +21,11 @@ import { fileURLToPath } from 'node:url';
 
 import {
   MAX_BUTTON_TEXT_CHARS,
+  MAX_IDENTITY_HEADER_CODE_POINTS,
+  PROJECT_COLOR_FALLBACK,
+  PROJECT_COLOR_SLOTS,
   displayLabel,
+  identityHeader,
   homeNoLive,
   homeOne,
   homeMultiple,
@@ -181,7 +185,7 @@ describe('beginner copy: busy and action builders (BEGINNER_UX.md sections 8-9)'
       cbAck('steer', 'g'),
       "Done — Pi · g got your message and will adjust what it's doing.",
     );
-    assert.equal(cbAck('abort', 'g'), 'Stopping the current task...');
+    assert.equal(cbAck('abort', 'g'), 'Pi · g — Stopping the current task...');
     assert.equal(
       cbAck('prompt_after_abort', 'g'),
       'Stopped. Your message is on its way to Pi · g.',
@@ -293,6 +297,305 @@ describe('beginner copy: no builder ever leaks internals or jargon', () => {
     // "broker" is an advanced-layer word: allowed only after the label.
     assert.doesNotMatch(beginnerPortion, /broker/i);
     assert.match(advancedPortion, /broker/i);
+  });
+});
+
+// --- T4B2 identity headers ---------------------------------------------------
+
+/** Real Unicode code point count (a surrogate pair is ONE code point). */
+const codePoints = (text) => [...text].length;
+
+/** Any unpaired surrogate — must never survive into a header. */
+const LONE_SURROGATE_RE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+
+describe('beginner copy: identityHeader (T4B2)', () => {
+  test('renders `<square> Pi · <name>` with exact alias precedence', () => {
+    assert.equal(
+      identityHeader({ colorSlot: 0, sessionAlias: 'win-a', projectAlias: 'proj-a', label: 'alpha' }),
+      '🟦 Pi · win-a',
+    );
+    assert.equal(
+      identityHeader({ colorSlot: 0, sessionAlias: null, projectAlias: 'proj-a', label: 'alpha' }),
+      '🟦 Pi · proj-a',
+    );
+    assert.equal(
+      identityHeader({ colorSlot: 0, sessionAlias: null, projectAlias: null, label: 'alpha' }),
+      '🟦 Pi · alpha',
+    );
+  });
+
+  test('appends the branch only when its ENTIRE sanitized form fits, never clipped', () => {
+    assert.equal(
+      identityHeader({ colorSlot: 0, label: 'alpha', branch: 'feature/one' }),
+      '🟦 Pi · alpha · feature/one',
+    );
+    // Exactly at the 64-code-point budget: prefix(7) + name(5) + ' · '(3) + 49.
+    assert.equal(
+      identityHeader({ colorSlot: 0, label: 'alpha', branch: 'z'.repeat(49) }),
+      `🟦 Pi · alpha · ${'z'.repeat(49)}`,
+    );
+    // One code point over: the branch is dropped whole, never half-shown.
+    assert.equal(
+      identityHeader({ colorSlot: 0, label: 'alpha', branch: 'z'.repeat(50) }),
+      '🟦 Pi · alpha',
+    );
+    assert.equal(
+      identityHeader({ colorSlot: 0, label: 'alpha', branch: '  ' }),
+      '🟦 Pi · alpha',
+    );
+  });
+
+  test('falls back to the neutral `⬜ Pi` on bad or missing metadata', () => {
+    assert.equal(identityHeader({}), '⬜ Pi');
+    assert.equal(identityHeader(), '⬜ Pi');
+    assert.equal(identityHeader({ colorSlot: 3 }), '⬜ Pi');
+    assert.equal(
+      identityHeader({ sessionAlias: null, projectAlias: undefined, label: null }),
+      '⬜ Pi',
+    );
+    assert.equal(identityHeader({ sessionAlias: '  ·  ·  ', label: 42 }), '⬜ Pi');
+    // A bare `Pi` is not an identity: the header must never read `Pi · Pi`.
+    assert.equal(identityHeader({ sessionAlias: 'Pi', label: 'Pi' }), '⬜ Pi');
+  });
+
+  test('a name that sanitizes empty falls through to the next candidate', () => {
+    assert.equal(
+      identityHeader({ colorSlot: 1, sessionAlias: 'tg:abc123', projectAlias: 'proj-b', label: 'alpha' }),
+      '🟪 Pi · proj-b',
+    );
+    assert.equal(
+      identityHeader({ colorSlot: 1, sessionAlias: 'tg:abc123', projectAlias: ' · · ', label: 'alpha' }),
+      '🟪 Pi · alpha',
+    );
+  });
+
+  test('strips ids, paths, pid mentions and jargon from every name candidate', () => {
+    const header = identityHeader({
+      colorSlot: 0,
+      sessionAlias: 'aaaaaaaaaaaaaaaa1111 pid=7 C:/Users/me broker win',
+      label: 'alpha',
+    });
+    assert.equal(header, '🟦 Pi · win');
+    assert.doesNotMatch(header, /aaaaaaaa|pid|Users|broker/i);
+    const fallback = identityHeader({
+      colorSlot: 0,
+      sessionAlias: 'tg:abc123 aaaaaaaaaaaaaaaa2222 C:/Windows',
+    });
+    assert.equal(fallback, '⬜ Pi');
+  });
+
+  test(`is bounded to ${MAX_IDENTITY_HEADER_CODE_POINTS} code points and never splits a surrogate pair`, () => {
+    assert.equal(MAX_IDENTITY_HEADER_CODE_POINTS, 64);
+    const long = identityHeader({ colorSlot: 0, label: 'x'.repeat(500) });
+    assert.ok(codePoints(long) <= MAX_IDENTITY_HEADER_CODE_POINTS);
+    assert.equal(codePoints(long), MAX_IDENTITY_HEADER_CODE_POINTS);
+    assert.ok(long.startsWith('🟦 Pi · '));
+    const astral = identityHeader({ colorSlot: 0, label: '😀'.repeat(100) });
+    assert.ok(codePoints(astral) <= MAX_IDENTITY_HEADER_CODE_POINTS);
+    assert.doesNotMatch(astral, LONE_SURROGATE_RE);
+    assert.ok(astral.includes('😀'));
+    // The header budget holds with a branch present too.
+    const withBranch = identityHeader({ colorSlot: 0, label: 'x'.repeat(500), branch: 'y'.repeat(500) });
+    assert.ok(codePoints(withBranch) <= MAX_IDENTITY_HEADER_CODE_POINTS);
+    assert.doesNotMatch(withBranch, LONE_SURROGATE_RE);
+  });
+
+  test('carries identity only: never a state or liveness word', () => {
+    const header = identityHeader({ colorSlot: 2, label: 'alpha', branch: 'main' });
+    assert.doesNotMatch(
+      header,
+      /connected|disconnect|offline|available|working|waiting|busy|live|idle/i,
+    );
+  });
+
+  test('never carries a model name or state: only identity fields are inputs', () => {
+    const header = identityHeader({
+      colorSlot: 0,
+      label: 'alpha',
+      model: 'secret-model',
+      state: 'busy',
+      pid: 4242,
+    });
+    assert.equal(header, '🟦 Pi · alpha');
+  });
+
+  test('uses the project palette square and the neutral fallback square', () => {
+    for (let slot = 0; slot < PROJECT_COLOR_SLOTS.length; slot++) {
+      assert.match(
+        identityHeader({ colorSlot: slot, label: 'alpha' }),
+        new RegExp(`^${PROJECT_COLOR_SLOTS[slot]} Pi · alpha$`, 'u'),
+      );
+    }
+    assert.match(
+      identityHeader({ colorSlot: 99, label: 'alpha' }),
+      new RegExp(`^${PROJECT_COLOR_FALLBACK} Pi · alpha$`, 'u'),
+    );
+  });
+
+  test('the first abort acknowledgement names the session instead of staying anonymous', () => {
+    assert.equal(cbAck('abort', 'alpha'), 'Pi · alpha — Stopping the current task...');
+    assert.equal(
+      cbAck('abort', '⬜ Pi · alpha'),
+      '⬜ Pi · alpha — Stopping the current task...',
+    );
+    assert.doesNotMatch(cbAck('abort', 'alpha'), /^Stopping/,
+      'the first abort ack must never be anonymous');
+  });
+
+  test('displayLabel is idempotent for a valid prebuilt identity header', () => {
+    const headers = [
+      identityHeader({ colorSlot: 0, sessionAlias: 'win-a', branch: 'main' }),
+      identityHeader({ colorSlot: 7, label: 'alpha' }),
+      '⬜ Pi',
+      '⬜ Pi · alpha',
+      '🟫 Pi · alpha · feature/one',
+      '🟪 Pi · beta',
+    ];
+    for (const header of headers) {
+      assert.equal(displayLabel(header), header, `displayLabel must not rewrap: ${header}`);
+    }
+    assert.doesNotMatch(displayLabel('⬜ Pi · alpha'), /Pi · Pi/);
+    assert.doesNotMatch(displayLabel('⬜ Pi'), /Pi · /);
+    // A plain label still composes exactly as before.
+    assert.equal(displayLabel('plain-name'), 'Pi · plain-name');
+    assert.equal(displayLabel('Pi · plain-name'), 'Pi · plain-name');
+  });
+});
+
+// --- Correction round: identity header astral safety, normalization, spoof rejection ---
+
+describe('beginner copy: identity header correction round (F1-F6)', () => {
+  /** Five astral code points (mathematical italic letters), 10 UTF-16 units. */
+  const ASTRAL = '𝕒𝕝𝕡𝕙𝕒';
+  const hasLoneSurrogate = (text) => LONE_SURROGATE_RE.test(text);
+
+  test('F1: displayLabel re-renders every identity header byte-for-byte, astral-safe, all slots', () => {
+    const slots = [0, 1, 2, 3, 4, 5, 6, 7, null, 99, 'x'];
+    for (const colorSlot of slots) {
+      const header = identityHeader({
+        colorSlot,
+        sessionAlias: `${ASTRAL} ${'w'.repeat(50)}`,
+        branch: 'main',
+      });
+      assert.ok(codePoints(header) <= MAX_IDENTITY_HEADER_CODE_POINTS,
+        `slot ${colorSlot}: header exceeded 64 code points`);
+      assert.ok(!hasLoneSurrogate(header), `slot ${colorSlot}: lone surrogate in header`);
+      const rendered = displayLabel(header);
+      assert.equal(rendered, header,
+        `slot ${colorSlot}: displayLabel must re-render the header unchanged`);
+      assert.ok(!hasLoneSurrogate(rendered),
+        `slot ${colorSlot}: displayLabel introduced a lone surrogate`);
+    }
+    // A crafted header whose UTF-16 length exceeds 64 units while sitting at
+    // the 64-code-point boundary: the clip must never split a pair.
+    const boundary = identityHeader({
+      colorSlot: 0,
+      label: `${'x'.repeat(55)}${'𝕒'.repeat(10)}`,
+    });
+    assert.equal(codePoints(boundary), MAX_IDENTITY_HEADER_CODE_POINTS);
+    assert.ok(boundary.length > MAX_IDENTITY_HEADER_CODE_POINTS,
+      'the fixture must exceed 64 UTF-16 units for this probe to be meaningful');
+    const renderedBoundary = displayLabel(boundary);
+    assert.equal(renderedBoundary, boundary);
+    assert.ok(!hasLoneSurrogate(renderedBoundary));
+  });
+
+  test('F1: the neutral fallback header keeps its exact passthrough contract', () => {
+    assert.equal(displayLabel(identityHeader({})), '⬜ Pi');
+    assert.equal(displayLabel('⬜ Pi'), '⬜ Pi');
+    assert.equal(displayLabel(identityHeader({ colorSlot: 8, label: ASTRAL })),
+      identityHeader({ colorSlot: 8, label: ASTRAL }));
+  });
+
+  test('F2: branch math counts code points, so an astral name can keep a whole branch', () => {
+    const name50 = '𝕒'.repeat(50); // 50 code points, 100 UTF-16 units
+    const fits = identityHeader({ colorSlot: 0, label: name50, branch: 'main' });
+    assert.equal(fits, `🟦 Pi · ${name50} · main`,
+      '7 + 50 + 7 = 64 code points: the branch must survive an astral name');
+    assert.equal(codePoints(fits), MAX_IDENTITY_HEADER_CODE_POINTS);
+    const name51 = '𝕒'.repeat(51);
+    const dropped = identityHeader({ colorSlot: 0, label: name51, branch: 'main' });
+    assert.equal(dropped, `🟦 Pi · ${name51}`,
+      'one code point over: the branch is dropped whole, never half-shown');
+    // The branch survives the final displayLabel whole or not at all.
+    assert.equal(displayLabel(fits), fits);
+    assert.doesNotMatch(displayLabel(dropped), /main/);
+  });
+
+  test('F3: a candidate that is itself prefixed or a header normalizes to ONE prefix', () => {
+    assert.equal(
+      identityHeader({ colorSlot: 0, sessionAlias: 'Pi · alpha' }),
+      '🟦 Pi · alpha',
+    );
+    assert.equal(
+      identityHeader({ colorSlot: 0, sessionAlias: 'Pi - alpha' }),
+      '🟦 Pi · alpha',
+    );
+    assert.equal(
+      identityHeader({ colorSlot: 0, sessionAlias: 'Pi · Pi · alpha' }),
+      '🟦 Pi · alpha',
+    );
+    assert.equal(
+      identityHeader({ colorSlot: 0, label: '🟫 Pi · alpha' }),
+      '🟦 Pi · alpha',
+      'a candidate carrying another slot square must not nest squares',
+    );
+    assert.equal(
+      identityHeader({ colorSlot: 5, sessionAlias: '⬜ Pi · alpha', label: 'beta' }),
+      '🟫 Pi · alpha',
+    );
+    for (const candidate of ['Pi · alpha', 'Pi - alpha', '🟫 Pi · alpha']) {
+      const header = identityHeader({ colorSlot: 0, sessionAlias: candidate });
+      assert.doesNotMatch(header, /Pi · Pi/, `doubled prefix from: ${candidate}`);
+      assert.doesNotMatch(header, /[🟦🟪🟧🟩🟨🟫⬛⬜].*[🟦🟪🟧🟩🟨🟫⬛⬜]/u,
+        `nested squares from: ${candidate}`);
+    }
+    // Sanitization/path stripping still applies to the normalized remainder.
+    assert.equal(
+      identityHeader({ colorSlot: 0, sessionAlias: 'Pi · C:/Users/me alpha' }),
+      '🟦 Pi · alpha',
+    );
+  });
+
+  test('F5: state circles never gain prebuilt passthrough privilege', () => {
+    for (const circle of ['🟢', '🟡', '⚪', '🔴', '⚫']) {
+      const spoofed = `${circle} Pi · alpha`;
+      const rendered = displayLabel(spoofed);
+      assert.notEqual(rendered, spoofed,
+        `${circle} must not pass through as a prebuilt header`);
+      assert.ok(!rendered.includes(circle),
+        `${circle} must be stripped from identity presentation`);
+      assert.equal(rendered, 'Pi · alpha');
+      assert.doesNotMatch(rendered, /Pi · Pi/);
+    }
+    assert.equal(eventConnected('🟢 Pi · alpha'), 'Pi · alpha is connected.');
+    assert.equal(
+      identityHeader({ colorSlot: 3, sessionAlias: '🟡 Pi · gamma' }),
+      '🟩 Pi · gamma',
+    );
+    // Project squares keep their passthrough privilege.
+    assert.equal(displayLabel('🟪 Pi · beta'), '🟪 Pi · beta');
+  });
+
+  test('F6: full copy consumers render the astral header verbatim; fallback intact', () => {
+    const header = identityHeader({ colorSlot: 6, sessionAlias: `${ASTRAL} win`, branch: 'main' });
+    assert.equal(sessionNotice(header, 'Prompt queued.'), `${header} — Prompt queued.`);
+    assert.equal(eventConnected(header), `${header} is connected.`);
+    assert.equal(
+      eventStatus(header, { state: 'busy', model: 'm' }).split('\n')[0],
+      `${header} status`,
+    );
+    assert.equal(
+      busyCard(header),
+      `${header} is still working on the current task. What should I do with your message?`,
+    );
+    for (const text of [
+      sessionNotice(header, 'Prompt queued.'),
+      eventConnected(header),
+      busyCard(header),
+    ]) {
+      assert.ok(!hasLoneSurrogate(text));
+    }
   });
 });
 

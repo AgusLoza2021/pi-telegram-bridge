@@ -16,6 +16,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { DatabaseSync } from 'node:sqlite';
 
 import { Store } from '../src/store.mjs';
 import { TuiBridgeClient } from '../src/tui-bridge-client.mjs';
@@ -361,7 +362,7 @@ describe('SelectiveTelegramBroker: authorization, routing, dedup and rendering (
     const api = makeFakeApi();
     const broker = newBroker(api);
     await deliver(broker, api, msg('/use aaa111'));
-    assert.equal(api.sent[0].text, 'Pi · alpha — Selected.');
+    assert.equal(api.sent[0].text, '🟫 Pi · alpha — Selected.');
     await deliver(broker, api, msg('/use NOPE'));
     assert.match(api.sent[1].text, /Usage: \/use <shortId>/);
     await deliver(broker, api, msg('/use zzz999'));
@@ -491,7 +492,7 @@ describe('SelectiveTelegramBroker: authorization, routing, dedup and rendering (
     });
     assert.equal(res.ok, true);
     await broker.drainTuiEvents();
-    assert.ok(api.sent.some((m) => m.text === 'Pi · beta — command failed (input_refused).'));
+    assert.ok(api.sent.some((m) => m.text === '🟪 Pi · beta — command failed (input_refused).'));
   });
 
   test('a failed delivery leaves the event unacknowledged and fabricates no retry command', async () => {
@@ -793,7 +794,7 @@ describe('SelectiveTelegramBroker: beginner auto-selection of the sole live sess
       const api = makeFakeApi();
       const broker = newBroker(fx, api);
       await deliver(broker, api, msg('/use bbb222'));
-      assert.equal(api.sent[0].text, 'Pi · beta — Selected.');
+      assert.equal(api.sent[0].text, '🟪 Pi · beta — Selected.');
       await deliver(broker, api, msg('to beta explicitly'));
       const bCommands = fx.clientB.poll(B).commands;
       assert.equal(bCommands.length, 1);
@@ -950,7 +951,7 @@ describe('SelectiveTelegramBroker: chooser keyboards + broker-memory pending pro
       assert.equal(commands.length, 1);
       assert.equal(commands[0].kind, 'prompt');
       assert.equal(commands[0].payload.text, 'second version');
-      assert.equal(api.sent[api.sent.length - 1].text, 'Sent to Pi · beta.');
+      assert.equal(api.sent[api.sent.length - 1].text, 'Sent to 🟪 Pi · beta.');
     } finally { fx.close(); }
   });
 
@@ -1146,7 +1147,7 @@ describe('SelectiveTelegramBroker: chooser keyboards + broker-memory pending pro
       const bCommands = fx.clientB.poll(B).commands;
       assert.equal(bCommands.length, 1);
       assert.equal(bCommands[0].payload.text, 'explicit send');
-      assert.equal(api.sent[api.sent.length - 1].text, 'Sent to Pi · alpha.');
+      assert.equal(api.sent[api.sent.length - 1].text, 'Sent to 🟫 Pi · alpha.');
     } finally { fx.close(); }
   });
 
@@ -1333,7 +1334,7 @@ describe('SelectiveTelegramBroker: busy cards, action keyboards and extended cal
       assert.equal(commands[0].kind, 'followup');
       assert.equal(commands[0].payload.text, 'plant the seeds later');
       const ack = api.sent[api.sent.length - 1].text;
-      assert.equal(ack, 'Got it — Pi · alpha will see your message right after the current task.');
+      assert.equal(ack, 'Got it — 🟫 Pi · alpha will see your message right after the current task.');
       assert.doesNotMatch(ack, /aaa111/, 'card acks stay label-only');
       // A second tap on the consumed generation never dispatches twice.
       await deliver(broker, api, cb(`v1:f:aaa111:${pid}`));
@@ -1363,7 +1364,7 @@ describe('SelectiveTelegramBroker: busy cards, action keyboards and extended cal
       assert.equal(commands[0].kind, 'steer');
       assert.equal(commands[0].payload.text, 'no, dig over here instead');
       assert.equal(api.sent[api.sent.length - 1].text,
-        "Done — Pi · alpha got your message and will adjust what it's doing.");
+        "Done — 🟫 Pi · alpha got your message and will adjust what it's doing.");
     } finally { fx.close(); }
   });
 
@@ -1386,7 +1387,7 @@ describe('SelectiveTelegramBroker: busy cards, action keyboards and extended cal
       assert.equal(commands[1].payload.text, 'stop and start over with this');
       const ackTexts = api.sent.slice(-2).map((m) => m.text);
       assert.deepEqual(ackTexts,
-        ['Stopping the current task...', 'Stopped. Your message is on its way to Pi · alpha.'],
+        ['🟫 Pi · alpha — Stopping the current task...', 'Stopped. Your message is on its way to 🟫 Pi · alpha.'],
         'the abort acknowledgement must precede the prompt acknowledgement');
       // A second tap dispatches nothing more.
       await deliver(broker, api, cb(`v1:a:aaa111:${pid}`));
@@ -1539,14 +1540,14 @@ describe('SelectiveTelegramBroker: busy cards, action keyboards and extended cal
       let commands = fx.clientA.poll(A).commands;
       assert.equal(commands.length, 1);
       assert.equal(commands[0].kind, 'status');
-      assert.equal(api.sent[api.sent.length - 1].text, 'Status requested for Pi · alpha.');
+      assert.equal(api.sent[api.sent.length - 1].text, 'Status requested for 🟫 Pi · alpha.');
       // x: exactly one abort command; the ack is the truthful QUEUED
       // wording — the abort is enqueued, not yet completed.
       await deliver(broker, api, cb('v1:x:aaa111'));
       commands = fx.clientA.poll(A).commands;
       assert.equal(commands.length, 1);
       assert.equal(commands[0].kind, 'abort');
-      assert.equal(api.sent[api.sent.length - 1].text, 'Stopping the current task...');
+      assert.equal(api.sent[api.sent.length - 1].text, '🟫 Pi · alpha — Stopping the current task...');
       // c: the Projects dashboard, no dispatch.
       await deliver(broker, api, cb('v1:c'));
       assert.equal(lastButtons(api)[0].text, 'Active now');
@@ -1556,7 +1557,7 @@ describe('SelectiveTelegramBroker: busy cards, action keyboards and extended cal
       // d: a readable confirmation card with Unlink (D) and Cancel (C).
       await deliver(broker, api, cb('v1:d:aaa111'));
       const confirmText = api.sent[api.sent.length - 1].text;
-      assert.match(confirmText, /Unlink Pi · alpha\?/);
+      assert.match(confirmText, /Unlink 🟫 Pi · alpha\?/u);
       assert.doesNotMatch(confirmText, /aaa111/);
       const confirmButtons = lastButtons(api);
       assert.deepEqual(confirmButtons.map((b) => b.text), ['Unlink', 'Cancel']);
@@ -1570,7 +1571,7 @@ describe('SelectiveTelegramBroker: busy cards, action keyboards and extended cal
       commands = fx.clientA.poll(A).commands;
       assert.equal(commands.length, 1);
       assert.equal(commands[0].kind, 'disconnect');
-      assert.equal(api.sent[api.sent.length - 1].text, 'Unlinking Pi · alpha.');
+      assert.equal(api.sent[api.sent.length - 1].text, 'Unlinking 🟫 Pi · alpha.');
     } finally { fx.close(); }
   });
 
@@ -1850,7 +1851,7 @@ describe('SelectiveTelegramBroker: beginner commands, stale naming and no-jargon
       const broker = newBeginnerBroker(fx, api);
       await deliver(broker, api, msg('/start'));
       assert.equal(api.sent[0].text,
-        'Connected to Pi · alpha. Just type a message and it goes to that Pi.');
+        'Connected to 🟫 Pi · alpha. Just type a message and it goes to that Pi.');
       assert.deepEqual(lastButtons(api).map((b) => b.text),
         ['Status', 'Projects', 'Disconnect']);
       // Auto-selection sticks: plain text routes without any /use.
@@ -2083,7 +2084,7 @@ describe('SelectiveTelegramBroker: beginner commands, stale naming and no-jargon
       await deliver(broker, api, msg('/send zzz999 hi'));
       assert.match(api.sent[explicitBase].text, /No live session with short id "zzz999"/);
       await deliver(broker, api, msg('/abort bbb222'));
-      assert.equal(api.sent[explicitBase + 1].text, 'Pi · beta — Abort queued.');
+      assert.equal(api.sent[explicitBase + 1].text, '🟪 Pi · beta — Abort queued.');
       const bCommands = fx.clientB.poll(B).commands;
       assert.equal(bCommands.length, 1);
       assert.equal(bCommands[0].kind, 'abort');
@@ -4079,3 +4080,406 @@ describe('SelectiveTelegramBroker: per-session /alias (T4C2)', () => {
     } finally { fx.close(); }
   });
 });
+
+// --- T4B2: alias-aware identity headers on session-scoped messages ----------
+
+describe('SelectiveTelegramBroker: alias-aware identity headers (T4B2)', () => {
+  const H = Object.freeze({ trackingId: 'c'.repeat(32), connectionId: '3'.repeat(32) });
+  const E = Object.freeze({ trackingId: 'd'.repeat(32), connectionId: '4'.repeat(32) });
+
+  /**
+   * Fixture with two same-project windows (distinct tracking ids, one cwd),
+   * so alias precedence, per-window distinctness and snapshot freezing are
+   * all observable through the fake API's visible texts.
+   */
+  function makeHeaderFixture() {
+    const dir = mkdtempSync(join(TEST_RUNS, 'sel-header-'));
+    let t = Date.now();
+    const now = () => t;
+    const store = new Store(join(dir, 'bridge.sqlite'), { now, isProcessAlive: () => true });
+    const clientH = new TuiBridgeClient(store, { staleAfterMs: 30_000 });
+    const clientE = new TuiBridgeClient(store, { staleAfterMs: 30_000 });
+    let closed = false;
+    const fx = {
+      store, clientH, clientE, now, dir,
+      advance(ms) { t += ms; },
+      close() { if (!closed) { closed = true; store.close(); } },
+      newBroker(api) {
+        return new SelectiveTelegramBroker({ store, api, config: BROKER_CONFIG, now });
+      },
+      async deliver(broker, api, update) {
+        broker.handleUpdate(update);
+        await broker.flushReplies();
+      },
+      async drain(broker) {
+        await broker.drainTuiEvents();
+      },
+      connectH({ alias = null } = {}) {
+        assert.equal(clientH.connect({
+          ...H, shortId: 'hhh111', label: 'alpha', pid: 1111,
+          cwd: 'C:/proj/alpha', branch: 'main',
+        }).ok, true);
+        if (alias !== null) fx.aliasH(alias);
+      },
+      aliasH(alias) {
+        assert.equal(store.setTuiSessionAlias({ trackingId: H.trackingId, alias }).ok, true);
+      },
+      connectE({ alias = null } = {}) {
+        assert.equal(clientE.connect({
+          ...E, shortId: 'ddd222', label: 'beta', pid: 2222,
+          cwd: 'C:/proj/alpha', branch: 'main',
+        }).ok, true);
+        if (alias !== null) fx.aliasE(alias);
+      },
+      aliasE(alias) {
+        assert.equal(store.setTuiSessionAlias({ trackingId: E.trackingId, alias }).ok, true);
+      },
+      projectKey() {
+        const [row] = store.listTuiSessions({ staleCutoff: now() - 30_000 });
+        return row.projectKey;
+      },
+      square(key) {
+        return PROJECT_COLOR_SLOTS[parseInt(key.slice(0, 8), 16) % 8];
+      },
+    };
+    return fx;
+  }
+
+  test('live replies prefer the session alias, then the project alias, then the label', async () => {
+    const fx = makeHeaderFixture();
+    try {
+      fx.connectH();
+      const key = fx.projectKey();
+      const square = fx.square(key);
+      assert.equal(fx.store.setTuiProjectAlias({ projectKey: key, alias: 'Alpha HQ' }).ok, true);
+      fx.aliasH('alpha window');
+      const api = makeFakeApi();
+      const broker = fx.newBroker(api);
+      await fx.deliver(broker, api, msg('/status'));
+      assert.equal(api.sent[0].text, `${square} Pi · alpha window · main — Status requested.`);
+      await fx.deliver(broker, api, msg('/start'));
+      assert.equal(api.sent[1].text, `Connected to ${square} Pi · alpha window · main. Just type a message and it goes to that Pi.`);
+      // Clearing the session alias falls to the project alias.
+      fx.aliasH(null);
+      await fx.deliver(broker, api, msg('/status'));
+      assert.equal(api.sent[2].text, `${square} Pi · Alpha HQ · main — Status requested.`);
+      // Clearing the project alias falls to the raw label.
+      assert.equal(fx.store.setTuiProjectAlias({ projectKey: key, alias: null }).ok, true);
+      await fx.deliver(broker, api, msg('/status'));
+      assert.equal(api.sent[3].text, `${square} Pi · alpha · main — Status requested.`);
+    } finally { fx.close(); }
+  });
+
+  test('same-project windows with distinct aliases produce distinct headers', async () => {
+    const fx = makeHeaderFixture();
+    try {
+      fx.connectH({ alias: 'window one' });
+      fx.connectE({ alias: 'window two' });
+      const square = fx.square(fx.projectKey());
+      const api = makeFakeApi();
+      const broker = fx.newBroker(api);
+      await fx.deliver(broker, api, msg('/status hhh111'));
+      assert.equal(api.sent[0].text, `${square} Pi · window one · main — Status requested.`);
+      await fx.deliver(broker, api, msg('/status ddd222'));
+      assert.equal(api.sent[1].text, `${square} Pi · window two · main — Status requested.`);
+      assert.notEqual(api.sent[0].text, api.sent[1].text);
+    } finally { fx.close(); }
+  });
+
+  test('a frozen event alias wins over a later rename; a frozen null alias never adopts one', async () => {
+    const fx = makeHeaderFixture();
+    try {
+      fx.connectH(); // auto 'connected' event frozen with a null alias
+      const square = fx.square(fx.projectKey());
+      fx.aliasH('frozen win');
+      assert.equal(fx.store.appendTuiEvent({
+        trackingId: H.trackingId, kind: 'connected', payload: null,
+      }).ok, true);
+      fx.aliasH('renamed win');
+      const api = makeFakeApi();
+      const broker = fx.newBroker(api);
+      await fx.drain(broker);
+      assert.equal(api.sent[0].text, `${square} Pi · alpha · main is connected.`,
+        'a snapshot alias that was null stays null: no later session alias, no label swap');
+      assert.equal(api.sent[1].text, `${square} Pi · frozen win · main is connected.`,
+        'a snapshot alias wins even after the live session was renamed');
+      for (const record of api.sent) {
+        assert.doesNotMatch(record.text, /renamed win/);
+      }
+    } finally { fx.close(); }
+  });
+
+  test('a snapshot null alias falls back to the CURRENT project alias, never a later session alias', async () => {
+    const fx = makeHeaderFixture();
+    try {
+      fx.connectH(); // snapshot alias frozen null
+      const key = fx.projectKey();
+      const square = fx.square(key);
+      assert.equal(fx.store.setTuiProjectAlias({ projectKey: key, alias: 'Alpha HQ' }).ok, true);
+      fx.aliasH('late alias');
+      const api = makeFakeApi();
+      const broker = fx.newBroker(api);
+      await fx.drain(broker);
+      assert.equal(api.sent[0].text, `${square} Pi · Alpha HQ · main is connected.`,
+        'the project alias is a legitimate CURRENT project-level fallback');
+      assert.doesNotMatch(api.sent[0].text, /late alias/);
+    } finally { fx.close(); }
+  });
+
+  test('a legacy all-null snapshot event falls back to the live identity cache', async () => {
+    const fx = makeHeaderFixture();
+    try {
+      fx.connectH({ alias: 'live cache win' });
+      assert.equal(fx.store.appendTuiEvent({
+        trackingId: H.trackingId, kind: 'connected', payload: null,
+      }).ok, true);
+      fx.close();
+      // Reduce the event to a legacy all-null snapshot and erase the
+      // session/project history, exactly like a pre-T4B1 row whose session
+      // is gone and that the store backfill could not match.
+      const raw = new DatabaseSync(join(fx.dir, 'bridge.sqlite'));
+      raw.exec('DELETE FROM tui_sessions; DELETE FROM tui_projects;'
+        + 'DELETE FROM tui_session_aliases;'
+        + 'UPDATE tui_events SET session_label=NULL, session_alias=NULL,'
+        + 'session_branch=NULL, project_key=NULL;');
+      raw.close();
+      // Reopen: the backfill must find nothing (all sources erased).
+      const reopened = new Store(join(fx.dir, 'bridge.sqlite'), {
+        now: fx.now, isProcessAlive: () => true,
+      });
+      const clientH = new TuiBridgeClient(reopened, { staleAfterMs: 30_000 });
+      assert.equal(clientH.connect({
+        ...H, shortId: 'hhh111', label: 'alpha', pid: 1111,
+        cwd: 'C:/proj/alpha', branch: 'main',
+      }).ok, true);
+      assert.equal(reopened.setTuiSessionAlias({
+        trackingId: H.trackingId, alias: 'live cache win',
+      }).ok, true);
+      const api = makeFakeApi();
+      const broker = new SelectiveTelegramBroker({
+        store: reopened, api, config: BROKER_CONFIG, now: fx.now,
+      });
+      await broker.drainTuiEvents();
+      assert.ok(api.sent.length >= 1);
+      assert.equal(api.sent[0].text, '🟫 Pi · live cache win · main is connected.',
+        'only an ALL-NULL legacy snapshot may fall back to the live identity cache');
+      assert.doesNotMatch(api.sent[0].text, /⬜/);
+      reopened.close();
+    } finally { fx.close(); }
+  });
+
+  test('disconnected and final_output events after a broker restart use the snapshot color, name and branch', async () => {
+    const fx = makeHeaderFixture();
+    try {
+      fx.connectH({ alias: 'snap win' });
+      const square = fx.square(fx.projectKey());
+      assert.equal(fx.clientH.publishFinalOutput({ ...H, text: 'final body' }).ok, true);
+      assert.equal(fx.clientH.disconnect({ ...H }).ok, true);
+      // Fresh broker: memory-only identity cache is empty; only the frozen
+      // snapshots on the events remain.
+      const api = makeFakeApi();
+      const broker = fx.newBroker(api);
+      await fx.drain(broker);
+      assert.ok(api.sent.length >= 3);
+      assert.equal(api.sent[1].text, `${square} Pi · snap win · main\nfinal body`,
+        'the final output must keep the frozen alias, branch and project color');
+      assert.equal(api.sent[2].text, `${square} Pi · snap win · main disconnected.`,
+        'the disconnected notice must keep the frozen identity');
+      assert.doesNotMatch(api.sent[1].text, /⬜/);
+      assert.doesNotMatch(api.sent[2].text, /⬜/);
+    } finally { fx.close(); }
+  });
+
+  test('explicit-target acks identify the actual target, not merely the selected session', async () => {
+    const fx = makeHeaderFixture();
+    try {
+      fx.connectH({ alias: 'window one' });
+      fx.connectE({ alias: 'window two' });
+      const square = fx.square(fx.projectKey());
+      const api = makeFakeApi();
+      const broker = fx.newBroker(api);
+      await fx.deliver(broker, api, msg('/use hhh111'));
+      assert.equal(api.sent[0].text, `${square} Pi · window one · main — Selected.`);
+      await fx.deliver(broker, api, msg('/status'));
+      assert.equal(api.sent[1].text, `${square} Pi · window one · main — Status requested.`,
+        'an omitted id resolves through the selection');
+      await fx.deliver(broker, api, msg('/status ddd222'));
+      assert.equal(api.sent[2].text, `${square} Pi · window two · main — Status requested.`,
+        'an explicit id must name the target, not the selection');
+    } finally { fx.close(); }
+  });
+
+  test('the busy card and the first abort acknowledgement name the session', async () => {
+    const fx = makeHeaderFixture();
+    try {
+      fx.connectH({ alias: 'busy win' });
+      assert.equal(fx.clientH.setState({ ...H, state: 'busy' }).ok, true);
+      const square = fx.square(fx.projectKey());
+      const api = makeFakeApi();
+      const broker = fx.newBroker(api);
+      await fx.deliver(broker, api, msg('hello there'));
+      assert.equal(
+        api.sent[0].text,
+        `${square} Pi · busy win · main is still working on the current task. `
+        + 'What should I do with your message?',
+      );
+      const abortData = api.sent[0].replyMarkup.inline_keyboard
+        .flat()
+        .find((button) => button.callback_data.startsWith('v1:a:'))
+        .callback_data;
+      await fx.deliver(broker, api, cb(abortData));
+      const ackTexts = api.sent.slice(1).map((record) => record.text);
+      assert.equal(ackTexts[0], `${square} Pi · busy win · main — Stopping the current task...`,
+        'the first abort acknowledgement must never be anonymous');
+      assert.equal(ackTexts[1], `Stopped. Your message is on its way to ${square} Pi · busy win · main.`);
+    } finally { fx.close(); }
+  });
+
+  test('status events keep the model in the body only; the header is identity', async () => {
+    const fx = makeHeaderFixture();
+    try {
+      fx.connectH({ alias: 'status win' });
+      assert.equal(fx.store.appendTuiEvent({
+        trackingId: H.trackingId,
+        kind: 'status',
+        payload: { state: 'busy', model: 'test-model' },
+      }).ok, true);
+      const square = fx.square(fx.projectKey());
+      const api = makeFakeApi();
+      const broker = fx.newBroker(api);
+      await fx.drain(broker);
+      const statusText = api.sent[1].text;
+      assert.equal(statusText.split('\n')[0], `${square} Pi · status win · main status`);
+      assert.match(statusText, /model: test-model/);
+      assert.doesNotMatch(statusText.split('\n')[0], /model|busy/);
+    } finally { fx.close(); }
+  });
+
+  test('global and dashboard copy stays unchanged', async () => {
+    const fx = makeHeaderFixture();
+    try {
+      const api = makeFakeApi();
+      const broker = fx.newBroker(api);
+      await fx.deliver(broker, api, msg('hello'));
+      assert.equal(api.sent[0].text, copyModule.plainNoLive,
+        'zero live sessions keeps the exact global copy');
+      await fx.deliver(broker, api, msg('/start'));
+      assert.equal(api.sent[1].text, copyModule.homeNoLive);
+      fx.connectH({ alias: 'w1' });
+      fx.connectE();
+      await fx.deliver(broker, api, msg('/projects'));
+      const dashboard = api.sent[2];
+      assert.equal(dashboard.text, copyModule.projectsTitle);
+      const rows = dashboard.replyMarkup.inline_keyboard.map((row) => row[0]);
+      assert.equal(rows[0].text, 'Active now');
+      for (const row of rows.slice(1, -1)) {
+        assert.doesNotMatch(row.text, /Pi · /,
+          'dashboard rows keep projectRowLabel copy, never the identity header');
+        assert.match(row.text, /^(🟢|🟡|⚪) [🟦🟪🟧🟩🟨🟫⬛⬜] .+ · (Available|Working|Waiting)$/u);
+      }
+      assert.equal(rows[rows.length - 1].text, 'Refresh');
+    } finally { fx.close(); }
+  });
+
+  test('a long final output carries the header exactly once, keyboard on the last chunk, ack after all sends', async () => {
+    const fx = makeHeaderFixture();
+    try {
+      fx.connectH({ alias: 'long win' });
+      const square = fx.square(fx.projectKey());
+      assert.equal(fx.clientH.publishFinalOutput({ ...H, text: 'A'.repeat(3900) }).ok, true);
+      const api = makeFakeApi();
+      const broker = fx.newBroker(api);
+      await fx.drain(broker);
+      const finalChunks = api.sent.slice(1); // [0] is the auto connected event
+      assert.ok(finalChunks.length >= 2, 'the final output must actually be chunked');
+      const header = `${square} Pi · long win · main`;
+      const occurrences = api.sent
+        .map((record) => record.text.split(header).length - 1)
+        .reduce((sum, count) => sum + count, 0);
+      assert.equal(occurrences, 1, 'the header must appear exactly once across all chunks');
+      assert.ok(finalChunks[0].text.startsWith(`${header}\n`));
+      const last = finalChunks[finalChunks.length - 1];
+      assert.deepEqual(
+        last.replyMarkup.inline_keyboard[0].map((button) => button.text),
+        ['Projects', 'Disconnect'],
+        'the keyboard rides only on the final chunk',
+      );
+      for (let i = 0; i < finalChunks.length - 1; i++) {
+        assert.equal(finalChunks[i].replyMarkup, undefined,
+          'no keyboard on a non-final chunk');
+      }
+      assert.equal(fx.store.listPendingBrokerTuiEvents({ limit: 50 }).length, 0,
+        'the event is acknowledged only after every chunk was sent');
+    } finally { fx.close(); }
+  });
+
+  test('an astral-heavy alias survives the full broker path without surrogate damage', async () => {
+    const fx = makeHeaderFixture();
+    try {
+      const astralAlias = '𝕨𝕚𝕟 𝕒'; // 5 astral code points, 10 UTF-16 units
+      fx.connectH({ alias: astralAlias });
+      const square = fx.square(fx.projectKey());
+      assert.equal(fx.clientH.publishFinalOutput({ ...H, text: 'final body' }).ok, true);
+      assert.equal(fx.clientH.disconnect({ ...H }).ok, true);
+      const api = makeFakeApi();
+      const broker = fx.newBroker(api);
+      await fx.drain(broker);
+      const header = `${square} Pi · ${astralAlias} · main`;
+      const finalText = api.sent[1].text;
+      assert.equal(finalText, `${header}\nfinal body`);
+      assert.equal(api.sent[2].text, `${header} disconnected.`);
+      for (const text of [finalText, api.sent[2].text]) {
+        assert.doesNotMatch(text,
+          /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/,
+          'a lone surrogate must never reach a Telegram message');
+      }
+    } finally { fx.close(); }
+  });
+
+  test('every visible text stays free of ids, paths, pid mentions and tracking tokens', async () => {
+    const fx = makeHeaderFixture();
+    try {
+      fx.connectH({ alias: 'scan win' });
+      fx.connectE({ alias: 'scan two' });
+      fx.clientH.setState({ ...H, state: 'busy' });
+      const api = makeFakeApi();
+      const broker = fx.newBroker(api);
+      await fx.deliver(broker, api, msg('/use hhh111'));
+      await fx.deliver(broker, api, msg('/projects'));
+      await fx.deliver(broker, api, msg('hello there'));
+      const abortData = api.sent[api.sent.length - 1].replyMarkup.inline_keyboard
+        .flat()
+        .find((button) => button.callback_data.startsWith('v1:a:'))
+        .callback_data;
+      await fx.deliver(broker, api, cb(abortData));
+      fx.store.appendTuiEvent({
+        trackingId: H.trackingId,
+        kind: 'status',
+        payload: { state: 'busy', model: 'test-model' },
+      });
+      fx.clientH.publishFinalOutput({ ...H, text: 'final body' });
+      await fx.drain(broker);
+      fx.clientH.disconnect({ ...H });
+      await fx.drain(broker);
+      const forbidden = [
+        'hhh111', 'ddd222', H.trackingId, E.trackingId, H.connectionId, E.connectionId,
+        'C:/proj/alpha', /pid/i, /\b[0-9a-f]{16,}\b/i, /pi_session/i,
+      ];
+      const visible = [];
+      for (const record of api.sent) {
+        visible.push(record.text);
+        for (const row of record.replyMarkup?.inline_keyboard ?? []) {
+          for (const button of row) visible.push(button.text);
+        }
+      }
+      assert.ok(visible.length > 5, 'the script must have produced visible texts');
+      for (const text of visible) {
+        for (const needle of forbidden) {
+          const hit = needle instanceof RegExp ? needle.test(text) : text.includes(needle);
+          assert.ok(!hit, `leaked "${needle}" in: ${JSON.stringify(text)}`);
+        }
+      }
+    } finally { fx.close(); }
+  });
+});
+
