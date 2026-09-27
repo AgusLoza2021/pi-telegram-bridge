@@ -66,6 +66,74 @@ function New-BrokerServiceTaskTrigger {
 
 <#
 .SYNOPSIS
+Writes the GENERATED hidden-launcher VBS at -LauncherPath: a wscript.exe
+(GUI subsystem) script that spawns node.exe with window style 0, so no
+console window ever appears. A closed window can no longer kill the
+broker with CTRL_CLOSE, and the five-minute logon-trigger self-heal
+relaunch never flashes one. The file is a generated artifact (gitignored
+.local directory), never a committed source file. The command line is
+built with a format string and every embedded quote is doubled for the
+VBS string literal.
+#>
+function New-BrokerServiceHiddenLauncher {
+    param(
+        [Parameter(Mandatory = $true)][string]$NodeExe,
+        [Parameter(Mandatory = $true)][string]$BrokerScript,
+        [Parameter(Mandatory = $true)][string]$StateRoot,
+        [Parameter(Mandatory = $true)][string]$LauncherPath
+    )
+    foreach ($value in @($NodeExe, $BrokerScript, $StateRoot)) {
+        if ([string]::IsNullOrWhiteSpace($value)) {
+            throw 'New-BrokerServiceHiddenLauncher requires non-empty -NodeExe, -BrokerScript and -StateRoot paths'
+        }
+    }
+    $vbsCommand = '""{0}"" ""{1}"" --state-dir ""{2}""' -f $NodeExe, $BrokerScript, $StateRoot
+    $runLine = 'CreateObject("WScript.Shell").Run "{0}", 0, False' -f $vbsCommand
+    # Lines are joined explicitly: Windows PowerShell 5.1 cannot parse
+    # here-strings in an LF-ended source file, so no here-string here.
+    $lines = @(
+        ''' Pi Telegram Bridge - hidden broker launcher (generated; do not edit).'
+        ''' wscript.exe hosts this GUI-subsystem script, so no console window ever'
+        ''' appears, and window style 0 hides the node.exe console too: a closed'
+        ''' window can no longer kill the broker with CTRL_CLOSE, and the'
+        ''' five-minute self-heal relaunch never flashes one.'
+        $runLine
+    )
+    $content = (($lines -join "`r`n") + "`r`n")
+    $launcherDir = Split-Path -Parent $LauncherPath
+    if (-not (Test-Path -LiteralPath $launcherDir)) {
+        New-Item -ItemType Directory -Path $launcherDir -Force | Out-Null
+    }
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($LauncherPath, $content, $utf8NoBom)
+    return $LauncherPath
+}
+
+<#
+.SYNOPSIS
+Builds the dedicated task action: System32 wscript.exe running the
+generated hidden launcher <module>\.local\broker-launch.vbs, which
+spawns the same pinned absolute node.exe + runtime-broker.mjs +
+--state-dir command with window style 0. The task action therefore never
+hosts a console app directly, so no console window ever appears and
+closing windows can no longer kill the broker with CTRL_CLOSE.
+#>
+function New-BrokerServiceTaskAction {
+    param(
+        [Parameter(Mandatory = $true)][string]$NodeExe,
+        [Parameter(Mandatory = $true)][string]$BrokerScript,
+        [Parameter(Mandatory = $true)][string]$StateRoot
+    )
+    $moduleRoot = Get-BridgeModuleRoot
+    $launcher = New-BrokerServiceHiddenLauncher -NodeExe $NodeExe -BrokerScript $BrokerScript `
+        -StateRoot $StateRoot -LauncherPath (Join-Path $moduleRoot '.local\broker-launch.vbs')
+    $wscript = Join-Path $env:SystemRoot 'System32\wscript.exe'
+    return New-ScheduledTaskAction -Execute $wscript `
+        -Argument ('"{0}"' -f $launcher) -WorkingDirectory $moduleRoot
+}
+
+<#
+.SYNOPSIS
 Fail-closed readback of the registered XML. Construction success is not
 enough: Task Scheduler must persist the settings that keep one broker alive.
 #>
@@ -85,7 +153,12 @@ function Assert-BrokerServiceTaskXml {
         '<RestartOnFailure>[\s\S]*?<Count>\s*3\s*</Count>',
         # The repetition must be INSIDE the logon trigger: a repetition
         # anywhere else in the document does not re-fire the logon start.
-        '<LogonTrigger>(?:(?!</LogonTrigger>)[\s\S])*?<Repetition>(?:(?!</Repetition>)[\s\S])*?<Interval>\s*PT5M\s*</Interval>'
+        '<LogonTrigger>(?:(?!</LogonTrigger>)[\s\S])*?<Repetition>(?:(?!</Repetition>)[\s\S])*?<Interval>\s*PT5M\s*</Interval>',
+        # The action must be the hidden launcher: System32 wscript.exe
+        # running the generated .local\broker-launch.vbs, never a console
+        # node.exe whose window can kill the broker on close.
+        '<Exec>[^<]*\\wscript\.exe</Exec>',
+        '<Arguments>[^<]*broker-launch\.vbs[^<]*</Arguments>'
     )
     foreach ($pattern in $required) {
         if ($TaskXml -notmatch $pattern) {

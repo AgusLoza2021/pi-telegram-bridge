@@ -1,6 +1,7 @@
 import { describe, test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
@@ -12,6 +13,14 @@ const INSTALLER = join(ROOT, 'scripts', 'install-broker-service.ps1');
 const COMMON_SOURCE = readFileSync(COMMON, 'utf8').replaceAll('\r\n', '\n');
 const INSTALLER_SOURCE = readFileSync(INSTALLER, 'utf8').replaceAll('\r\n', '\n');
 const IS_WIN = process.platform === 'win32';
+// Task action fragment added to every inline XML fixture: the verifier must
+// require the wscript.exe hidden-launcher action, so the fixtures must carry
+// one for the accept case to stay meaningful.
+const TASK_ACTIONS_FRAGMENT = '<Actions><Action>'
+  + '<Exec>C:\\Windows\\System32\\wscript.exe</Exec>'
+  + '<Arguments>"C:\\proj\\.local\\broker-launch.vbs"</Arguments>'
+  + '<WorkingDirectory>C:\\proj</WorkingDirectory>'
+  + '</Action></Actions>';
 
 function ps(command) {
   const result = spawnSync('powershell.exe', [
@@ -91,6 +100,7 @@ describe('broker service task settings', () => {
       + '<RestartOnFailure><Interval>PT1M</Interval><Count>3</Count></RestartOnFailure>'
       + '</Settings>'
       + logonTriggerWithRepetition
+      + TASK_ACTIONS_FRAGMENT
       + '</Task>';
     const command = [
       `. ${quotePs(COMMON)}`,
@@ -116,6 +126,7 @@ describe('broker service task settings', () => {
       + '<RestartOnFailure><Interval>PT1M</Interval><Count>3</Count></RestartOnFailure>'
       + '</Settings>'
       + '<Triggers><LogonTrigger></LogonTrigger></Triggers>'
+      + TASK_ACTIONS_FRAGMENT
       + '</Task>';
     const command = [
       `. ${quotePs(COMMON)}`,
@@ -142,6 +153,7 @@ describe('broker service task settings', () => {
       + '</Settings>'
       + '<Repetition><Interval>PT5M</Interval><StopAtDurationEnd>true</StopAtDurationEnd></Repetition>'
       + '<Triggers><LogonTrigger></LogonTrigger></Triggers>'
+      + TASK_ACTIONS_FRAGMENT
       + '</Task>';
     const command = [
       `. ${quotePs(COMMON)}`,
@@ -152,6 +164,59 @@ describe('broker service task settings', () => {
       'Write-Output "OK"',
     ].join('; ');
     assert.equal(ps(command), 'OK');
+  });
+
+  test('installer builds its task action through the single-source hidden-launcher helper', () => {
+    assert.match(INSTALLER_SOURCE,
+      /\$action = New-BrokerServiceTaskAction -NodeExe \$nodeExe -BrokerScript \$brokerScript -StateRoot \$stateRoot/,
+      'the installer must build its task action through New-BrokerServiceTaskAction');
+    assert.ok(!INSTALLER_SOURCE.includes('New-ScheduledTaskAction -Execute $nodeExe'),
+      'the installer must not build the action directly from node.exe: only the hidden-launcher helper may');
+  });
+
+  test('Windows PowerShell 5.1 builds the wscript hidden-launcher action and a credential-free generated VBS', { skip: !IS_WIN }, () => {
+    // In-process function test: no task is registered and nothing outside the
+    // temp dir is touched. Get-BridgeModuleRoot is re-pointed at the temp dir
+    // so the generated launcher lands in <tmp>\.local instead of the module.
+    const tmp = mkdtempSync(join(tmpdir(), 'broker-launcher-'));
+    try {
+      const localDir = join(tmp, '.local');
+      mkdirSync(localDir, { recursive: true });
+      const nodeExe = join(tmp, 'fake', 'node.exe');
+      const brokerScript = join(tmp, 'fake', 'src', 'runtime-broker.mjs');
+      const stateRoot = join(tmp, 'state');
+      const command = [
+        `. ${quotePs(COMMON)}`,
+        `function Get-BridgeModuleRoot { return ${quotePs(tmp)} }`,
+        `$nodeExe = ${quotePs(nodeExe)}`,
+        `$brokerScript = ${quotePs(brokerScript)}`,
+        `$stateRoot = ${quotePs(stateRoot)}`,
+        '$action = New-BrokerServiceTaskAction -NodeExe $nodeExe -BrokerScript $brokerScript -StateRoot $stateRoot',
+        '$launcherPath = Join-Path (Get-BridgeModuleRoot) \'.local\\broker-launch.vbs\'',
+        '$vbs = [System.IO.File]::ReadAllText($launcherPath)',
+        '[PSCustomObject]@{',
+        '  execute = $action.Execute',
+        '  arguments = $action.Arguments',
+        '  workingDirectory = $action.WorkingDirectory',
+        '  vbs = $vbs',
+        '} | ConvertTo-Json -Compress',
+      ].join('\r\n');
+      const result = JSON.parse(ps(command));
+      assert.ok(result.execute.endsWith('wscript.exe'),
+        `action must execute wscript.exe, got: ${result.execute}`);
+      assert.ok(result.arguments.includes('"') && result.arguments.includes('broker-launch.vbs'),
+        `arguments must contain the quoted launcher path, got: ${result.arguments}`);
+      assert.equal(result.workingDirectory, tmp);
+      assert.match(result.vbs, /^' Pi Telegram Bridge - hidden broker launcher \(generated; do not edit\)\./);
+      assert.ok(result.vbs.includes(', 0, False'), 'the Run call must use window style 0 and not wait');
+      assert.ok(result.vbs.includes(`""${nodeExe}""`),
+        'the node invocation must carry doubled quotes inside the VBS string literal');
+      assert.ok(result.vbs.includes(`--state-dir ""${stateRoot}""`),
+        'the state dir must carry doubled quotes inside the VBS string literal');
+      assert.ok(!/token|secret/i.test(result.vbs), 'the generated launcher must be credential-free by construction');
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
   });
 
   test('installer reads back and verifies the task after registration', () => {

@@ -5,10 +5,13 @@
 #   principal = current interactive user, LogonType Interactive,
 #   RunLevel Limited. Never LocalSystem; no Windows password is ever
 #   stored or prompted for.
-# - Action: <absolute node.exe> <absolute src/runtime-broker.mjs>
-#   --state-dir <absolute confined state dir>, working directory = module
-#   root, hidden. No token, no Telegram ids, no credential material in
-#   the task XML, argv or environment.
+# - Action: <absolute System32 wscript.exe> running the generated hidden
+#   launcher <module>\.local\broker-launch.vbs, which spawns the same
+#   pinned absolute node.exe + src/runtime-broker.mjs --state-dir command
+#   with window style 0 (no console window ever appears; closing windows
+#   can no longer kill the broker). Working directory = module root. No
+#   token, no Telegram ids, no credential material in the task XML, argv
+#   or environment.
 # - Idempotent: an existing task is exported to a dated XML backup under
 #   .local\backups and re-registered in place; backups are never deleted.
 # - Prerequisites: Windows PowerShell 5.1+, Node 24+, confined state
@@ -59,9 +62,7 @@ $trigger = New-BrokerServiceTaskTrigger -UserIdentity $identityName
 $principal = New-ScheduledTaskPrincipal -UserId $identityName `
     -LogonType Interactive -RunLevel Limited
 $settings = New-BrokerServiceTaskSettings
-$action = New-ScheduledTaskAction -Execute $nodeExe `
-    -Argument ('"{0}" --state-dir "{1}"' -f $brokerScript, $stateRoot) `
-    -WorkingDirectory $moduleRoot
+$action = New-BrokerServiceTaskAction -NodeExe $nodeExe -BrokerScript $brokerScript -StateRoot $stateRoot
 
 Register-ScheduledTask -TaskName $taskName -Trigger $trigger -Principal $principal `
     -Settings $settings -Action $action -Force | Out-Null
@@ -99,6 +100,7 @@ if ($credentialsPresent) {
 Write-Host "Task: $taskName (logon trigger, current user, Interactive, Limited)."
 Write-Host "Node: $nodeExe"
 Write-Host "Broker: $brokerScript"
+Write-Host "Launcher: $((Join-Path $moduleRoot '.local\broker-launch.vbs'))"
 Write-Host "State: $stateRoot"
 Write-Host "Manifest: $(Get-BrokerServiceManifestPath)"
 
