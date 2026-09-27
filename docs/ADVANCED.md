@@ -9,9 +9,10 @@ These commands work only in the enrolled private chat. Session arguments use sho
 | Command | Effect |
 |---|---|
 | `/help` | Show command help. |
+| `/projects` | Show the Projects dashboard and pick which live session receives your messages. Opening or refreshing the dashboard never changes routing on its own — only tapping an active row selects it (or dispatches a held prompt); Recent rows are inert and cannot be tapped. |
 | `/sessions` | List live connected Pi sessions. Each row shows only safe columns: `tg:<shortId> · <project square> Pi · <alias or label>[ · <branch>] · state: <state>`. Local file paths (cwd), pids and internal ids are never sent to Telegram. |
 | `/use <shortId>` | Select the active Pi session. |
-| `/alias <name>` | Rename the selected Pi window; `/alias clear` resets it, `/alias <shortId> <name>` renames a specific window. |
+| `/alias <name>` | Rename the selected Pi window; `/alias clear` resets it, `/alias <shortId> <name\|clear>` renames or resets a specific window. |
 | `/status [shortId]` | Request status from the selected or named session. |
 | `/send [shortId] <text>` | Prompt an idle session. |
 | `/steer [shortId] <text>` | Redirect the current turn. |

@@ -79,6 +79,42 @@ Cuatro cosas, en orden:
 3. Un mensaje normal que escribiste en el teléfono llegó a Pi como instrucción.
 4. La respuesta final de Pi volvió al mismo chat de Telegram.
 
+## El panel de Projects: elegir a qué Pi le hablás
+
+Con una sola ventana de Pi vinculada no tenés que elegir nada: los mensajes van solos. Con varias, el botón **Projects** abre un panel compacto donde elegís a qué ventana le hablás (el comando `/projects` muestra lo mismo, pero es de la capa avanzada; el botón es el camino para principiantes). **Las palabras de la pantalla están en inglés a propósito** — esta tabla te dice qué significa cada una:
+
+| Palabra en inglés | Qué significa |
+|---|---|
+| **Projects** | Proyectos: abre (o actualiza) el panel. |
+| **Active now** | "Activos ahora": una fila por cada ventana de Pi vinculada con `/tg` que sigue corriendo. |
+| **Recent** | "Recientes": proyectos vistos en los últimos 30 días (como máximo 20, del más nuevo al más viejo) que ahora mismo no tienen ninguna ventana corriendo. |
+| **Available** | "Disponible": esa Pi está corriendo y libre. |
+| **Working** / **Waiting** | "Trabajando" / "Esperando": esa Pi está corriendo pero en medio de una tarea. |
+| **Offline** | "Desconectado": fila de **Recent**. No se puede tocar y jamás se le envía nada. |
+| **Refresh** | "Actualizar": recarga el panel. |
+| **Status** / **Disconnect** / **Stop the task** | "Estado" / "Desvincular" / "Detener la tarea". |
+
+Cómo leer una fila:
+
+- El **cuadrado de color** (🟦 🟪 🟧 🟩 🟨 🟫 ⬛ ⬜) es estable: el mismo proyecto siempre lleva el mismo color. `⬜` puede ser simplemente el color de esa carpeta (la paleta tiene ocho espacios y `⬜` es uno de ellos) o el neutral cuando no se pudo derivar un color; en cualquier caso orienta, no marca un error.
+- El **círculo de estado y la palabra** (🟢 Available, 🟡 Working/Waiting, ⚪ Offline) te dicen cómo está: el color nunca es la única señal.
+- El **✓** marca la fila elegida (resaltada en azul): es la Pi que recibe tus mensajes.
+- El **nombre** es el alias que le pusiste con `/alias`, o el nombre de la carpeta del proyecto; cuando entra completa, se muestra también la rama de git entre paréntesis.
+
+Tres reglas del panel:
+
+1. Tocás una fila de **Active now** y, desde ese momento, tus mensajes van a esa Pi. Si tenés un mensaje guardado esperando destino, tocar una fila activa lo envía ahí.
+2. Tu elección sobrevive a que el puente se reinicie en tu PC, pero solo si la misma ventana exacta y el mismo proyecto siguen corriendo cuando vuelve. A una ventana cerrada o vieja nunca se le envía nada: el bot te pide elegir de nuevo.
+3. Cada respuesta final de Pi nombra la ventana que la produjo: cuadrado de color, nombre de la ventana y su rama de git cuando entra completa. Las confirmaciones del bot también nombran a esa ventana siempre que el puente todavía sabe de qué Pi se trata; las pantallas globales y las confirmaciones genéricas pueden llegar sin nombre de ventana.
+
+### Nombrar una ventana: `/alias`
+
+`/alias <nombre>` le pone un nombre legible a la ventana de Pi seleccionada — por ejemplo `/alias Home PC` — y `/alias clear` lo borra. Sirve sobre todo cuando tenés **varias ventanas del mismo proyecto**: el nombre distingue ventana por ventana, no solo proyecto por proyecto. Reglas:
+
+- Hasta 64 caracteres normales; si el nombre no sirve, el bot lo rechaza con un mensaje fijo y nunca te muestra lo que escribiste.
+- El nombre **sobrevive a que el puente se reinicie** y a que la misma ventana se reconecte (queda guardado hasta 30 días mientras la ventana no se cierre del todo).
+- Si **cerrás la ventana de Pi y abrís una nueva**, esa ventana nueva arranca con su etiqueta por defecto otra vez: el alias no salta de ventana.
+
 ## Enviar una foto al teléfono
 
 Puedes enviar una imagen desde tu PC a tu propio chat privado, sin abrir Telegram en la PC:
@@ -134,6 +170,7 @@ Si el audio no se puede transcribir (falta una herramienta, archivo demasiado gr
 | Hiciste doble clic en el archivo de configuración **desde dentro del ZIP** | Windows lo ejecuta desde una carpeta temporal que no tiene el resto de los archivos del proyecto, y la configuración puede avisarte de que falta algo que en realidad sí tienes. Cierra esa ventana, extrae el ZIP correctamente (clic derecho → **Extraer todo...**) y ejecuta `Setup Pi Telegram.cmd` desde la carpeta extraída. |
 | El código QR expiró o no se puede escanear | Cierra la configuración y ejecuta `Setup Pi Telegram.cmd` de nuevo para obtener un código nuevo. Sube el brillo de la pantalla y acerca el teléfono. |
 | El bot dice que no hay Pi conectado (`no Pi window is connected`) | Abre Pi en la PC, escribe `/tg` y elige **Connect**. |
+| Tenés varias ventanas de Pi vinculadas | Tocá **Projects** y elegí la fila que corresponda: la fila con `✓` es la que recibe tus mensajes. |
 | Al enviar una foto imprime `FAILED: ...` | Cada código nombra una sola causa. `path_escape`: el archivo está fuera de la carpeta del proyecto — esta comprobación va primero, así que la ves incluso si el archivo además no existe o tiene mal el nombre; agrega `--root "C:\la\carpeta"` si la imagen está en otro lado. `not_found` o `not_a_file`: no hay nada legible en esa ruta. `bad_extension`: no es `.png`, `.jpg`, `.jpeg` ni `.webp`. `too_large`: supera los 10 MB. `bad_root`: la carpeta que pasaste en `--root` no existe. |
 | El bot responde "I couldn't transcribe that audio" | Verificá que existan los tres archivos: `.local/tools/whisper/whisper-cli.exe`, `.local/tools/whisper/models/ggml-small.bin` y `.local/tools/ffmpeg/ffmpeg.exe`. Un audio de más de 20 MB o de más de 5 minutos se rechaza por diseño. Si acabás de instalar las herramientas no hace falta reiniciar nada — la próxima nota de voz las usa. |
 | Querés apagar la transcripción de voz | Poné `transcription.enabled` en `false` en tu configuración local. Las notas de voz pasan a comportarse como si la función no existiera: se consumen en silencio y no corre ninguna herramienta. |
@@ -147,6 +184,7 @@ Para más síntomas y soluciones, mira la sección [Fix problems del README](REA
 | **Bot** | Una cuenta de Telegram manejada por un programa en lugar de una persona. Creas el tuyo con @BotFather y solo tú puedes hablar con él. |
 | **Token** | La contraseña secreta que BotFather te da para tu bot. Queda cifrada en tu PC y nunca aparece en chats ni registros. |
 | **`/tg`** | El comando que escribes dentro de una ventana de Pi para vincularla a tu teléfono (o desvincularla, con `/tg off`). |
+| **Alias** | Un nombre legible que le ponés a una ventana de Pi desde el teléfono con `/alias <nombre>`, por ejemplo `Home PC`. Sirve sobre todo con varias ventanas del mismo proyecto. Sobrevive a reinicios del puente y a que la misma ventana se reconecte, pero no a cerrar la ventana y abrir una nueva. |
 | **Ventana de Pi** | Una copia de Pi corriendo en una terminal. Puedes tener varias; cada una se vincula por separado. |
 | **Sesión / workspace** | Una sesión es una ventana de Pi viva que el puente conoce; el workspace es la carpeta de proyecto en la que esa ventana trabaja. El nombre de esa carpeta se convierte en la etiqueta legible que ves en el teléfono, como `Pi · mi-proyecto`. |
 | **La conexión de fondo** | Un programa pequeño que corre en silencio en tu PC y transporta mensajes entre Telegram y Pi. Está registrado como tarea programada de Windows, pero la configuración la registra deshabilitada y no la arranca: el modo Beginner nunca la habilita ni la arranca, y el modo avanzado te pregunta una vez al final y por defecto es No, así que no arranca nada al iniciar sesión si no la prendés vos: con `telegram on`, que la habilita y la arranca, o respondiendo que sí a esa única pregunta. Después la controlás vos: `telegram off` la detiene y la deshabilita, y una vez apagada sigue apagada después de reiniciar hasta que la prendés de nuevo. Se comunica con Telegram mediante long polling. |

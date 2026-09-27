@@ -119,9 +119,36 @@ Any three of the four means you are almost there — check [Fix problems](#fix-p
 |---|---|
 | Send normal text | It becomes a prompt for the selected linked Pi. |
 | Tap **Status** | The bot reports the selected Pi's connection state and model. |
-| Tap **Change Pi** | Choose another linked Pi by its readable project label. |
+| Tap **Projects** | Opens the Projects dashboard, where you pick which Pi gets your messages (see below). Typing `/projects` shows the same screen — the button is the beginner path. |
 | Tap **Disconnect** | Disconnect the selected Pi from Telegram. |
+| Send `/alias <name>` | Gives the selected Pi window a readable name, like `Home PC`. `/alias clear` resets it. |
 | Send text while Pi is busy | Choose whether to add it for later, redirect the current task, stop and use it, or leave the task alone. |
+
+### The Projects dashboard (your project library)
+
+Tap **Projects** and the bot answers with one compact screen — the easy way to switch between Pi windows:
+
+1. Look at the **Active now** rows: one row per Pi window you linked with `/tg` that is still running.
+2. Tap the row you want. From then on, your messages go to that Pi. If a message of yours is saved and waiting to be delivered, tapping an active row sends it there instead.
+3. Below them, **Recent** lists projects seen in the last 30 days (at most 20, newest first) that have no window running right now. These rows cannot be tapped — nothing is ever sent to an offline project.
+
+How to read a row:
+
+| What you see | What it means |
+|---|---|
+| `✓` in front of a row (highlighted blue) | This is the Pi your messages currently go to. |
+| Colored square (🟦 🟪 🟧 🟩 🟨 🟫 ⬛ ⬜) | A stable color for that project folder — the same project keeps the same color. `⬜` can simply be that folder's color (the palette has eight slots, and `⬜` is one of them) or the neutral fallback when no color could be derived; either way it is orientation, not an error badge. |
+| 🟢 **Available** | That Pi is running and idle. |
+| 🟡 **Working** or 🟡 **Waiting** | That Pi is running but in the middle of a task. |
+| ⚪ **Offline** | A Recent row: seen lately, not running now. |
+| Name and `(branch)` | Your `/alias` name for that window, or the project folder name — plus its git branch when there is one and it fits. |
+| **Refresh** | Reloads the screen. |
+
+Three things worth knowing:
+
+- Tapping an **Active now** row is what routes your messages: from that tap on, they go to that Pi. If a message of yours is saved and waiting to be delivered, tapping an active row sends it there instead.
+- Your choice survives the bridge restarting on your PC, but only if the exact same Pi window and project are still running when it comes back. A closed or stale window is never sent anything — the bot asks you to pick again.
+- Color is never the only signal: every row also carries the state circle and the state word in text. Every final Pi answer names the window that produced it, and the bot's confirmations name that window whenever the bridge still knows which Pi they are about; screens that are not about one particular window — global panels and generic confirmations — may arrive without a window name.
 
 On the PC:
 
@@ -202,7 +229,8 @@ Find your symptom, then follow the matching action. A failed setup never replace
 | `/tg` says the phone connection is unavailable | The background connection is off. Open a Command Prompt in your setup folder, run `telegram on`, then send your message again. |
 | The bot says no Pi is connected | Open Pi on the PC, type `/tg`, and choose **Connect**. |
 | The bot does not answer | Make sure the PC is awake and online, then check the background connection: run `telegram status` in your setup folder, and `telegram on` if it is off. |
-| Several Pi windows are linked | Tap **Change Pi** and choose the readable project label you want. |
+| Several Pi windows are linked | Tap **Projects** and tap the row you want — the row marked `✓` is the one that gets your messages. |
+| You closed a Pi window and the bot says it "just closed or disconnected" | That window is gone, so nothing was sent to it. Tap **Projects** and pick another row (or reopen the window with `/tg` and tap **Refresh**). |
 | You want to remove the bridge | Follow [Uninstall and rollback](docs/ADVANCED.md#uninstall-and-rollback). State and backups are preserved unless you remove them yourself. |
 | Sending a picture printed `FAILED: ...` | Each code names exactly one cause. `path_escape`: the file is outside the project folder — this check runs first, so you get it even when the file is also missing or misnamed; add `--root "C:\the\folder"` if the picture lives elsewhere. `not_found` or `not_a_file`: nothing readable at that path. `bad_extension`: not a `.png`, `.jpg`, `.jpeg`, or `.webp`. `too_large`: over 10 MB. `bad_root`: the folder you passed to `--root` does not exist. |
 | The bot answers "I couldn't transcribe that audio" | Check the three tool files exist: `.local/tools/whisper/whisper-cli.exe`, `.local/tools/whisper/models/ggml-small.bin`, and `.local/tools/ffmpeg/ffmpeg.exe`. Audio over 20 MB or longer than 5 minutes is refused by design. If you just installed the tools, no restart is needed — the next voice note picks them up. |
@@ -217,6 +245,7 @@ For service status, repair, manual setup, and the full command reference, see th
 | **Bot** | A Telegram account run by a program instead of a person. You create your own with @BotFather, and only you can talk to it. |
 | **Token** | The secret password BotFather gives you for your bot. It stays encrypted on your PC and never appears in chats or logs. |
 | **`/tg`** | The command you type inside a Pi window to link (or unlink, with `/tg off`) that window to your phone. |
+| **Alias** | A readable name you give one Pi window from your phone with `/alias <name>`, like `Home PC`. It is useful mostly when several windows work in the same project. The name sticks to that exact window: it survives the bridge restarting and the window reconnecting, but if you close the window and open a new one, the new window starts with its default project label again. |
 | **Pi window** | One running copy of Pi in a terminal. You can have several; each one is linked separately. |
 | **Session / workspace** | A session is one live Pi window the bridge knows about; the workspace is the project folder that window is working in. Its folder name becomes the readable label you see on your phone, like `Pi · my-project`. |
 | **The background connection** | A small program that runs quietly on your PC and shuttles messages between Telegram and Pi, so Pi can answer even when that Pi window is doing something else. It is registered as a Windows scheduled task, but the beginner setup registers it DISABLED and leaves it off, and the advanced setup asks once at the end whether to turn it on, with No as the default: nothing starts at a sign-in unless you turn it on. After that you control it yourself: `telegram off` stops it, `telegram on` starts it again, and once you turned it off it stays off after a restart until you turn it on again. It talks to Telegram by long polling. |
