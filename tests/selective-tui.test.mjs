@@ -345,7 +345,7 @@ describe('SelectiveTelegramBroker: authorization, routing, dedup and rendering (
     assert.equal(clientB.poll(B).commands.length, 0);
   });
 
-  test('/sessions lists only live TUIs with short id, label, state and cwd', async () => {
+  test('/sessions lists live TUIs as short id, safe identity header and state — never cwd', async () => {
     clearTransport();
     const api = makeFakeApi();
     const broker = newBroker(api);
@@ -353,8 +353,11 @@ describe('SelectiveTelegramBroker: authorization, routing, dedup and rendering (
     assert.equal(api.sent.length, 1);
     const text = api.sent[0].text;
     assert.match(text, /Live TUI sessions:/);
-    assert.match(text, /tg:aaa111 · alpha · connected · C:\/proj\/alpha/);
-    assert.match(text, /tg:bbb222 · beta · connected · C:\/proj\/beta/);
+    assert.match(text, /tg:aaa111 · .+ Pi · alpha · state: connected/);
+    assert.match(text, /tg:bbb222 · .+ Pi · beta · state: connected/);
+    assert.doesNotMatch(text, /C:[\\/]/, 'cwd must never be sent to Telegram');
+    assert.doesNotMatch(text, /proj/, 'no cwd path fragment may be sent');
+    assert.doesNotMatch(text, /1111|2222/, 'pids must never be sent');
   });
 
   test('/use selects a live session, refuses malformed ids and misses unknown ids', async () => {
@@ -2090,6 +2093,158 @@ describe('SelectiveTelegramBroker: beginner commands, stale naming and no-jargon
       assert.equal(bCommands[0].kind, 'abort');
       assert.equal(fx.clientA.poll(A).commands.length, 0,
         'an explicit-id command must never leak onto another live session');
+    } finally { fx.close(); }
+  });
+});
+
+describe('SelectiveTelegramBroker: /sessions safe listing', () => {
+  const E = Object.freeze({ trackingId: 'e'.repeat(32), connectionId: '5'.repeat(32) });
+  const ALPHA = Object.freeze({ shortId: 'aaa111', label: 'alpha', cwd: 'C:/proj/alpha' });
+  const BETA = Object.freeze({ shortId: 'bbb222', label: 'beta', cwd: 'C:/proj/beta' });
+
+  /** Fresh store + per-session clients with branch/state support. */
+  function makeFixture() {
+    const dir = mkdtempSync(join(TEST_RUNS, 'sel-sessions-'));
+    let t = Date.now();
+    const now = () => t;
+    const store = new Store(join(dir, 'bridge.sqlite'), { now, isProcessAlive: () => true });
+    const sessions = [];
+    return {
+      store,
+      now,
+      connect(id, { shortId, label, cwd, branch = null, state = null }) {
+        const client = new TuiBridgeClient(store, { staleAfterMs: 30_000 });
+        assert.equal(client.connect({ ...id, shortId, label, cwd, branch, pid: 4242 + sessions.length }).ok, true);
+        if (state !== null) {
+          assert.equal(client.setState({ ...id, state }).ok, true);
+        }
+        sessions.push({ id, client });
+        return client;
+      },
+      close() { store.close(); },
+    };
+  }
+
+  function newBroker(fx, api) {
+    return new SelectiveTelegramBroker({ store: fx.store, api, config: BROKER_CONFIG, now: fx.now });
+  }
+
+  async function deliver(broker, api, update) {
+    broker.handleUpdate(update);
+    await broker.flushReplies();
+  }
+
+  /** The one /sessions row for a short id, or ''. */
+  function lineFor(text, shortId) {
+    return text.split('\n').find((line) => line.startsWith(`tg:${shortId} `)) ?? '';
+  }
+
+  test('the row keeps tg:<shortId> and the safe identity header carries the branch when present, nothing extra when missing', async () => {
+    const fx = makeFixture();
+    try {
+      fx.connect(A, { ...ALPHA, branch: 'feature/x', state: 'busy' });
+      fx.connect(B, BETA);
+      const api = makeFakeApi();
+      await deliver(newBroker(fx, api), api, msg('/sessions'));
+      const text = api.sent[0].text;
+      assert.match(lineFor(text, 'aaa111'),
+        /tg:aaa111 · .+ Pi · alpha · feature\/x · state: busy/);
+      assert.match(lineFor(text, 'bbb222'),
+        /tg:bbb222 · .+ Pi · beta · state: connected/);
+      assert.ok(!text.includes('C:/proj'), 'cwd must never be sent');
+    } finally { fx.close(); }
+  });
+
+  test('alias precedence: session alias, then project alias, then label; same-project windows stay distinct', async () => {
+    const fx = makeFixture();
+    try {
+      fx.connect(A, { ...ALPHA, state: 'waiting' });
+      fx.connect(E, { shortId: 'eee555', label: 'alpha two', cwd: 'C:/proj/alpha' });
+      fx.connect(B, BETA);
+      const projectKey = fx.store
+        .getTuiSession({ trackingId: A.trackingId, staleCutoff: fx.now() - 30_000 })
+        .projectKey;
+      const betaKey = fx.store
+        .getTuiSession({ trackingId: B.trackingId, staleCutoff: fx.now() - 30_000 })
+        .projectKey;
+      assert.notEqual(projectKey, betaKey, 'alpha and beta must be distinct projects');
+      assert.equal(fx.store.setTuiProjectAlias({ projectKey, alias: 'proj name' }).ok, true);
+      assert.equal(fx.store.setTuiProjectAlias({ projectKey: betaKey, alias: 'beta proj' }).ok, true);
+      assert.equal(fx.store.setTuiSessionAlias({ trackingId: A.trackingId, alias: 'mine' }).ok, true);
+      assert.equal(fx.store.setTuiSessionAlias({ trackingId: E.trackingId, alias: 'second' }).ok, true);
+      const api = makeFakeApi();
+      await deliver(newBroker(fx, api), api, msg('/sessions'));
+      const text = api.sent[0].text;
+      assert.match(lineFor(text, 'aaa111'), /tg:aaa111 · .+ Pi · mine · state: waiting/,
+        'the session alias must win over the project alias');
+      assert.match(lineFor(text, 'eee555'), /tg:eee555 · .+ Pi · second · state: connected/,
+        'a same-project sibling shows its own distinct window alias');
+      assert.match(lineFor(text, 'bbb222'), /tg:bbb222 · .+ Pi · beta proj · state: connected/,
+        'a window without a session alias falls back to its own project alias');
+    } finally { fx.close(); }
+  });
+
+  test('hostile label, cwd, pid and id material never leak; the state word survives', async () => {
+    const fx = makeFixture();
+    try {
+      const hostileLabel = `alpha tg:zzz999 ${'a'.repeat(16)} C:/secret/path pid 42`;
+      fx.connect(A, { shortId: 'aaa111', label: hostileLabel, cwd: 'C:/secret/real-cwd' });
+      const api = makeFakeApi();
+      await deliver(newBroker(fx, api), api, msg('/sessions'));
+      const text = api.sent[0].text;
+      assert.match(lineFor(text, 'aaa111'), /^tg:aaa111 · .+ Pi · .+ · state: connected$/);
+      assert.ok(!text.includes('C:/secret'), 'cwd must never appear');
+      assert.ok(!text.includes('tg:zzz999'), 'a hostile short-id-looking token must never appear');
+      assert.ok(!text.includes('a'.repeat(16)), 'tracking-id material must never appear');
+      assert.ok(!text.includes('pid 42'), 'pid material must never appear');
+      assert.ok(!text.includes('4242'), 'real pids must never appear');
+    } finally { fx.close(); }
+  });
+
+  test('a session connected without cwd still renders a complete safe line', async () => {
+    const fx = makeFixture();
+    try {
+      fx.connect(A, { shortId: 'aaa111', label: 'alpha', cwd: undefined });
+      const api = makeFakeApi();
+      await deliver(newBroker(fx, api), api, msg('/sessions'));
+      const text = api.sent[0].text;
+      assert.match(lineFor(text, 'aaa111'), /tg:aaa111 · .+ Pi · alpha · state: connected/);
+      assert.ok(!text.includes('undefined'), 'a missing cwd must never render as undefined');
+      assert.ok(!text.includes(' - '), 'no placeholder column is rendered anymore');
+    } finally { fx.close(); }
+  });
+
+  test('zero live sessions keeps the advanced no-live notice unchanged', async () => {
+    const fx = makeFixture();
+    try {
+      const api = makeFakeApi();
+      await deliver(newBroker(fx, api), api, msg('/sessions'));
+      assert.equal(api.sent.length, 1);
+      assert.equal(api.sent[0].replyMarkup, undefined);
+      assert.match(api.sent[0].text, /No Pi session is connected/);
+      assert.match(api.sent[0].text, /\/sessions/);
+      assert.doesNotMatch(api.sent[0].text, /Live TUI sessions:/);
+    } finally { fx.close(); }
+  });
+
+  test('more than 32 live sessions still cap the list with the same summary line', async () => {
+    const fx = makeFixture();
+    try {
+      for (let i = 0; i < 33; i++) {
+        const id = {
+          trackingId: i.toString(16).padStart(32, '0'),
+          connectionId: (i + 1).toString(16).padStart(32, '0'),
+        };
+        fx.connect(id, { shortId: `s${i.toString().padStart(5, '0')}`, label: `win${i}`, cwd: `C:/proj/${i}` });
+      }
+      const api = makeFakeApi();
+      await deliver(newBroker(fx, api), api, msg('/sessions'));
+      const lines = api.sent[0].text.split('\n');
+      assert.equal(lines[0], 'Live TUI sessions:');
+      const rows = lines.filter((line) => line.startsWith('tg:'));
+      assert.equal(rows.length, 32, 'exactly 32 session rows are listed');
+      assert.equal(lines[lines.length - 1], '…and 1 more.', 'the overflow summary is unchanged');
+      assert.ok(rows.every((line) => !line.includes('C:/proj')), 'capped rows are still cwd-free');
     } finally { fx.close(); }
   });
 });

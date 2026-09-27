@@ -9,7 +9,7 @@ These commands work only in the enrolled private chat. Session arguments use sho
 | Command | Effect |
 |---|---|
 | `/help` | Show command help. |
-| `/sessions` | List live connected Pi sessions. |
+| `/sessions` | List live connected Pi sessions. Each row shows only safe columns: `tg:<shortId> · <project square> Pi · <alias or label>[ · <branch>] · state: <state>`. Local file paths (cwd), pids and internal ids are never sent to Telegram. |
 | `/use <shortId>` | Select the active Pi session. |
 | `/alias <name>` | Rename the selected Pi window; `/alias clear` resets it, `/alias <shortId> <name>` renames a specific window. |
 | `/status [shortId]` | Request status from the selected or named session. |

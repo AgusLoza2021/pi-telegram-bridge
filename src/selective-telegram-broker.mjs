@@ -1374,8 +1374,11 @@ export class SelectiveTelegramBroker {
     }
     const lines = ['Live TUI sessions:'];
     for (const session of live.slice(0, MAX_LISTED_SESSIONS)) {
-      const cwd = typeof session.cwd === 'string' && session.cwd.length > 0 ? session.cwd : '-';
-      lines.push(`tg:${session.shortId} · ${boundedLabel(session.label)} · ${session.state} · ${cwd}`);
+      // Safe columns only (advanced layer): tg:<shortId>, the T4B2
+      // alias-aware identity header and the store-validated state word.
+      // Never cwd, pid, tracking/project/session/connection ids or raw
+      // model internals: local paths stay on this PC.
+      lines.push(`tg:${session.shortId} · ${this.#sessionHeader(session)} · state: ${session.state}`);
     }
     if (live.length > MAX_LISTED_SESSIONS) {
       lines.push(`…and ${live.length - MAX_LISTED_SESSIONS} more.`);
