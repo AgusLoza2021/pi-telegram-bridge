@@ -2097,24 +2097,68 @@ export class Store {
 
   /**
    * Durable selected target. Verifies the exact current session-row
-   * identity exists and its project_key matches (row existence only:
-   * liveness/staleness re-checks stay broker-owned). Both meta keys persist
-   * atomically.
+   * identity exists and persists both meta keys atomically.
+   *
+   * Strict trackingId validation and strict expected-project validation
+   * when the caller supplies a non-null projectKey (T4E): a malformed or
+   * nonmatching caller key never persists and never repairs.
+   *
+   * T4E slice A — authoritative legacy repair: a pre-deploy Pi extension
+   * can insert/recreate a live tui_sessions row with a NULL project_key
+   * after the one-shot migration backfill. When the caller's projectKey is
+   * null/omitted (a legacy-keyless live snapshot) and the row exists, the
+   * canonical existing project identity is derived from the row's OWN
+   * stored cwd using the same helper/normalization as the migration
+   * backfill (the cwd itself never leaves this method), the row's
+   * project_key and its project history row are repaired atomically inside
+   * the same transaction, and the canonical projectKey is returned. A row
+   * that already carries a valid key is selected as-is (the derivation is
+   * idempotent). A stored key that is present but malformed fails closed.
+   * Unknown sessions fail closed.
    */
   setSelectedTuiTarget({ trackingId, projectKey }) {
     assertTuiId(trackingId, 'trackingId');
-    this.#assertTuiProjectKey(projectKey);
+    if (projectKey !== undefined && projectKey !== null) {
+      this.#assertTuiProjectKey(projectKey);
+    }
     return this.#transaction(() => {
       const row = this.#db
-        .prepare('SELECT project_key FROM tui_sessions WHERE tracking_id = ?')
+        .prepare(
+          `SELECT cwd, label, branch, state, connected_at, updated_at, project_key
+           FROM tui_sessions WHERE tracking_id = ?`,
+        )
         .get(trackingId);
       if (!row) return { ok: false, reason: 'unknown_session' };
-      if (row.project_key !== projectKey) {
+      if (projectKey != null && row.project_key !== projectKey) {
         return { ok: false, reason: 'project_mismatch' };
       }
+      let canonicalKey = row.project_key;
+      if (typeof canonicalKey !== 'string' || !TUI_PROJECT_KEY_RE.test(canonicalKey)) {
+        if (canonicalKey !== null) {
+          // Present but malformed stored identity: never guess, fail closed
+          // (mirrors setTuiSessionAlias's malformed-key rule).
+          return { ok: false, reason: 'project_mismatch' };
+        }
+        // Legacy keyless row: repair the row and its history atomically
+        // from the row's own stored cwd, exactly like the migration
+        // backfill (monotonic upsert, cwd never exposed).
+        canonicalKey = this.#deriveTuiProjectKey(row.cwd, trackingId);
+        this.#db
+          .prepare('UPDATE tui_sessions SET project_key = ? WHERE tracking_id = ?')
+          .run(canonicalKey, trackingId);
+        this.#upsertTuiProjectRow({
+          projectKey: canonicalKey,
+          label: row.label,
+          branch: row.branch,
+          trackingId,
+          state: row.state,
+          seenAt: row.updated_at,
+          firstSeenAt: row.connected_at,
+        });
+      }
       this.#setMeta(SELECTED_TUI_TRACKING_ID_KEY, trackingId);
-      this.#setMeta(SELECTED_TUI_PROJECT_KEY_KEY, projectKey);
-      return { ok: true };
+      this.#setMeta(SELECTED_TUI_PROJECT_KEY_KEY, canonicalKey);
+      return { ok: true, projectKey: canonicalKey };
     });
   }
 

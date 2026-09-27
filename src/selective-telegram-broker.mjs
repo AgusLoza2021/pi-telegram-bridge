@@ -447,12 +447,18 @@ export class SelectiveTelegramBroker {
   }
 
   /**
-   * The single selection mutation helper (T4A): memory and durable store
-   * move together or not at all. A session is selected only when it
-   * carries a valid trackingId AND projectKey and the store ACCEPTS the
-   * write (row identity + project match). Any refusal or throw fails
-   * closed: the memory selection is dropped and the durable selection is
-   * cleared best-effort, so a store-refused selection can never route.
+   * The single selection mutation helper (T4A/T4E): memory and durable
+   * store move together or not at all. A session is selected only when it
+   * carries a valid trackingId and the store ACCEPTS the write (row
+   * identity + project match, or T4E authoritative repair). A legacy
+   * keyless live snapshot passes projectKey: null; the store derives the
+   * canonical identity from the row's own stored cwd, repairs the row and
+   * its history, and returns the canonical projectKey, which this helper
+   * consumes in its result. Any refusal or throw fails closed: the memory
+   * selection is dropped and the durable selection is cleared best-effort,
+   * so a store-refused selection can never route. The boolean truthiness
+   * is preserved for legacy callers; the full result also reports whether
+   * the selected tracking id CHANGED (T4E slice B same-target taps).
    * Called inside the handleUpdate receipt/offset transaction, the
    * re-entrant store calls join that SAME transaction.
    */
@@ -461,16 +467,24 @@ export class SelectiveTelegramBroker {
       && typeof session.trackingId === 'string' && session.trackingId.length > 0
       ? session.trackingId
       : null;
+    // null (not a rejection) when the live snapshot is legacy-keyless:
+    // the store repairs the row and returns the canonical key (T4E).
     const projectKey = isPlainObject(session)
       && typeof session.projectKey === 'string' && session.projectKey.length > 0
       ? session.projectKey
       : null;
-    if (trackingId !== null && projectKey !== null) {
+    if (trackingId !== null) {
+      const previous = this.#selectedTrackingId;
       try {
         const result = this.#store.setSelectedTuiTarget({ trackingId, projectKey });
-        if (isPlainObject(result) && result.ok === true) {
+        if (isPlainObject(result) && result.ok === true
+          && typeof result.projectKey === 'string' && result.projectKey.length > 0) {
           this.#selectedTrackingId = trackingId;
-          return true;
+          return {
+            ok: true,
+            projectKey: result.projectKey,
+            changed: previous !== trackingId,
+          };
         }
       } catch {
         // Fall through to the fail-closed path below.
@@ -822,12 +836,20 @@ export class SelectiveTelegramBroker {
             command: null,
           };
         }
-        this.#selectTarget(matches[0]);
+        const result = this.#selectTarget(matches[0]);
         // T3: the tap re-renders the dashboard with the ✓/primary selection
-        // instead of navigating away. No command is enqueued.
+        // instead of navigating away. No command is enqueued. T4E slice B:
+        // a repeated tap on the ALREADY-SELECTED same trackingId still
+        // re-resolves, validates and persists, but queues NO additional
+        // Telegram message — only the callback answer stops the spinner.
+        // A first successful change re-renders exactly once; a failed
+        // selection stays fail-closed and re-renders the safest dashboard
+        // (never a success claim). No time-based suppression anywhere.
         return {
           answerId,
-          reply: this.#projectsReply(),
+          reply: isPlainObject(result) && result.changed === false
+            ? null
+            : this.#projectsReply(),
           command: null,
         };
       }

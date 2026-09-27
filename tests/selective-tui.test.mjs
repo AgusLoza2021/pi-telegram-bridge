@@ -16,6 +16,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { createHash } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 
 import { Store } from '../src/store.mjs';
@@ -2291,6 +2292,20 @@ describe('SelectiveTelegramBroker: Projects dashboard (T3)', () => {
         }
         return commands;
       },
+      /** TEST-ONLY legacy-writer reproduction (T4E): a pre-deploy Pi
+       * extension can null/recreate a live tui_sessions row's project_key
+       * after the store's one-shot migration backfill already ran. Writes
+       * directly through a second raw SQLite connection; no production
+       * hooks. */
+      recreateLegacyKeylessRow(trackingId) {
+        const raw = new DatabaseSync(join(dir, 'bridge.sqlite'));
+        try {
+          raw.prepare('UPDATE tui_sessions SET project_key = NULL WHERE tracking_id = ?')
+            .run(trackingId);
+        } finally {
+          raw.close();
+        }
+      },
       close() { store.close(); },
     };
   }
@@ -2581,6 +2596,99 @@ describe('SelectiveTelegramBroker: Projects dashboard (T3)', () => {
         'a stale selection must not mark any row');
       assert.ok(rows.some((b) => b.text === 'Recent'),
         'the aged-out project shows under Recent');
+    } finally { fx.close(); }
+  });
+
+  // --- T4E slice A: authoritative repair of a legacy keyless live row -----
+
+  const ALPHA_CANONICAL_KEY = createHash('sha256').update('c:/proj/alpha').digest('hex');
+
+  test('a legacy keyless live row repairs on tap: durable exact selection, one re-render, /alias works without /reload', async () => {
+    const fx = makeFixture();
+    try {
+      fx.connect(A, ALPHA);
+      fx.recreateLegacyKeylessRow(A.trackingId);
+      const api = makeFakeApi();
+      const broker = newBroker(fx, api);
+      await deliver(broker, api, cb('v1:s:aaa111'));
+      assert.equal(api.sent.length, 1, 'the successful selection must re-render exactly one dashboard');
+      assert.equal(api.answered.length, 1, 'the tap must be answered');
+      assert.deepEqual(fx.store.getSelectedTuiTarget(),
+        { trackingId: A.trackingId, projectKey: ALPHA_CANONICAL_KEY },
+        'the selection must be exact trackingId + canonical derived projectKey');
+      assert.equal(fx.pollAllCommands().length, 0, 'selecting enqueues nothing');
+      // The repaired row renders with its canonical color slot again.
+      assert.ok(colorOf(rowButtons(api)[1].text) !== undefined,
+        'the repaired row must render its canonical project color');
+      // /alias RealCapture succeeds without /reload.
+      await deliver(broker, api, msg('/alias RealCapture'));
+      const lastButtons = api.sent[api.sent.length - 1].replyMarkup?.inline_keyboard.flat() ?? [];
+      assert.ok(lastButtons.some((b) => b.text.includes('RealCapture')),
+        'the renamed row must render after a successful /alias save');
+    } finally { fx.close(); }
+  });
+
+  test('five taps on the same row persist/validate but queue no extra dashboard and still answer every callback', async () => {
+    const fx = makeFixture();
+    try {
+      fx.connect(A, ALPHA);
+      fx.connect(B, BETA);
+      const api = makeFakeApi();
+      const broker = newBroker(fx, api);
+      for (let i = 0; i < 5; i++) {
+        await deliver(broker, api, cb('v1:s:aaa111'));
+      }
+      assert.equal(api.sent.length, 1, 'the initial change re-renders once; repeated same-target taps queue nothing');
+      assert.equal(api.answered.length, 5, 'every tap must still answer its callback so the spinner stops');
+      assert.deepEqual(fx.store.getSelectedTuiTarget(),
+        { trackingId: A.trackingId, projectKey: ALPHA_CANONICAL_KEY },
+        'the durable selection must stay intact after repeated taps');
+      assert.equal(fx.pollAllCommands().length, 0);
+    } finally { fx.close(); }
+  });
+
+  test('switching to another target re-renders exactly once; a repeated second-row tap queues none', async () => {
+    const fx = makeFixture();
+    try {
+      fx.connect(A, ALPHA);
+      fx.connect(B, BETA);
+      const api = makeFakeApi();
+      const broker = newBroker(fx, api);
+      await deliver(broker, api, cb('v1:s:aaa111'));
+      assert.equal(api.sent.length, 1);
+      await deliver(broker, api, cb('v1:s:bbb222'));
+      assert.equal(api.sent.length, 2, 'switching targets re-renders exactly once');
+      assert.ok(rowButtons(api)[2].text.startsWith('✓'), 'the new target is selected');
+      await deliver(broker, api, cb('v1:s:bbb222'));
+      assert.equal(api.sent.length, 2, 'a repeated second-row tap queues no additional message');
+      assert.equal(api.answered.length, 3, 'every tap is still answered');
+    } finally { fx.close(); }
+  });
+
+  test('select callback_data stays <=64 bytes and no cwd or internal ids leak through dashboard replies', async () => {
+    const fx = makeFixture();
+    try {
+      fx.connect(A, ALPHA);
+      fx.connect(B, BETA);
+      const api = makeFakeApi();
+      const broker = newBroker(fx, api);
+      await deliver(broker, api, msg('/projects'));
+      await deliver(broker, api, cb('v1:s:aaa111'));
+      await deliver(broker, api, cb('v1:s:bbb222'));
+      const datas = api.sent
+        .flatMap((m) => m.replyMarkup?.inline_keyboard ?? [])
+        .flat()
+        .map((b) => b.callback_data)
+        .filter((d) => typeof d === 'string');
+      assert.ok(datas.length > 0, 'the dashboards must offer tappable rows');
+      for (const data of datas) {
+        assert.ok(Buffer.byteLength(data, 'utf8') <= 64, `callback_data must stay <=64 bytes: ${data}`);
+      }
+      const rendered = JSON.stringify(api.sent);
+      assert.ok(!rendered.includes('proj/alpha') && !rendered.includes('proj/beta'),
+        'no cwd may leak through dashboard replies');
+      assert.ok(!rendered.includes(A.trackingId) && !rendered.includes(B.trackingId),
+        'no tracking id may leak through dashboard replies');
     } finally { fx.close(); }
   });
 

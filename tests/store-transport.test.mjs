@@ -557,7 +557,8 @@ describe('store: tui project history (T1 store foundation)', () => {
     store.registerTuiSession(reg({ trackingId, cwd: 'C:/proj/sel' }));
     const projectKey = getSession(trackingId).projectKey;
     assert.equal(store.getSelectedTuiTarget(), null, 'nothing selected initially');
-    assert.deepEqual(store.setSelectedTuiTarget({ trackingId, projectKey }), { ok: true });
+    assert.deepEqual(store.setSelectedTuiTarget({ trackingId, projectKey }),
+      { ok: true, projectKey }, 'success returns the canonical projectKey (T4E)');
     const selected = store.getSelectedTuiTarget();
     assert.deepEqual(selected, { trackingId, projectKey });
     assert.throws(() => { selected.trackingId = 'x'; }, TypeError, 'selection is frozen');
@@ -598,6 +599,73 @@ describe('store: tui project history (T1 store foundation)', () => {
     raw.close();
     store = new Store(dbPath, { now: () => t, isProcessAlive: () => true });
     assert.equal(store.getSelectedTuiTarget(), null, 'malformed meta fails closed');
+  });
+
+  /** TEST-ONLY legacy-writer reproduction (T4E): a pre-deploy Pi extension
+   * can insert a live tui_sessions row with a NULL project_key AFTER the
+   * store's one-shot migration backfill has already run. This writes
+   * directly through a second raw SQLite connection while the store stays
+   * open; there is no production hook for this. */
+  const insertLegacyKeylessRow = ({ trackingId, shortId, cwd, label }) => {
+    const raw = new DatabaseSync(join(dir, 'main.sqlite'));
+    try {
+      raw.prepare(
+        `INSERT INTO tui_sessions
+           (tracking_id, short_id, cwd, label, pid, connection_id, state, connected_at, updated_at, heartbeat_at)
+         VALUES (?, ?, ?, ?, 2222, ?, 'connected', ?, ?, ?)`,
+      ).run(trackingId, shortId, cwd, label, 'd'.repeat(32), t, t, t);
+    } finally {
+      raw.close();
+    }
+  };
+
+  test('a legacy keyless live row inserted after backfill is repaired on selection (T4E slice A)', () => {
+    store.registerTuiSession(reg({ cwd: 'C:/proj/healthy' }));
+    const legacyTrackingId = 'b'.repeat(32);
+    insertLegacyKeylessRow({ trackingId: legacyTrackingId, shortId: 'bbb222', cwd: 'C:/proj/legacy', label: 'legacy' });
+    // The one-shot backfill already ran at construction, so the legacy row
+    // is still keyless here — exactly the live incident.
+    assert.equal(getSession(legacyTrackingId).projectKey, null);
+    assert.equal(store.getSelectedTuiTarget(), null);
+
+    const expectedKey = createHash('sha256').update('c:/proj/legacy').digest('hex');
+    const result = store.setSelectedTuiTarget({ trackingId: legacyTrackingId, projectKey: null });
+    assert.deepEqual(result, { ok: true, projectKey: expectedKey });
+    assert.deepEqual(store.getSelectedTuiTarget(),
+      { trackingId: legacyTrackingId, projectKey: expectedKey });
+    // Row repaired from its own stored cwd; cwd itself never surfaces.
+    assert.equal(getSession(legacyTrackingId).projectKey, expectedKey);
+    const project = store.listRecentTuiProjects({ since: 0 }).find((p) => p.projectKey === expectedKey);
+    assert.ok(project, 'the repaired project history row must exist');
+    assert.equal(project.label, 'legacy');
+    assert.equal(project.firstSeenAt, t);
+    assert.equal(project.lastSeenAt, t);
+    assert.ok(!JSON.stringify(store.listRecentTuiProjects({ since: 0 })).includes('proj/legacy'));
+    // The /alias join works immediately after repair, without a reload.
+    assert.deepEqual(store.setTuiSessionAlias({ trackingId: legacyTrackingId, alias: 'RealCapture' }), { ok: true });
+  });
+
+  test('a nonmatching or malformed expected projectKey still fails closed and never repairs (T4E slice A)', () => {
+    store.registerTuiSession(reg({ cwd: 'C:/proj/healthy' }));
+    const legacyTrackingId = 'b'.repeat(32);
+    insertLegacyKeylessRow({ trackingId: legacyTrackingId, shortId: 'bbb222', cwd: 'C:/proj/legacy', label: 'legacy' });
+
+    assert.deepEqual(store.setSelectedTuiTarget({ trackingId: legacyTrackingId, projectKey: 'f'.repeat(64) }),
+      { ok: false, reason: 'project_mismatch' });
+    assert.throws(() => store.setSelectedTuiTarget({ trackingId: legacyTrackingId, projectKey: 'nothex' }), TypeError);
+    assert.equal(store.getSelectedTuiTarget(), null, 'a rejected selection must not persist');
+    assert.equal(getSession(legacyTrackingId).projectKey, null, 'a rejected selection must not repair the row');
+    assert.deepEqual(store.setSelectedTuiTarget({ trackingId: 'e'.repeat(32), projectKey: null }),
+      { ok: false, reason: 'unknown_session' });
+  });
+
+  test('selection repair of a keyless row with no cwd derives the deterministic per-tracking fallback (T4E slice A)', () => {
+    const legacyTrackingId = 'b'.repeat(32);
+    insertLegacyKeylessRow({ trackingId: legacyTrackingId, shortId: 'bbb222', cwd: null, label: 'nocwd' });
+    const expectedKey = createHash('sha256').update(`tracking:${legacyTrackingId}`).digest('hex');
+    const result = store.setSelectedTuiTarget({ trackingId: legacyTrackingId });
+    assert.deepEqual(result, { ok: true, projectKey: expectedKey });
+    assert.deepEqual(store.getSelectedTuiTarget(), { trackingId: legacyTrackingId, projectKey: expectedKey });
   });
 
   // --- D. list validation and retention ----------------------------------
