@@ -1128,3 +1128,354 @@ describe('store: tui branch heartbeat refresh (T2 metadata pipeline)', () => {
     assert.equal(project.lastState, 'busy');
   });
 });
+
+// T4C1: additive durable per-session alias storage. tui_session_aliases is
+// keyed by tracking_id and guarded by project_key; the live tui_sessions
+// row is still deleted on disconnect while the alias survives (retention:
+// unreferenced aliases are pruned after TUI_PROJECT_RETENTION_MS). The
+// project-scoped tui_projects.alias fallback is untouched.
+describe('store: tui session aliases (T4C1)', () => {
+  let dir;
+  let t;
+  let store;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(TEST_RUNS, 'tui-alias-'));
+    t = T0;
+    store = new Store(join(dir, 'main.sqlite'), {
+      now: () => t,
+      isProcessAlive: () => true,
+    });
+  });
+
+  afterEach(() => {
+    store.close();
+  });
+
+  const reg = (over = {}) => ({
+    trackingId: 'a'.repeat(32),
+    connectionId: 'c'.repeat(32),
+    label: 'alpha',
+    pid: 1111,
+    staleCutoff: t + 30_000,
+    ...over,
+  });
+
+  const getSession = (trackingId) =>
+    store.getTuiSession({ trackingId, staleCutoff: t + 30_000 });
+
+  test('migration is additive, idempotent and never backfills from the project alias', () => {
+    const trackingId = 'a'.repeat(32);
+    store.registerTuiSession(reg({ trackingId, cwd: 'C:/proj/alias-mig' }));
+    const dbPath = join(dir, 'main.sqlite');
+    store.close();
+    // Reopening an existing database twice must be safe (idempotent).
+    store = new Store(dbPath, { now: () => t, isProcessAlive: () => true });
+    store.close();
+    store = new Store(dbPath, { now: () => t, isProcessAlive: () => true });
+    const db = new DatabaseSync(dbPath);
+    try {
+      const columns = db.prepare('PRAGMA table_info(tui_session_aliases)').all().map((r) => r.name);
+      assert.deepEqual(
+        columns.sort(),
+        ['alias', 'created_at', 'project_key', 'tracking_id', 'updated_at'].sort(),
+        'exact additive schema: tracking_id PK, project_key, alias, timestamps',
+      );
+      assert.equal(
+        db.prepare('SELECT COUNT(*) AS n FROM tui_session_aliases').get().n,
+        0,
+        'no backfill from the project alias',
+      );
+    } finally {
+      db.close();
+    }
+  });
+
+  test('set/read alias across a Store reopen (durable, keyed by tracking id)', () => {
+    const trackingId = 'a'.repeat(32);
+    store.registerTuiSession(reg({ trackingId, cwd: 'C:/proj/durable' }));
+    assert.deepEqual(store.setTuiSessionAlias({ trackingId, alias: 'my session' }), { ok: true });
+    assert.equal(getSession(trackingId).alias, 'my session');
+    const dbPath = join(dir, 'main.sqlite');
+    store.close();
+    store = new Store(dbPath, { now: () => t, isProcessAlive: () => true });
+    assert.equal(getSession(trackingId).alias, 'my session', 'alias survives a broker restart');
+  });
+
+  test('same-project stale takeover preserves the session alias', () => {
+    const trackingId = 'a'.repeat(32);
+    store.registerTuiSession(reg({ trackingId, connectionId: '1'.repeat(32), cwd: 'C:/proj/takeover' }));
+    assert.equal(store.setTuiSessionAlias({ trackingId, alias: 'kept' }).ok, true);
+    t += 1000;
+    const replaced = store.registerTuiSession(reg({
+      trackingId, connectionId: '2'.repeat(32), cwd: 'C:/proj/takeover',
+    }));
+    assert.equal(replaced.ok, true);
+    assert.equal(replaced.replaced, true, 'the stale row was actually taken over');
+    assert.equal(getSession(trackingId).alias, 'kept', 'same-project takeover keeps the alias');
+  });
+
+  test('disconnect deletes the live row but the alias survives a same-tracking re-register', () => {
+    const trackingId = 'a'.repeat(32);
+    store.registerTuiSession(reg({ trackingId, connectionId: '1'.repeat(32), cwd: 'C:/proj/reconn' }));
+    assert.equal(store.setTuiSessionAlias({ trackingId, alias: 'sticky' }).ok, true);
+    t += 1000;
+    assert.equal(store.disconnectTuiSession({ trackingId, connectionId: '1'.repeat(32) }).ok, true);
+    assert.equal(getSession(trackingId), null, 'live row still deletes on disconnect');
+    t += 1000;
+    assert.equal(store.registerTuiSession(reg({
+      trackingId, connectionId: '2'.repeat(32), cwd: 'C:/proj/reconn',
+    })).ok, true);
+    assert.equal(getSession(trackingId).alias, 'sticky', 'same-tracking reconnect restores the alias');
+  });
+
+  test('correction: disconnect + re-register with a changed project physically deletes the orphaned alias (INSERT path)', () => {
+    const trackingId = 'a'.repeat(32);
+    const dbPath = join(dir, 'main.sqlite');
+    store.registerTuiSession(reg({ trackingId, connectionId: '1'.repeat(32), cwd: 'C:/proj/orphan-old' }));
+    assert.equal(store.setTuiSessionAlias({ trackingId, alias: 'stale' }).ok, true);
+    t += 1000;
+    assert.equal(store.disconnectTuiSession({ trackingId, connectionId: '1'.repeat(32) }).ok, true);
+    t += 1000;
+    assert.equal(store.registerTuiSession(reg({
+      trackingId, connectionId: '2'.repeat(32), cwd: 'C:/proj/orphan-new',
+    })).ok, true);
+    assert.equal(getSession(trackingId).alias, null, 'the hidden alias never surfaces');
+    const db = new DatabaseSync(dbPath);
+    try {
+      assert.equal(
+        db.prepare('SELECT COUNT(*) AS n FROM tui_session_aliases WHERE tracking_id = ?').get(trackingId).n,
+        0,
+        'the stale alias row is physically deleted, not prune-protected by the new live row',
+      );
+    } finally {
+      db.close();
+    }
+  });
+
+  test('correction: disconnect + re-register with the same project preserves the alias (INSERT path)', () => {
+    const trackingId = 'a'.repeat(32);
+    const dbPath = join(dir, 'main.sqlite');
+    store.registerTuiSession(reg({ trackingId, connectionId: '1'.repeat(32), cwd: 'C:/proj/orphan-same' }));
+    assert.equal(store.setTuiSessionAlias({ trackingId, alias: 'kept' }).ok, true);
+    t += 1000;
+    assert.equal(store.disconnectTuiSession({ trackingId, connectionId: '1'.repeat(32) }).ok, true);
+    t += 1000;
+    assert.equal(store.registerTuiSession(reg({
+      trackingId, connectionId: '2'.repeat(32), cwd: 'c:/proj/orphan-same/',
+    })).ok, true, 'same project (any cwd spelling) re-registers cleanly');
+    assert.equal(getSession(trackingId).alias, 'kept', 'a same-project alias survives the INSERT path');
+    const db = new DatabaseSync(dbPath);
+    try {
+      assert.equal(
+        db.prepare('SELECT COUNT(*) AS n FROM tui_session_aliases WHERE tracking_id = ?').get(trackingId).n,
+        1,
+      );
+    } finally {
+      db.close();
+    }
+  });
+
+  test('project drift on refresh and replacement deletes the session alias atomically', () => {
+    const trackingId = 'a'.repeat(32);
+    const dbPath = join(dir, 'main.sqlite');
+    store.registerTuiSession(reg({ trackingId, connectionId: '1'.repeat(32), cwd: 'C:/proj/drift-a' }));
+    assert.equal(store.setTuiSessionAlias({ trackingId, alias: 'before' }).ok, true);
+    t += 1000;
+    store.registerTuiSession(reg({ trackingId, connectionId: '1'.repeat(32), cwd: 'C:/proj/drift-b' }));
+    assert.equal(getSession(trackingId).alias, null, 'refresh onto a new project clears the alias');
+    let db = new DatabaseSync(dbPath);
+    try {
+      assert.equal(
+        db.prepare('SELECT COUNT(*) AS n FROM tui_session_aliases WHERE tracking_id = ?').get(trackingId).n,
+        0,
+        'the alias row itself is deleted, not just unjoined',
+      );
+    } finally {
+      db.close();
+    }
+    // A fresh alias on the new project is independent of the old one.
+    assert.equal(store.setTuiSessionAlias({ trackingId, alias: 'after' }).ok, true);
+    assert.equal(getSession(trackingId).alias, 'after');
+    t += 1000;
+    store.registerTuiSession(reg({ trackingId, connectionId: '2'.repeat(32), cwd: 'C:/proj/drift-c' }));
+    assert.equal(getSession(trackingId).alias, null, 'replacement onto a new project clears the alias');
+    db = new DatabaseSync(dbPath);
+    try {
+      assert.equal(
+        db.prepare('SELECT COUNT(*) AS n FROM tui_session_aliases WHERE tracking_id = ?').get(trackingId).n,
+        0,
+      );
+    } finally {
+      db.close();
+    }
+  });
+
+  test('null clears the alias and clearing is idempotent', () => {
+    const trackingId = 'a'.repeat(32);
+    store.registerTuiSession(reg({ trackingId, cwd: 'C:/proj/clear' }));
+    assert.equal(store.setTuiSessionAlias({ trackingId, alias: 'x' }).ok, true);
+    assert.equal(store.setTuiSessionAlias({ trackingId, alias: null }).ok, true);
+    assert.equal(getSession(trackingId).alias, null, 'null clears the alias');
+    assert.equal(store.setTuiSessionAlias({ trackingId, alias: null }).ok, true, 'clear is idempotent');
+    assert.equal(store.setTuiSessionAlias({ trackingId }).ok, true, 'undefined clears too');
+    assert.equal(getSession(trackingId).alias, null);
+  });
+
+  test('unknown session fails closed', () => {
+    assert.deepEqual(
+      store.setTuiSessionAlias({ trackingId: 'e'.repeat(32), alias: 'x' }),
+      { ok: false, reason: 'unknown_session' },
+    );
+  });
+
+  test('alias validation matches the optional-string/64-char contract; tracking id is validated', () => {
+    const trackingId = 'a'.repeat(32);
+    store.registerTuiSession(reg({ trackingId, cwd: 'C:/proj/valid' }));
+    assert.throws(() => store.setTuiSessionAlias({ trackingId, alias: 'x'.repeat(65) }), TypeError);
+    assert.throws(() => store.setTuiSessionAlias({ trackingId, alias: 42 }), TypeError);
+    assert.throws(() => store.setTuiSessionAlias({ trackingId, alias: '' }), TypeError);
+    assert.throws(() => store.setTuiSessionAlias({ trackingId: 'short', alias: 'x' }), TypeError);
+    assert.equal(store.setTuiSessionAlias({ trackingId, alias: 'a'.repeat(64) }).ok, true,
+      'a 64-char alias is within the contract');
+  });
+
+  test('renaming is not activity: session and project timestamps untouched', () => {
+    const trackingId = 'a'.repeat(32);
+    store.registerTuiSession(reg({ trackingId, cwd: 'C:/proj/quiet' }));
+    const beforeSession = getSession(trackingId);
+    const beforeProject = store.listRecentTuiProjects({ since: 0 })[0];
+    t += 1000;
+    assert.equal(store.setTuiSessionAlias({ trackingId, alias: 'quiet' }).ok, true);
+    const afterSession = getSession(trackingId);
+    const afterProject = store.listRecentTuiProjects({ since: 0 })[0];
+    assert.equal(afterSession.updatedAt, beforeSession.updatedAt);
+    assert.equal(afterSession.heartbeatAt, beforeSession.heartbeatAt);
+    assert.equal(afterSession.connectedAt, beforeSession.connectedAt);
+    assert.equal(afterProject.lastSeenAt, beforeProject.lastSeenAt);
+    assert.equal(afterProject.lastState, beforeProject.lastState);
+  });
+
+  test('auto-prune keeps live-session aliases, keeps recent disconnected aliases and removes aged unreferenced ones', () => {
+    const liveId = 'a'.repeat(32);
+    const goneId = 'b'.repeat(32);
+    const dbPath = join(dir, 'main.sqlite');
+    store.registerTuiSession(reg({ trackingId: liveId, connectionId: '1'.repeat(32), cwd: 'C:/proj/prune-live' }));
+    store.registerTuiSession(reg({ trackingId: goneId, connectionId: '2'.repeat(32), cwd: 'C:/proj/prune-gone' }));
+    store.setTuiSessionAlias({ trackingId: liveId, alias: 'live-alias' });
+    store.setTuiSessionAlias({ trackingId: goneId, alias: 'gone-alias' });
+    store.disconnectTuiSession({ trackingId: goneId, connectionId: '2'.repeat(32) });
+    // Before the cutoff the disconnected alias is still protected: a
+    // register-triggered prune must not remove it.
+    t += 1000;
+    store.registerTuiSession(reg({
+      trackingId: 'd'.repeat(32), connectionId: '4'.repeat(32), cwd: 'C:/proj/prune-early',
+    }));
+    let db = new DatabaseSync(dbPath);
+    try {
+      const kept = db.prepare('SELECT tracking_id FROM tui_session_aliases').all().map((r) => r.tracking_id).sort();
+      assert.deepEqual(kept, [liveId, goneId].sort(), 'recent disconnected alias survives before 30d');
+    } finally {
+      db.close();
+    }
+    // 31 days later the aged unreferenced alias goes on the next register.
+    t += 31 * 24 * 60 * 60 * 1000;
+    store.registerTuiSession(reg({
+      trackingId: 'e'.repeat(32), connectionId: '5'.repeat(32), cwd: 'C:/proj/prune-late',
+    }));
+    assert.equal(getSession(liveId).alias, 'live-alias', 'a live-session alias is never pruned');
+    db = new DatabaseSync(dbPath);
+    try {
+      const kept = db.prepare('SELECT tracking_id FROM tui_session_aliases').all().map((r) => r.tracking_id).sort();
+      assert.deepEqual(kept, [liveId], 'aged unreferenced alias pruned; live alias preserved');
+    } finally {
+      db.close();
+    }
+  });
+
+  test('explicit prune API validates olderThan, preserves referenced aliases and reports the deleted count', () => {
+    const trackingId = 'a'.repeat(32);
+    store.registerTuiSession(reg({ trackingId, cwd: 'C:/proj/explicit' }));
+    store.setTuiSessionAlias({ trackingId, alias: 'kept' });
+    store.disconnectTuiSession({ trackingId, connectionId: 'c'.repeat(32) });
+    t += 1000;
+    assert.throws(() => store.pruneTuiSessionAliases({ olderThan: 'nope' }), RangeError);
+    assert.deepEqual(store.pruneTuiSessionAliases({ olderThan: t }), { ok: true, deleted: 1 });
+    // Re-registering the same tracking id restores nothing: the alias is gone.
+    store.registerTuiSession(reg({ trackingId, connectionId: '2'.repeat(32), cwd: 'C:/proj/explicit' }));
+    assert.equal(getSession(trackingId).alias, null);
+  });
+
+  test('project alias and session alias coexist; session aliasing never touches the project alias', () => {
+    const trackingId = 'a'.repeat(32);
+    store.registerTuiSession(reg({ trackingId, cwd: 'C:/proj/coexist' }));
+    const projectKey = getSession(trackingId).projectKey;
+    assert.equal(store.setTuiProjectAlias({ projectKey, alias: 'project-alias' }).ok, true);
+    assert.equal(store.setTuiSessionAlias({ trackingId, alias: 'session-alias' }).ok, true);
+    assert.equal(getSession(trackingId).alias, 'session-alias');
+    const project = store.listRecentTuiProjects({ since: 0 }).find((p) => p.projectKey === projectKey);
+    assert.equal(project.alias, 'project-alias', 'project alias unchanged');
+    assert.equal(store.setTuiSessionAlias({ trackingId, alias: null }).ok, true);
+    assert.equal(
+      store.listRecentTuiProjects({ since: 0 }).find((p) => p.projectKey === projectKey).alias,
+      'project-alias',
+      'clearing the session alias never clears the project alias',
+    );
+  });
+
+  test('session objects are frozen and expose a nullable alias; listTuiSessions surfaces it', () => {
+    const trackingId = 'a'.repeat(32);
+    store.registerTuiSession(reg({ trackingId, cwd: 'C:/proj/frozen' }));
+    const plain = getSession(trackingId);
+    assert.equal(plain.alias, null, 'alias is null before it is set');
+    assert.throws(() => { plain.alias = 'mutated'; }, TypeError, 'session rows are frozen');
+    assert.equal(store.setTuiSessionAlias({ trackingId, alias: 'frozen' }).ok, true);
+    const listed = store.listTuiSessions({ staleCutoff: t + 30_000 });
+    const row = listed.find((s) => s.trackingId === trackingId);
+    assert.equal(row.alias, 'frozen', 'listTuiSessions surfaces the alias');
+    assert.throws(() => { row.alias = 'mutated'; }, TypeError);
+  });
+
+  test('project history never gains a session alias, session ids or raw paths', () => {
+    const trackingId = 'a'.repeat(32);
+    store.registerTuiSession(reg({ trackingId, cwd: 'C:/proj/privacy2' }));
+    store.setTuiSessionAlias({ trackingId, alias: 'session-only' });
+    store.setTuiProjectAlias({ projectKey: getSession(trackingId).projectKey, alias: 'project-name' });
+    const project = store.listRecentTuiProjects({ since: 0 })[0];
+    assert.equal(project.alias, 'project-name', 'the project-history alias stays the project alias');
+    assert.ok(!JSON.stringify(project).includes('session-only'), 'no session alias leaks into project history');
+    assert.ok(!JSON.stringify(project).includes(trackingId), 'no raw tracking id may leak');
+    assert.ok(!JSON.stringify(project).toLowerCase().includes('proj/privacy2'), 'no raw cwd may leak');
+    for (const forbidden of ['trackingId', 'connectionId', 'shortId', 'pid', 'cwd']) {
+      assert.ok(!(forbidden in project), `${forbidden} must never be exposed`);
+    }
+  });
+
+  test('malformed legacy alias rows fail closed (project mismatch never surfaces an alias)', () => {
+    const trackingId = 'a'.repeat(32);
+    const dbPath = join(dir, 'main.sqlite');
+    store.registerTuiSession(reg({ trackingId, cwd: 'C:/proj/legacy' }));
+    store.setTuiSessionAlias({ trackingId, alias: 'good' });
+    store.close();
+    let db = new DatabaseSync(dbPath);
+    try {
+      db.prepare('UPDATE tui_session_aliases SET project_key = ? WHERE tracking_id = ?')
+        .run('not-hex', trackingId);
+    } finally {
+      db.close();
+    }
+    store = new Store(dbPath, { now: () => t, isProcessAlive: () => true });
+    assert.equal(getSession(trackingId).alias, null, 'a project mismatch fails closed to null');
+    // Repairing the row restores the join; a fresh store open is still safe.
+    store.close();
+    db = new DatabaseSync(dbPath);
+    try {
+      db.prepare('DELETE FROM tui_session_aliases WHERE tracking_id = ?').run(trackingId);
+    } finally {
+      db.close();
+    }
+    store = new Store(dbPath, { now: () => t, isProcessAlive: () => true });
+    assert.equal(getSession(trackingId).alias, null);
+  });
+});
+

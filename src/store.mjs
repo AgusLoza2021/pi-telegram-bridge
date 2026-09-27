@@ -382,6 +382,24 @@ export class Store {
       CREATE INDEX IF NOT EXISTS idx_tui_projects_recent
         ON tui_projects(last_seen_at, project_key);
     `);
+    // T4C1: durable per-session alias storage. Keyed by tracking_id and
+    // guarded by project_key: the alias only ever joins a tui_sessions row
+    // whose project identity still matches, so a project drift can never
+    // carry an alias across projects. Deliberately separate from
+    // tui_sessions (whose rows are deleted on disconnect) so the alias
+    // survives disconnect/re-register, and never backfilled from the
+    // project alias (tui_projects.alias stays the project-scoped
+    // fallback). Retention: aliases no current session references are
+    // pruned after TUI_PROJECT_RETENTION_MS (no count cap).
+    this.#db.exec(`
+      CREATE TABLE IF NOT EXISTS tui_session_aliases (
+        tracking_id TEXT PRIMARY KEY,
+        project_key TEXT NOT NULL,
+        alias TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+    `);
     this.#backfillTuiProjects();
   }
 
@@ -1294,13 +1312,23 @@ export class Store {
       updatedAt: row.updated_at,
       heartbeatAt: row.heartbeat_at,
       projectKey: row.project_key ?? null,
+      alias: row.session_alias ?? null,
       live: this.#tuiRowLive(row, staleCutoff),
     });
   }
 
   #getTuiSessionRow(trackingId) {
+    // T4C1: the session alias joins only on BOTH tracking_id and
+    // project_key, so a project mismatch (drifted or malformed legacy
+    // alias row) fails closed to a null alias instead of surfacing.
     return this.#db
-      .prepare('SELECT * FROM tui_sessions WHERE tracking_id = ?')
+      .prepare(
+        `SELECT s.*, a.alias AS session_alias
+         FROM tui_sessions s
+         LEFT JOIN tui_session_aliases a
+           ON a.tracking_id = s.tracking_id AND a.project_key = s.project_key
+         WHERE s.tracking_id = ?`,
+      )
       .get(trackingId);
   }
 
@@ -1476,6 +1504,30 @@ export class Store {
     });
   }
 
+  /** T4C1 retention-only alias prune (transaction core). Preserves ANY
+   * alias referenced by a current tui_sessions row; deletes unreferenced
+   * aliases older than the cutoff. No count cap: aliases are bounded by
+   * retention time, not by count. */
+  #pruneTuiSessionAliasesCore({ olderThan }) {
+    const info = this.#db
+      .prepare(
+        `DELETE FROM tui_session_aliases
+         WHERE updated_at < ?
+           AND tracking_id NOT IN (SELECT tracking_id FROM tui_sessions)`,
+      )
+      .run(olderThan);
+    return Number(info.changes);
+  }
+
+  /** Retention-only alias sweep for the automatic register/disconnect
+   * path. Must be called INSIDE the caller's transaction, like
+   * #pruneTuiProjectsInTx. */
+  #pruneTuiSessionAliasesInTx(now) {
+    this.#pruneTuiSessionAliasesCore({
+      olderThan: now - TUI_PROJECT_RETENTION_MS,
+    });
+  }
+
   #clearSelectedTuiTargetKeys() {
     for (const key of [SELECTED_TUI_TRACKING_ID_KEY, SELECTED_TUI_PROJECT_KEY_KEY]) {
       this.#db.prepare('DELETE FROM meta WHERE key = ?').run(key);
@@ -1547,6 +1599,13 @@ export class Store {
           && this.#getMeta(SELECTED_TUI_TRACKING_ID_KEY) === trackingId) {
           this.#clearSelectedTuiTargetKeys();
         }
+        // T4C1: a project identity change must never carry the old
+        // session alias onto the new project — delete it atomically.
+        if (row.project_key !== projectKey) {
+          this.#db
+            .prepare('DELETE FROM tui_session_aliases WHERE tracking_id = ?')
+            .run(trackingId);
+        }
         this.#db
           .prepare(
             `UPDATE tui_sessions SET
@@ -1567,6 +1626,7 @@ export class Store {
           projectKey, label, branch, trackingId, state: 'connected', seenAt: now,
         });
         this.#pruneTuiProjectsInTx(now);
+        this.#pruneTuiSessionAliasesInTx(now);
         return { ok: true, replaced: true, shortId: row.short_id };
       }
       if (row) {
@@ -1575,6 +1635,14 @@ export class Store {
         if (row.project_key !== projectKey
           && this.#getMeta(SELECTED_TUI_TRACKING_ID_KEY) === trackingId) {
           this.#clearSelectedTuiTargetKeys();
+        }
+        // T4C1: same drift rule on refresh — a changed project identity
+        // deletes the session alias atomically; a same-project refresh
+        // preserves it.
+        if (row.project_key !== projectKey) {
+          this.#db
+            .prepare('DELETE FROM tui_session_aliases WHERE tracking_id = ?')
+            .run(trackingId);
         }
         this.#db
           .prepare(
@@ -1591,6 +1659,7 @@ export class Store {
           projectKey, label, branch, trackingId, state: 'connected', seenAt: now,
         });
         this.#pruneTuiProjectsInTx(now);
+        this.#pruneTuiSessionAliasesInTx(now);
         return { ok: true, replaced: false, shortId: row.short_id };
       }
       let resolvedShortId = shortId ?? null;
@@ -1611,6 +1680,18 @@ export class Store {
       ) {
         return { ok: false, reason: 'short_id_collision' };
       }
+      // T4C1 correction: an INSERT after a disconnect can reuse a
+      // tracking id whose alias row still points at the OLD project
+      // identity. The LEFT JOIN would hide it, but the new live row
+      // would protect it from prune forever (a hidden orphan). Delete
+      // any alias whose project_key differs from the newly derived one;
+      // a same-project alias is preserved. This runs AFTER every
+      // rejection check, so a rejected registration never deletes.
+      this.#db
+        .prepare(
+          'DELETE FROM tui_session_aliases WHERE tracking_id = ? AND project_key != ?',
+        )
+        .run(trackingId, projectKey);
       this.#db
         .prepare(
           `INSERT INTO tui_sessions
@@ -1627,6 +1708,7 @@ export class Store {
         projectKey, label, branch, trackingId, state: 'connected', seenAt: now,
       });
       this.#pruneTuiProjectsInTx(now);
+      this.#pruneTuiSessionAliasesInTx(now);
       return { ok: true, replaced: false, shortId: resolvedShortId };
     });
   }
@@ -1737,6 +1819,7 @@ export class Store {
         this.#clearSelectedTuiTargetKeys();
       }
       this.#pruneTuiProjectsInTx(now);
+      this.#pruneTuiSessionAliasesInTx(now);
       return { ok: true };
     });
   }
@@ -1753,7 +1836,13 @@ export class Store {
   listTuiSessions({ staleCutoff }) {
     this.#assertTuiStaleCutoff(staleCutoff);
     const rows = this.#db
-      .prepare('SELECT * FROM tui_sessions ORDER BY connected_at, tracking_id')
+      .prepare(
+        `SELECT s.*, a.alias AS session_alias
+         FROM tui_sessions s
+         LEFT JOIN tui_session_aliases a
+           ON a.tracking_id = s.tracking_id AND a.project_key = s.project_key
+         ORDER BY s.connected_at, s.tracking_id`,
+      )
       .all();
     return rows.map((row) => this.#rowToTuiSession(row, staleCutoff));
   }
@@ -1813,6 +1902,69 @@ export class Store {
         .run(normalizedAlias, projectKey);
       return info.changes === 1 ? { ok: true } : { ok: false, reason: 'unknown_project' };
     });
+  }
+
+  /**
+   * Set (or clear with null) the human alias of ONE live session (T4C1).
+   * The alias is keyed by tracking id and guarded by the session row's
+   * current project_key: it survives broker restarts, same-tracking
+   * connection takeover and disconnect/re-register, but a project
+   * identity change deletes it (never carried across projects). Renaming
+   * is not activity: tui_sessions and tui_projects timestamps are
+   * deliberately left unchanged, and the project alias is never touched.
+   * Unknown sessions fail closed with 'unknown_session'; a session row
+   * with a malformed project key fails closed with 'project_mismatch'.
+   */
+  setTuiSessionAlias({ trackingId, alias }) {
+    assertTuiId(trackingId, 'trackingId');
+    const normalizedAlias = assertOptionalTuiString(alias, 'alias', MAX_TUI_LABEL_CHARS);
+    return this.#transaction(() => {
+      const row = this.#db
+        .prepare('SELECT project_key FROM tui_sessions WHERE tracking_id = ?')
+        .get(trackingId);
+      if (!row) return { ok: false, reason: 'unknown_session' };
+      if (typeof row.project_key !== 'string' || !TUI_PROJECT_KEY_RE.test(row.project_key)) {
+        return { ok: false, reason: 'project_mismatch' };
+      }
+      if (normalizedAlias === null) {
+        this.#db
+          .prepare('DELETE FROM tui_session_aliases WHERE tracking_id = ?')
+          .run(trackingId);
+        return { ok: true };
+      }
+      const now = this.#now();
+      this.#db
+        .prepare(
+          `INSERT INTO tui_session_aliases
+             (tracking_id, project_key, alias, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?)
+           ON CONFLICT(tracking_id) DO UPDATE SET
+             project_key = excluded.project_key,
+             alias = excluded.alias,
+             updated_at = excluded.updated_at`,
+        )
+        .run(trackingId, row.project_key, normalizedAlias, now, now);
+      return { ok: true };
+    });
+  }
+
+  /**
+   * Explicit retention-only sweep for per-session aliases (T4C1).
+   * Preserves ANY alias referenced by a current tui_sessions row;
+   * deletes unreferenced aliases older than `olderThan` (epoch ms). No
+   * count cap. Returns the deleted count. Also runs inside each
+   * successful register/disconnect transaction with
+   * TUI_PROJECT_RETENTION_MS, so a disconnected session's recent alias
+   * stays restorable for a same-tracking reconnect for 30 days.
+   */
+  pruneTuiSessionAliases({ olderThan }) {
+    if (!Number.isSafeInteger(olderThan)) {
+      throw new RangeError('olderThan must be an epoch-ms integer');
+    }
+    return this.#transaction(() => ({
+      ok: true,
+      deleted: this.#pruneTuiSessionAliasesCore({ olderThan }),
+    }));
   }
 
   /** Durable selected target: frozen {trackingId, projectKey} or null.
