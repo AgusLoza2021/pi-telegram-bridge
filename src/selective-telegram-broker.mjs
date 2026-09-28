@@ -32,10 +32,15 @@
 //   Projects dashboard (v1:r, v1:s:<sid>, v1:p:<sid>:<pid>, v1:c),
 //   the busy decision card (v1:f/t/a:<sid>:<pid>, v1:n:<pid>), the action
 //   keyboards (v1:q/x/d/D:<sid>, v1:C) and the remote choice card
-//   (v1:w:<requestId>:<index>, v1:W:<requestId> — T2B1 renders and registers
-//   these callbacks; the parser branch is deliberately NOT added until the
-//   dedicated consumer work unit, so a choice tap falls through the closed
-//   grammar as malformed). Data never carries labels,
+//   (v1:w:<requestId>:<index>, v1:W:<requestId> — rendered and registered by
+//   T2B1 and consumed by T2B2 exactly once: an authorized tap on a live,
+//   unexpired request whose captured connection still owns the session
+//   enqueues exactly one bounded choice_response with the deterministic
+//   command id choice_<requestId> and a fixed accepted/cancelled toast;
+//   every unknown, expired, replayed, malformed, out-of-range-index or
+//   replaced-connection tap chooses nothing and gets the fixed out-of-date
+//   toast, and the pending row is dropped only AFTER the transaction
+//   commits). Data never carries labels,
 //   prompt text, cwd, tokens or secrets; short ids and opaque request ids
 //   stay inside callback_data, never in beginner-visible card text. Authorized
 //   callbacks get a best-effort answerCallbackQuery queued only AFTER the
@@ -111,12 +116,18 @@ const CALLBACK_DISCONNECT_ASK_RE = /^v1:d:([a-z0-9]{3,32})$/;
 const CALLBACK_DISCONNECT_CONFIRM_RE = /^v1:D:([a-z0-9]{3,32})$/;
 const CALLBACK_CHOOSER_RE = /^v1:c$/;
 const CALLBACK_CANCEL_RE = /^v1:C$/;
+// T2B2 remote ordinary choice callbacks: strictly bounded, opaque. The
+// request id is exactly 16 lowercase hex chars and the option index is one
+// digit 0..3; the index is additionally re-validated against the request's
+// own option count in the consumer, and anything else stays malformed.
 const CALLBACK_MAX_DATA_BYTES = 64;
+const CALLBACK_CHOICE_OPTION_RE = /^v1:w:([0-9a-f]{16}):([0-3])$/;
+const CALLBACK_CHOICE_CANCEL_RE = /^v1:W:([0-9a-f]{16})$/;
 const REFRESH_BUTTON_TEXT = 'Refresh';
 
 // T2B1 remote ordinary choice cards: a bounded memory-only pending registry
-// and render guards. The v1:w / v1:W callback grammar is rendered here and
-// consumed by the dedicated parser work unit only — no branch is added now.
+// and render guards. The v1:w / v1:W callback grammar rendered here is
+// consumed exactly once by the T2B2 parser branch and consumer below.
 const MAX_PENDING_CHOICES = 32;
 const CHOICE_REQUEST_ID_RE = /^[0-9a-f]{16}$/;
 const MIN_CHOICE_OPTIONS = 2;
@@ -143,10 +154,11 @@ function freshPendingId() {
 }
 
 /**
- * Strict T03a/T03b callback grammar. Anything else — unknown version,
+ * Strict T03a/T03b/T2B2 callback grammar. Anything else — unknown version,
  * unknown action, bad shape — is null. Data carries only the version, the
- * action, the opaque session short id and the pending generation id: never
- * labels, prompt text, cwd or secrets.
+ * action, the opaque session short id, the pending generation id and (for
+ * choice callbacks) the opaque request id plus the bounded option index:
+ * never labels, prompt text, cwd or secrets.
  */
 function parseCallbackData(data) {
   if (CALLBACK_REFRESH_RE.test(data)) return { action: 'refresh' };
@@ -176,6 +188,12 @@ function parseCallbackData(data) {
   if (disconnectConfirm !== null) {
     return { action: 'disconnect_confirm', shortId: disconnectConfirm[1] };
   }
+  const choiceOption = CALLBACK_CHOICE_OPTION_RE.exec(data);
+  if (choiceOption !== null) {
+    return { action: 'choice_option', requestId: choiceOption[1], index: Number(choiceOption[2]) };
+  }
+  const choiceCancel = CALLBACK_CHOICE_CANCEL_RE.exec(data);
+  if (choiceCancel !== null) return { action: 'choice_cancel', requestId: choiceCancel[1] };
   return null;
 }
 
@@ -663,6 +681,10 @@ export class SelectiveTelegramBroker {
     // { callbackQueryId, text } — the toast is empty for every normal
     // callback; only the consumed/stale pending-prompt path carries text.
     let callbackAnswer = null;
+    // T2B2: the consumed pending-choice row is deleted only AFTER this
+    // transaction committed (receipt + command + offset). A thrown
+    // transaction never reaches the deletion, so the row survives.
+    let consumeChoiceRequestId = null;
     this.#store.withTransaction(() => {
       const first = this.#store.recordInbox({ inboxId, kind: type, payload: { type } });
       if (!first) return; // re-delivery: no repeated planning, no duplicate commands
@@ -672,6 +694,9 @@ export class SelectiveTelegramBroker {
           callbackAnswer = plan.answerId !== null
             ? { callbackQueryId: plan.answerId, text: plan.answerText ?? '' }
             : null;
+          if (typeof plan.consumeChoiceRequestId === 'string') {
+            consumeChoiceRequestId = plan.consumeChoiceRequestId;
+          }
           if (plan.command !== null) {
             const result = this.#store.enqueueTuiCommand({
               trackingId: plan.command.trackingId,
@@ -687,6 +712,28 @@ export class SelectiveTelegramBroker {
             } else {
               this.#log('command_enqueue_failed');
             }
+          }
+          if (plan.choiceCommand != null) {
+            // T2B2: at-most-once choice_response with the deterministic
+            // explicit command id. An accepted enqueue answers the fixed
+            // accepted/cancelled toast; a duplicate or failed enqueue is
+            // stale (never success) and answers the fixed out-of-date
+            // toast. The answer is queued only after this whole unit
+            // (receipt + command + offset) commits; a throw rolls back
+            // and queues nothing.
+            const choiceCommand = plan.choiceCommand;
+            const result = this.#store.enqueueTuiCommand({
+              trackingId: choiceCommand.trackingId,
+              kind: choiceCommand.kind,
+              payload: choiceCommand.payload,
+              commandId: choiceCommand.commandId,
+            });
+            callbackAnswer = plan.answerId !== null
+              ? {
+                  callbackQueryId: plan.answerId,
+                  text: result.ok ? choiceCommand.acceptedToast : copy.staleChoiceToast,
+                }
+              : null;
           }
           if (Array.isArray(plan.commands) && plan.commands.length > 0) {
             // T03b multi-command plans (abort then prompt): enqueue in
@@ -746,6 +793,11 @@ export class SelectiveTelegramBroker {
       }
       this.#store.advanceBrokerTransportOffset(offset);
     });
+    if (consumeChoiceRequestId !== null) {
+      // T2B2: drop the consumed pending-choice row only after the enclosing
+      // transaction returned successfully (a throw above never gets here).
+      this.#pendingChoices.delete(consumeChoiceRequestId);
+    }
     if (callbackAnswer !== null) {
       // Best-effort feedback, queued only AFTER the transaction (receipt,
       // commands and offset) committed inside the store. Objects carry the
@@ -828,7 +880,10 @@ export class SelectiveTelegramBroker {
    * no-live guidance) and never dispatches anything — EXCEPT the consumed
    * or stale pending-prompt generation (T5B2), which sends no chat reply
    * at all and is answered with the fixed out-of-date toast via
-   * answerText.
+   * answerText, and the T2B2 remote-choice taps, which likewise never
+   * send a chat reply: stale taps are answered with the fixed stale
+   * choice toast, and an accepted tap enqueues exactly one bounded
+   * choice_response (see #planChoiceResponse).
    */
   #planCallback(cq) {
     const messageId = isPlainObject(cq.message) ? cq.message : null;
@@ -984,9 +1039,90 @@ export class SelectiveTelegramBroker {
       }
       case 'disconnect_confirm':
         return this.#planSidCommand(parsed, 'disconnect', answerId);
+      case 'choice_option':
+        return this.#planChoiceResponse(
+          parsed.requestId,
+          { index: parsed.index },
+          answerId,
+        );
+      case 'choice_cancel':
+        return this.#planChoiceResponse(parsed.requestId, { cancelled: true }, answerId);
       default:
         return { answerId, reply: null, command: null };
     }
+  }
+
+  /**
+   * T2B2: consume a rendered v1:w (option) or v1:W (cancel) callback
+   * exactly once. Authorized taps are validated against the memory-only
+   * pending registry (expired rows pruned first), then against the LIVE
+   * sessions: the request's tracking id must resolve to exactly one live
+   * session whose CURRENT connection id still equals the captured one.
+   *
+   * Unknown, expired, replayed and post-restart requests, and dead or
+   * replaced connections, never choose anything: no command, no chat
+   * message, only the fixed out-of-date toast — and the dead/replaced
+   * row is dropped after the enclosing Store transaction commits (the
+   * plan carries consumeChoiceRequestId; deletion happens in
+   * handleUpdate, so a thrown transaction keeps the row). An index
+   * outside the request's own option range keeps the still-valid request
+   * registered. An accepted tap enqueues exactly one bounded
+   * choice_response under the deterministic command id `choice_<requestId>`
+   * — never an option label, description or value — and answers the fixed
+   * accepted/cancelled toast only after that enqueue is accepted.
+   */
+  #planChoiceResponse(requestId, response, answerId) {
+    this.#pruneExpiredChoices();
+    const pending = this.#pendingChoices.get(requestId) ?? null;
+    const stale = (dropRow) => {
+      this.#log('choice_callback_stale');
+      return {
+        answerId,
+        reply: null,
+        command: null,
+        answerText: copy.staleChoiceToast,
+        ...(dropRow ? { consumeChoiceRequestId: requestId } : {}),
+      };
+    };
+    if (pending === null) return stale(false);
+    const live = this.#liveSessions()
+      .filter((session) => session.trackingId === pending.trackingId);
+    if (live.length !== 1 || live[0].connectionId !== pending.connectionId) {
+      // Dead, stale or replaced connection: the request can never reach
+      // its captured owner again, so drop this row after the commit.
+      return stale(true);
+    }
+    if (response.cancelled !== true) {
+      const { index } = response;
+      if (!Number.isSafeInteger(index) || index < 0 || index >= pending.optionCount) {
+        // Out of range for THIS request: the still-valid request stays
+        // registered so a correct tap can still answer it.
+        this.#log('choice_callback_invalid_index');
+        return {
+          answerId,
+          reply: null,
+          command: null,
+          answerText: copy.staleChoiceToast,
+        };
+      }
+    }
+    return {
+      answerId,
+      reply: null,
+      command: null,
+      choiceCommand: {
+        trackingId: live[0].trackingId,
+        kind: 'choice_response',
+        payload: response.cancelled === true
+          ? { requestId, cancelled: true }
+          : { requestId, index: response.index },
+        commandId: `choice_${requestId}`,
+        acceptedToast: response.cancelled === true
+          ? copy.choiceCancelledToast
+          : copy.choiceAnsweredToast,
+      },
+      consumeChoiceRequestId: requestId,
+    };
   }
 
   /** The exactly-one live session with this short id, or null. */

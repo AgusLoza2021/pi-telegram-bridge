@@ -4991,8 +4991,9 @@ describe('SelectiveTelegramBroker: remote ordinary choice cards (T2B1)', () => {
   // The broker renders/sends/registers remote ordinary-choice cards from the
   // T1 `choice_request` transport contract (commit 7c062f4) and the T2A copy
   // builders (commit 3d2c428). The v1:w / v1:W callback grammar is RENDERED
-  // here but deliberately NOT parsed: the consumer branch belongs to the
-  // next work unit, never this one. No deploy, no live sends, no docs.
+  // here; its consumption (parser branch + at-most-once choice_response)
+  // lives in the dedicated T2B2 describe below. No deploy, no live sends,
+  // no docs.
   const T0 = 1_700_000_000_000;
   const CHOICE_TTL_MS = 30 * 60 * 1000;
   const REQUEST_ID = 'a1b2c3d4e5f60718';
@@ -5609,7 +5610,7 @@ describe('SelectiveTelegramBroker: remote ordinary choice cards (T2B1)', () => {
     } finally { fx.close(); }
   });
 
-  test('choice callbacks are not consumed yet and unknown event kinds stay inert', async () => {
+  test('unknown event kinds stay inert (v1:w/v1:W consumption lives in the T2B2 block)', async () => {
     const fx = makeChoiceFixture();
     try {
       fx.connectA();
@@ -5618,15 +5619,7 @@ describe('SelectiveTelegramBroker: remote ordinary choice cards (T2B1)', () => {
       await settle(fx, broker, api);
       fx.enqueueChoice(A.trackingId, fx.choicePayload());
       await broker.drainTuiEvents();
-      // The v1:w grammar is RENDERED here but deliberately not parsed: the
-      // callback falls through the closed grammar as malformed. The consumer
-      // branch belongs to the NEXT work unit, never this one.
       const sentBefore = api.sent.length;
-      broker.handleUpdate(cb(`v1:w:${REQUEST_ID}:1`));
-      await broker.flushReplies();
-      assert.equal(api.sent.length, sentBefore, 'an unparsed choice callback sends no chat reply');
-      assert.equal(fx.client.poll(A).commands.length, 0, 'no choice callback may enqueue anything yet');
-      assert.ok(fx.logs.some((e) => e.code === 'callback_rejected'));
       // The render set stays closed: an unknown kind (raw row, bypassing the
       // store's closed set) is acknowledged without being sent.
       fx.enqueueChoice(A.trackingId, fx.choicePayload({ requestId: REQUEST_ID_2 }));
@@ -5637,6 +5630,426 @@ describe('SelectiveTelegramBroker: remote ordinary choice cards (T2B1)', () => {
       assert.equal(api.sent.length, sentBefore, 'an unknown kind sends nothing');
       assert.equal(fx.store.listPendingBrokerTuiEvents({ limit: 100 }).length, 0,
         'an unknown kind is acknowledged so it never blocks the queue');
+    } finally { fx.close(); }
+  });
+});
+
+describe('SelectiveTelegramBroker: remote choice callback consumption (T2B2)', () => {
+  // T2B2 consumes the already-rendered v1:w / v1:W callbacks exactly once:
+  // one bounded `choice_response` (deterministic command id `choice_<id>`)
+  // to the exact current Pi connection, the fixed stale toast for every
+  // unknown/expired/replayed/malformed/wrong-index/replaced-connection tap,
+  // never a chat message, never a leaked id. No extension tool, no docs,
+  // no deploy, no live sends.
+  const T0 = 1_700_000_000_000;
+  const CHOICE_TTL_MS = 30 * 60 * 1000;
+  const REQUEST_ID = 'a1b2c3d4e5f60718';
+  const REQUEST_ID_2 = 'f0e1d2c3b4a59786';
+
+  const FOUR_OPTIONS = Object.freeze([
+    { label: 'One', description: 'first' },
+    { label: 'Two', description: 'second' },
+    { label: 'Three', description: 'third' },
+    { label: 'Four', description: 'fourth' },
+  ]);
+
+  function makeChoiceCallbackFixture() {
+    const dir = mkdtempSync(join(TEST_RUNS, 'sel-choice-cb-'));
+    let t = T0;
+    const store = new Store(join(dir, 'bridge.sqlite'), { now: () => t, isProcessAlive: () => true });
+    const client = new TuiBridgeClient(store, { staleAfterMs: 30_000 });
+    const logs = [];
+    return {
+      store,
+      client,
+      logs,
+      storePath: join(dir, 'bridge.sqlite'),
+      now: () => t,
+      advance(ms) { t += ms; },
+      connectA() {
+        assert.equal(client.connect({ ...A, shortId: 'aaa111', label: 'alpha', pid: 1111, cwd: 'C:/proj/alpha' }).ok, true);
+      },
+      choicePayload(over = {}) {
+        return {
+          requestId: REQUEST_ID,
+          question: 'Which database should we ship?',
+          options: [
+            { label: 'SQLite', description: 'Zero-config local file' },
+            { label: 'Postgres', description: 'Managed server, richer types' },
+          ],
+          expiresAt: t + CHOICE_TTL_MS,
+          ...over,
+        };
+      },
+      enqueueChoice(trackingId, payload) {
+        const res = store.appendTuiEvent({ trackingId, kind: 'choice_request', payload });
+        assert.equal(res.ok, true);
+        return res;
+      },
+      close() { store.close(); },
+    };
+  }
+
+  function newBroker(fx, api, config = BROKER_CONFIG) {
+    return new SelectiveTelegramBroker({
+      store: fx.store,
+      api,
+      config,
+      now: fx.now,
+      logger: (entry) => fx.logs.push(entry),
+    });
+  }
+
+  async function settle(fx, broker, api) {
+    await broker.drainTuiEvents();
+    api.sent.length = 0;
+    fx.logs.length = 0;
+  }
+
+  /** Render one choice card and clear the render evidence. */
+  async function renderCard(fx, broker, api, over = {}) {
+    fx.enqueueChoice(A.trackingId, fx.choicePayload(over));
+    await broker.drainTuiEvents();
+    api.sent.length = 0;
+    fx.logs.length = 0;
+  }
+
+  test('an option tap enqueues exactly one choice_response with the deterministic command id and the accepted toast', async () => {
+    const fx = makeChoiceCallbackFixture();
+    try {
+      fx.connectA();
+      const api = makeFakeApi();
+      const broker = newBroker(fx, api);
+      await settle(fx, broker, api);
+      await renderCard(fx, broker, api);
+      broker.handleUpdate(cb(`v1:w:${REQUEST_ID}:1`));
+      await broker.flushReplies();
+      const commands = fx.client.poll(A).commands;
+      assert.equal(commands.length, 1, 'exactly one choice_response must be enqueued');
+      assert.equal(commands[0].kind, 'choice_response');
+      assert.deepEqual(commands[0].payload, { requestId: REQUEST_ID, index: 1 },
+        'the payload must carry only the request id and the index');
+      assert.equal(commands[0].commandId, `choice_${REQUEST_ID}`,
+        'the explicit deterministic command id must win');
+      assert.deepEqual(api.answerPayloads.map((p) => p.text), [copyModule.choiceAnsweredToast]);
+      assert.equal(api.sent.length, 0, 'no chat acknowledgement may be sent');
+      // A repeated tap (distinct update id, row already dropped) replays nothing.
+      broker.handleUpdate(cb(`v1:w:${REQUEST_ID}:1`));
+      await broker.flushReplies();
+      assert.equal(fx.client.poll(A).commands.length, 0, 'the consumed request must not enqueue again');
+      assert.equal(api.answerPayloads.at(-1).text, copyModule.staleChoiceToast);
+      assert.equal(api.sent.length, 0, 'still no chat message on the stale replay');
+    } finally { fx.close(); }
+  });
+
+  test('the cancel tap enqueues exactly one {requestId, cancelled:true} with the cancelled toast', async () => {
+    const fx = makeChoiceCallbackFixture();
+    try {
+      fx.connectA();
+      const api = makeFakeApi();
+      const broker = newBroker(fx, api);
+      await settle(fx, broker, api);
+      await renderCard(fx, broker, api);
+      broker.handleUpdate(cb(`v1:W:${REQUEST_ID}`));
+      await broker.flushReplies();
+      const commands = fx.client.poll(A).commands;
+      assert.equal(commands.length, 1);
+      assert.equal(commands[0].kind, 'choice_response');
+      assert.deepEqual(commands[0].payload, { requestId: REQUEST_ID, cancelled: true });
+      assert.equal(commands[0].commandId, `choice_${REQUEST_ID}`);
+      assert.deepEqual(api.answerPayloads.map((p) => p.text), [copyModule.choiceCancelledToast]);
+      assert.equal(api.sent.length, 0, 'no chat acknowledgement may be sent');
+    } finally { fx.close(); }
+  });
+
+  test('an out-of-range index on a two-option card is non-consuming, then a valid tap succeeds', async () => {
+    const fx = makeChoiceCallbackFixture();
+    try {
+      fx.connectA();
+      const api = makeFakeApi();
+      const broker = newBroker(fx, api);
+      await settle(fx, broker, api);
+      await renderCard(fx, broker, api);
+      broker.handleUpdate(cb(`v1:w:${REQUEST_ID}:2`));
+      await broker.flushReplies();
+      assert.equal(fx.client.poll(A).commands.length, 0, 'an invalid index must enqueue nothing');
+      assert.equal(api.answerPayloads.at(-1).text, copyModule.staleChoiceToast);
+      assert.equal(api.sent.length, 0);
+      // The still-valid request survives the invalid tap.
+      broker.handleUpdate(cb(`v1:w:${REQUEST_ID}:1`));
+      await broker.flushReplies();
+      const commands = fx.client.poll(A).commands;
+      assert.equal(commands.length, 1, 'the request must still answer after the invalid tap');
+      assert.deepEqual(commands[0].payload, { requestId: REQUEST_ID, index: 1 });
+      assert.equal(api.answerPayloads.at(-1).text, copyModule.choiceAnsweredToast);
+      assert.equal(api.sent.length, 0);
+    } finally { fx.close(); }
+  });
+
+  test('a four-option card accepts the max index 3 and keeps the grammar closed above it', async () => {
+    const fx = makeChoiceCallbackFixture();
+    try {
+      fx.connectA();
+      const api = makeFakeApi();
+      const broker = newBroker(fx, api);
+      await settle(fx, broker, api);
+      await renderCard(fx, broker, api, { options: FOUR_OPTIONS });
+      broker.handleUpdate(cb(`v1:w:${REQUEST_ID}:4`));
+      await broker.flushReplies();
+      assert.ok(fx.logs.some((e) => e.code === 'callback_rejected'),
+        'an index above the closed grammar stays malformed');
+      assert.equal(api.answerPayloads.at(-1).text, '', 'a malformed callback answers with no toast text');
+      assert.equal(fx.client.poll(A).commands.length, 0);
+      broker.handleUpdate(cb(`v1:w:${REQUEST_ID}:3`));
+      await broker.flushReplies();
+      const commands = fx.client.poll(A).commands;
+      assert.equal(commands.length, 1);
+      assert.deepEqual(commands[0].payload, { requestId: REQUEST_ID, index: 3 });
+      assert.equal(api.answerPayloads.at(-1).text, copyModule.choiceAnsweredToast);
+      assert.equal(api.sent.length, 0);
+    } finally { fx.close(); }
+  });
+
+  test('unauthorized or non-private taps are dropped entirely: no command, no answer, non-consuming', async () => {
+    const fx = makeChoiceCallbackFixture();
+    try {
+      fx.connectA();
+      const api = makeFakeApi();
+      const broker = newBroker(fx, api);
+      await settle(fx, broker, api);
+      await renderCard(fx, broker, api);
+      broker.handleUpdate(cb(`v1:w:${REQUEST_ID}:1`, { userId: 999 }));
+      broker.handleUpdate(cb(`v1:w:${REQUEST_ID}:1`, { chatType: 'group' }));
+      broker.handleUpdate(cb(`v1:w:${REQUEST_ID}:1`, { isBot: true }));
+      await broker.flushReplies();
+      assert.equal(api.answered.length, 0, 'unauthorized callbacks must not even reach answerCallbackQuery');
+      assert.equal(fx.client.poll(A).commands.length, 0);
+      assert.equal(api.sent.length, 0);
+      // The authorized owner can still answer: nothing was consumed.
+      broker.handleUpdate(cb(`v1:w:${REQUEST_ID}:0`));
+      await broker.flushReplies();
+      assert.equal(fx.client.poll(A).commands.length, 1);
+      assert.equal(api.answerPayloads.at(-1).text, copyModule.choiceAnsweredToast);
+    } finally { fx.close(); }
+  });
+
+  test('malformed and oversized choice callback data stay rejected, non-consuming, toastless', async () => {
+    const fx = makeChoiceCallbackFixture();
+    try {
+      fx.connectA();
+      const api = makeFakeApi();
+      const broker = newBroker(fx, api);
+      await settle(fx, broker, api);
+      await renderCard(fx, broker, api);
+      broker.handleUpdate(cb(`v1:w:NOTHEX123456789:1`));
+      broker.handleUpdate(cb(`v1:w:${REQUEST_ID.toUpperCase()}:1`));
+      broker.handleUpdate(cb(`v1:w:${REQUEST_ID}:${'1'.repeat(60)}`)); // > 64 bytes
+      await broker.flushReplies();
+      assert.ok(fx.logs.filter((e) => e.code === 'callback_rejected').length >= 3);
+      assert.ok(api.answerPayloads.every((p) => p.text === ''),
+        'malformed callbacks answer with no toast text');
+      assert.equal(fx.client.poll(A).commands.length, 0);
+      assert.equal(api.sent.length, 0);
+      broker.handleUpdate(cb(`v1:w:${REQUEST_ID}:1`));
+      await broker.flushReplies();
+      assert.equal(fx.client.poll(A).commands.length, 1, 'the request must survive malformed taps');
+    } finally { fx.close(); }
+  });
+
+  test('unknown, expired and post-restart taps only get the fixed stale toast and enqueue nothing', async () => {
+    const fx = makeChoiceCallbackFixture();
+    try {
+      fx.connectA();
+      const api = makeFakeApi();
+      const broker = newBroker(fx, api);
+      await settle(fx, broker, api);
+      // Unknown request id (never registered).
+      broker.handleUpdate(cb(`v1:w:${REQUEST_ID_2}:0`));
+      await broker.flushReplies();
+      assert.equal(api.answerPayloads.at(-1).text, copyModule.staleChoiceToast);
+      assert.equal(fx.client.poll(A).commands.length, 0);
+      assert.equal(api.sent.length, 0);
+      // Expired request: pruned before the lookup, never answered.
+      await renderCard(fx, broker, api);
+      fx.advance(CHOICE_TTL_MS + 1);
+      fx.client.heartbeat({ ...A }); // keep alpha live across the jump
+      broker.handleUpdate(cb(`v1:w:${REQUEST_ID}:1`));
+      await broker.flushReplies();
+      assert.equal(api.answerPayloads.at(-1).text, copyModule.staleChoiceToast);
+      assert.equal(fx.client.poll(A).commands.length, 0);
+      assert.equal(api.sent.length, 0);
+      // Post-restart: the registry is memory-only, so the old card is stale.
+      const restarted = newBroker(fx, api);
+      broker.handleUpdate(cb(`v1:W:${REQUEST_ID}`));
+      restarted.handleUpdate(cb(`v1:W:${REQUEST_ID}`));
+      await broker.flushReplies();
+      await restarted.flushReplies();
+      assert.equal(api.answerPayloads.at(-1).text, copyModule.staleChoiceToast);
+      assert.equal(fx.client.poll(A).commands.length, 0);
+      assert.equal(api.sent.length, 0);
+    } finally { fx.close(); }
+  });
+
+  test('a dead or replaced connection only gets the stale toast, drops the row, and a fresh request routes to the new connection', async () => {
+    const fx = makeChoiceCallbackFixture();
+    try {
+      fx.connectA();
+      const api = makeFakeApi();
+      const broker = newBroker(fx, api);
+      await settle(fx, broker, api);
+      // Dead: alpha ages out of the 30s live window while the request is fresh.
+      await renderCard(fx, broker, api);
+      fx.advance(31_000);
+      broker.handleUpdate(cb(`v1:w:${REQUEST_ID}:1`));
+      await broker.flushReplies();
+      assert.equal(api.answerPayloads.at(-1).text, copyModule.staleChoiceToast);
+      assert.equal(fx.client.poll(A).commands.length, 0);
+      assert.equal(api.sent.length, 0);
+      // The dead-session tap DROPPED the row: even a revived session with the
+      // same connection finds the request gone.
+      fx.client.heartbeat({ ...A });
+      broker.handleUpdate(cb(`v1:w:${REQUEST_ID}:1`));
+      await broker.flushReplies();
+      assert.equal(api.answerPayloads.at(-1).text, copyModule.staleChoiceToast);
+      assert.equal(fx.client.poll(A).commands.length, 0);
+      // Replaced: a new connection owns the same tracking id.
+      assert.equal(fx.client.disconnect({ ...A }).ok, true);
+      const client2 = new TuiBridgeClient(fx.store, { staleAfterMs: 30_000 });
+      const newConn = { ...A, connectionId: '9'.repeat(32) };
+      assert.equal(client2.connect({ ...newConn, shortId: 'aaa111', label: 'alpha', pid: 1111, cwd: 'C:/proj/alpha' }).ok, true);
+      await renderCard(fx, broker, api, { requestId: REQUEST_ID_2 });
+      fx.advance(1000);
+      client2.heartbeat(newConn);
+      broker.handleUpdate(cb(`v1:w:${REQUEST_ID}:1`)); // captured connection is gone
+      await broker.flushReplies();
+      assert.equal(api.answerPayloads.at(-1).text, copyModule.staleChoiceToast);
+      assert.equal(client2.poll(newConn).commands.length, 0);
+      assert.equal(api.sent.length, 0);
+      // The NEW request routes to the EXACT current connection only.
+      broker.handleUpdate(cb(`v1:w:${REQUEST_ID_2}:0`));
+      await broker.flushReplies();
+      const commands = client2.poll(newConn).commands;
+      assert.equal(commands.length, 1, 'the live replacement connection must receive the response');
+      assert.deepEqual(commands[0].payload, { requestId: REQUEST_ID_2, index: 0 });
+      assert.equal(fx.client.poll(A).commands.length, 0,
+        'the replaced connection must claim nothing');
+      assert.equal(api.answerPayloads.at(-1).text, copyModule.choiceAnsweredToast);
+    } finally { fx.close(); }
+  });
+
+  test('a duplicate_command enqueue is treated as stale: drop after commit, stale toast, no second command', async () => {
+    const fx = makeChoiceCallbackFixture();
+    try {
+      fx.connectA();
+      const api = makeFakeApi();
+      const broker = newBroker(fx, api);
+      await settle(fx, broker, api);
+      await renderCard(fx, broker, api);
+      // The same deterministic command id is already durable (e.g. a crash
+      // between the commit and the registry drop).
+      const pre = fx.store.enqueueTuiCommand({
+        trackingId: A.trackingId,
+        kind: 'choice_response',
+        payload: { requestId: REQUEST_ID, index: 1 },
+        commandId: `choice_${REQUEST_ID}`,
+      });
+      assert.equal(pre.ok, true);
+      broker.handleUpdate(cb(`v1:w:${REQUEST_ID}:1`));
+      await broker.flushReplies();
+      assert.equal(api.answerPayloads.at(-1).text, copyModule.staleChoiceToast,
+        'a duplicate must NOT be answered with the accepted toast');
+      assert.equal(fx.client.poll(A).commands.length, 1, 'exactly the pre-existing command remains');
+      assert.equal(api.sent.length, 0);
+      // The row was dropped after the commit: a re-tap replays nothing.
+      broker.handleUpdate(cb(`v1:w:${REQUEST_ID}:1`));
+      await broker.flushReplies();
+      assert.equal(api.answerPayloads.at(-1).text, copyModule.staleChoiceToast);
+      assert.equal(fx.client.poll(A).commands.length, 0);
+    } finally { fx.close(); }
+  });
+
+  test('a failed enqueue drops the row after commit and answers only the stale toast', async () => {
+    const fx = makeChoiceCallbackFixture();
+    try {
+      fx.connectA();
+      const api = makeFakeApi();
+      const broker = newBroker(fx, api);
+      await settle(fx, broker, api);
+      await renderCard(fx, broker, api);
+      const original = fx.store.enqueueTuiCommand.bind(fx.store);
+      let failing = true;
+      fx.store.enqueueTuiCommand = (args) => failing
+        ? { ok: false, reason: 'unknown_session' }
+        : original(args);
+      broker.handleUpdate(cb(`v1:w:${REQUEST_ID}:1`));
+      await broker.flushReplies();
+      assert.equal(api.answerPayloads.at(-1).text, copyModule.staleChoiceToast);
+      assert.equal(fx.client.poll(A).commands.length, 0, 'a failed enqueue must leave no command');
+      assert.equal(api.sent.length, 0);
+      // The row was dropped after the committed failure: no retry, no replay.
+      failing = false;
+      broker.handleUpdate(cb(`v1:w:${REQUEST_ID}:1`));
+      await broker.flushReplies();
+      assert.equal(api.answerPayloads.at(-1).text, copyModule.staleChoiceToast);
+      assert.equal(fx.client.poll(A).commands.length, 0);
+    } finally { fx.close(); }
+  });
+
+  test('a throwing transaction rolls back everything: no command, no callback answer, and the row survives', async () => {
+    const fx = makeChoiceCallbackFixture();
+    try {
+      fx.connectA();
+      const api = makeFakeApi();
+      const broker = newBroker(fx, api);
+      await settle(fx, broker, api);
+      await renderCard(fx, broker, api);
+      const original = fx.store.enqueueTuiCommand.bind(fx.store);
+      let failing = true;
+      fx.store.enqueueTuiCommand = (args) => {
+        if (failing) throw new Error('simulated commit failure');
+        return original(args);
+      };
+      const answeredBefore = api.answered.length;
+      assert.throws(() => broker.handleUpdate(cb(`v1:w:${REQUEST_ID}:1`)), /simulated commit failure/);
+      await broker.flushReplies();
+      assert.equal(api.answered.length, answeredBefore,
+        'a rolled-back transaction must not queue a callback answer');
+      assert.equal(api.answerPayloads.length, answeredBefore);
+      assert.equal(fx.client.poll(A).commands.length, 0, 'the rolled-back command must not exist');
+      assert.equal(api.sent.length, 0);
+      // The registry row survived the rollback: the same tap now succeeds.
+      failing = false;
+      broker.handleUpdate(cb(`v1:w:${REQUEST_ID}:1`));
+      await broker.flushReplies();
+      const commands = fx.client.poll(A).commands;
+      assert.equal(commands.length, 1, 'the still-registered request must answer after the rollback');
+      assert.deepEqual(commands[0].payload, { requestId: REQUEST_ID, index: 1 });
+      assert.equal(api.answerPayloads.at(-1).text, copyModule.choiceAnsweredToast);
+    } finally { fx.close(); }
+  });
+
+  test('choice toasts stay bounded and leak-free, and a callback answer failure never replays the command', async () => {
+    const fx = makeChoiceCallbackFixture();
+    try {
+      fx.connectA();
+      const api = makeFakeApi();
+      const broker = newBroker(fx, api);
+      await settle(fx, broker, api);
+      await renderCard(fx, broker, api);
+      api.failNextAnswers(1);
+      broker.handleUpdate(cb(`v1:w:${REQUEST_ID}:1`));
+      await broker.flushReplies();
+      assert.equal(fx.client.poll(A).commands.length, 1,
+        'the command is already durable; a failed toast answer never replays it');
+      broker.handleUpdate(cb(`v1:w:${REQUEST_ID}:1`)); // row dropped: no replay either
+      await broker.flushReplies();
+      assert.equal(fx.client.poll(A).commands.length, 0);
+      for (const toast of [copyModule.choiceAnsweredToast, copyModule.choiceCancelledToast, copyModule.staleChoiceToast]) {
+        assert.ok(toast.length <= 200, 'every toast must fit answerCallbackQuery');
+        assert.ok(!toast.includes(REQUEST_ID), 'no request id may leak into a toast');
+        assert.ok(!toast.includes(A.trackingId), 'no tracking id may leak into a toast');
+        assert.ok(!toast.includes(A.connectionId), 'no connection id may leak into a toast');
+      }
     } finally { fx.close(); }
   });
 });
