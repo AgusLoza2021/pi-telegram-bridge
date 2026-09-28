@@ -177,6 +177,21 @@ describe('selective extension packaging', () => {
     }
   });
 
+  test('install/uninstall notice contract: full restart required, /reload alone not sufficient', () => {
+    // The notice lives in the shared PowerShell source and the uninstall
+    // early return; both must demand a FULL close+reopen because the
+    // extension has multiple runtime modules a /reload can mix.
+    const common = readFileSync(COMMON_PS1, 'utf8');
+    assert.match(common, /FULLY CLOSED and REOPENED/i);
+    assert.match(common, /\/reload alone is NOT sufficient/);
+    assert.match(common, /multiple runtime modules/i);
+    const uninstall = readFileSync(
+      join(MODULE_ROOT, 'scripts', 'uninstall-selective-extension.ps1'), 'utf8',
+    );
+    assert.match(uninstall, /fully closed and reopened/i);
+    assert.match(uninstall, /\/reload alone is not sufficient/i);
+  });
+
   describe('live PowerShell enumeration (read-only)', { skip: process.platform !== 'win32' }, () => {
     function enumerateLivePayloadMap() {
       return new Promise((resolvePromise) => {

@@ -44,7 +44,7 @@ if (-not (Test-Path -LiteralPath $destination)) {
             Write-Host "Manifest still records a prior backup (kept for reference): $previous"
         }
     }
-    Write-Host 'Already-running Pi instances need /reload only if they loaded the extension this session.'
+    Write-Host 'If a previous run removed the extension, any Pi window still running must be fully closed and reopened; /reload alone is not sufficient.'
     return
 }
 

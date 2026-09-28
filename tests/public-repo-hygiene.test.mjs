@@ -456,7 +456,12 @@ describe('public repository hygiene', () => {
     const advanced = read('docs/ADVANCED.md');
     assert.match(advanced, /2–4 options/);
     assert.match(advanced, /30 minutes/);
-    assert.match(advanced, /`\/reload`/);
+    // Upgrade coherence is a FULL process restart; '/reload' alone is never
+    // sufficient (mixed-version incident). The only surviving '/reload'
+    // mention is the truthful one: a reload interrupts a pending tool.
+    assert.match(advanced, /fully closed and reopened/i);
+    assert.match(advanced, /`\/reload` alone is not sufficient/i);
+    assert.doesNotMatch(advanced, /needs `\/reload` to discover or update/i);
     for (const boundary of [
       'provider-owned consent',
       'Gentle AI review consent',
@@ -491,6 +496,41 @@ describe('public repository hygiene', () => {
     assert.match(quickstart, /Cancel this question/);
     assert.match(quickstart, /30 minutos/);
     assert.match(quickstart, /no es una respuesta/i);
+  });
+
+  test('upgrade guidance pins the full-restart policy and rejects stale /reload claims', () => {
+    const readme = read('README.md');
+    const quickstart = read('QUICKSTART.es.md');
+    const advanced = read('docs/ADVANCED.md');
+    // Every upgrade/install/removal surface says: fully close and reopen Pi.
+    assert.match(readme, /close it completely and open it again/i);
+    assert.match(readme, /fully close and reopen/i);
+    assert.match(quickstart, /ciérralo por completo y vuelve a abrirlo/i);
+    assert.match(quickstart, /cierra Pi por completo y vuelve a abrirlo/i);
+    assert.match(advanced, /fully closed and reopened/i);
+    // '/reload' alone must be named as insufficient, in the reader's language.
+    assert.match(readme, /`\/reload` alone is not (enough|sufficient)/i);
+    assert.match(quickstart, /con `\/reload` solo no alcanza/i);
+    assert.match(advanced, /`\/reload` alone is not sufficient/i);
+    // Stale upgrade claims must not survive anywhere in the public docs.
+    for (const [name, text] of [
+      ['README', readme],
+      ['QUICKSTART.es', quickstart],
+      ['ADVANCED', advanced],
+    ]) {
+      assert.doesNotMatch(text, /`\/reload` once after an install or upgrade/i, `${name} stale claim`);
+      assert.doesNotMatch(text, /may need `\/reload` once/i, `${name} stale claim`);
+      assert.doesNotMatch(text, /needs? `\/reload` to discover or update/i, `${name} stale claim`);
+      assert.doesNotMatch(text, /puede necesitar `\/reload`/i, `${name} stale claim`);
+      assert.doesNotMatch(text, /type `\/reload` in any open Pi window/i, `${name} stale claim`);
+      assert.doesNotMatch(text, /escribe `\/reload` una vez/i, `${name} stale claim`);
+    }
+    // The truthful, upgrade-unrelated '/reload' mention survives: a pending
+    // tool IS interrupted by a reload (ADVANCED deadline contract).
+    assert.match(advanced, /`\/reload`/);
+    // Restart guidance for the remote-choice card and the /tg command.
+    assert.match(readme, /Fully close and reopen Pi, then run `\/tg`/);
+    assert.match(advanced, /then run `\/tg`/);
   });
 
   test('README pins the remote choice buttons and the Cancel row', () => {

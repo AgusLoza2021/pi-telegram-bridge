@@ -294,15 +294,19 @@ function Copy-SelectiveDirectoryContents {
 
 <#
 .SYNOPSIS
-Shared reload/inert notice printed by install and uninstall: running Pi
-instances must /reload; NEW Pi instances auto-discover the extension and
-start disconnected until the owner turns the phone connection on and
-links the window with /tg.
+Shared post-change notice printed by install and uninstall: already-running
+Pi windows must be FULLY CLOSED and REOPENED; '/reload' alone is NOT
+sufficient because the extension has multiple runtime modules and a reload
+can mix old cached modules with new ones in one process. NEW Pi windows
+auto-discover the extension and start disconnected until the owner turns
+the phone connection on and links the window with /tg.
 #>
 function Write-SelectiveReloadNotice {
     Write-Host ''
-    Write-Host 'NOTE: already-running Pi instances need /reload to pick up this change.'
-    Write-Host 'New Pi instances auto-discover the extension and start DISCONNECTED:'
+    Write-Host 'NOTE: already-running Pi windows must be FULLY CLOSED and REOPENED after this change.'
+    Write-Host '/reload alone is NOT sufficient: the extension has multiple runtime modules,'
+    Write-Host 'and a reload can leave old and new modules mixed in one process.'
+    Write-Host 'New Pi windows auto-discover the extension and start DISCONNECTED:'
     Write-Host 'nothing connects to Telegram until you turn the phone connection on, either with "telegram on" or with the start offer at the end of an advanced setup,'
     Write-Host 'and /tg links this window once it is on.'
 }

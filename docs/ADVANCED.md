@@ -64,7 +64,7 @@ Troubleshooting:
 
 | Symptom | Meaning |
 |---|---|
-| The card never appears after an upgrade | An already-running Pi window needs `/reload` to discover or update the extension; new windows pick it up automatically. |
+| The card never appears after an upgrade | Fully close and reopen every Pi window that was already running, then run `/tg` again. `/reload` alone is not sufficient: the extension has multiple runtime modules, and a reload can mix old and new modules in one process. New windows pick it up automatically. |
 | The tap answers "That question is out of date." | The request expired (30-minute deadline), was already answered, or the Pi window was replaced. Pi asks again if it still needs the answer. |
 | Typing a reply does nothing | Plain text never answers a pending choice; only the card's buttons do. |
 | A second question is refused | One pending request per window — answer or cancel the current one first. |
@@ -142,7 +142,7 @@ scripts/uninstall-selective-extension.ps1
 
 Installation stages a fixed four-file runtime payload, verifies hashes, rejects reparse-point escapes, writes a generated state-directory binding, and backs up any prior dedicated installation. Uninstall restores that prior installation when available and does not modify Pi settings.
 
-Already-running Pi windows need `/reload` after installation or removal. New windows discover the extension automatically and still start disconnected.
+After an installation, update, rollback or removal, every Pi window that was already running must be fully closed and reopened — `/reload` alone is not sufficient because the extension has multiple runtime modules. New windows discover the extension automatically and still start disconnected.
 
 ## State, logs, and backups
 
@@ -166,7 +166,7 @@ scripts/uninstall-broker-service.ps1
 scripts/uninstall-selective-extension.ps1
 ```
 
-Then type `/reload` in any open Pi window.
+Then fully close and reopen any open Pi window.
 
 This removes only the dedicated scheduled task and extension installation. Credentials, runtime state, logs, and dated backups remain under `.local/` so the operation is reversible.
 

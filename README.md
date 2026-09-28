@@ -96,7 +96,7 @@ If anything fails along the way, your previous settings are kept safe and nothin
 
 The bridge is installed, but every Pi window stays **disconnected until you link it** — this is deliberate.
 
-1. Open Pi in a terminal on your PC. If Pi was already open during setup, type `/reload` once so it discovers the new helper.
+1. Open Pi in a terminal on your PC. If Pi was already open during setup, close it completely and open it again so it loads the new helper — `/reload` alone is not enough.
 2. Type `/tg` and choose **Connect** in the confirmation that appears.
 3. Send a normal text message to your bot from your phone.
 
@@ -156,7 +156,7 @@ On the PC:
 - `/tg` opens the connection controls for that Pi window.
 - `/tg off` disconnects that Pi window.
 - Every new Pi window starts disconnected. Link only the windows you want available from your phone.
-- Pi windows that were already running may need `/reload` once after an install or upgrade.
+- After an install or upgrade, fully close and reopen any Pi windows that were already running; `/reload` alone is not sufficient because the helper has several runtime modules.
 - To send a picture **from your PC to your phone**, see [Send a picture to your phone](#send-a-picture-to-your-phone).
 
 ### When Pi asks you a question
@@ -172,7 +172,7 @@ The rules that keep this predictable:
 - One question at a time per Pi window, and each question expires after 30 minutes. Nothing arrives on Telegram when a question expires — the tool simply times out on the PC. Only if you tap an out-of-date card does the bot answer with the fixed out-of-date toast; Pi asks again if it still needs an answer.
 - Typing text while a question is pending is **not** an answer — the buttons on the card are the only way to answer it.
 - This is for ordinary workflow choices of the current task. Permissions, approvals, security prompts and everything else Pi shows on the PC screen never become Telegram buttons.
-- If the question never appears after an upgrade, an already-open Pi window may need `/reload` once — the same rule as any other upgrade, under [the Projects section](#the-projects-dashboard-your-project-library).
+- If the question never appears after an upgrade, fully close and reopen Pi, then run `/tg` again — the same rule as any other upgrade, under [the Projects section](#the-projects-dashboard-your-project-library).
 
 ## Send a picture to your phone
 
@@ -241,7 +241,7 @@ Find your symptom, then follow the matching action. A failed setup never replace
 | Setup says the token did not work | Get the current token from BotFather using `/token` or `/mybots`, then copy and paste it again. |
 | The QR code expired or will not scan | Close setup and run `Setup Pi Telegram.cmd` again for a fresh code. Raise the screen brightness and move the phone closer. |
 | The QR link opens a web page | Open Telegram directly, search for your bot username, tap **Start**, then run setup again. |
-| `/tg` does not exist in Pi | Type `/reload`, or restart Pi if it was already open during setup. |
+| `/tg` does not exist in Pi | Fully close and reopen Pi, then run `/tg`. An install or upgrade needs a full restart; `/reload` alone is not sufficient. |
 | `/tg` says the phone connection is unavailable | The background connection is off. Open a Command Prompt in your setup folder, run `telegram on`, then send your message again. |
 | The bot says no Pi is connected | Open Pi on the PC, type `/tg`, and choose **Connect**. |
 | The bot does not answer | Make sure the PC is awake and online, then check the background connection: run `telegram status` in your setup folder, and `telegram on` if it is off. |

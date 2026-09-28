@@ -2009,3 +2009,81 @@ describe('silent choice dispatch: exact binding, no events, no fabricated answer
     } finally { await pending.fx.cleanup(); }
   });
 });
+
+// --- Mixed-version runtime guard (restart_required) -------------------------
+//
+// Production incident: after install + /reload a NEW extension instance was
+// wired to OLD cached runtime modules (old beginner-copy.mjs without
+// containsCredentialShape, old TuiBridgeClient/Store), and the choice tool
+// crashed with a raw `containsCredentialShape is not a function` TypeError.
+// The contract below pins the guard: a mixed runtime must refuse with the
+// fixed compact `restart_required` JSON BEFORE any credential scan,
+// sanitization, helper call or publish — no event, no pending state, no
+// timer, no leaked ids/paths/raw errors.
+describe('telegram_ask_user_choice mixed-runtime guard (restart_required)', () => {
+  /** Calls the tool and resolves false if it is still pending after 250ms
+   *  (pre-guard behavior: publish + block) so RED fails fast, never hangs. */
+  async function callRefusingFast(fx, params) {
+    const toolPromise = callChoiceTool(fx, params, undefined);
+    const refused = await Promise.race([
+      toolPromise.then(() => true),
+      settleDelay(250).then(() => false),
+    ]);
+    return { toolPromise, refused };
+  }
+
+  test('injected mixed runtime: fixed restart_required JSON, nothing published, no pending state, no timer', async () => {
+    const inj = { ...makeChoiceInjections(), choiceRuntimeReady: () => false };
+    const fx = makeFixture({ selectAnswer: 'Connect', injections: inj });
+    try {
+      await fx.run('tg', '');
+      const { toolPromise, refused } = await callRefusingFast(fx, choiceParams());
+      assert.equal(
+        refused,
+        true,
+        'a mixed runtime must refuse immediately instead of publishing and blocking',
+      );
+      const result = await toolPromise;
+      assertChoiceResult(result, { status: 'refused', reason: 'restart_required' });
+      assert.equal(choiceRequestEvents(fx).length, 0, 'no choice request may be published');
+      assert.equal(inj.scheduled.length, 0, 'no deadline timer may be armed');
+      assert.equal(inj.cleared.length, 0, 'nothing scheduled means nothing to clear');
+      const p = fx.probe();
+      assert.equal(p.sessions()[0].state, 'connected', 'no pending choice may flip state to waiting');
+      p.close();
+    } finally { await fx.cleanup(); }
+  });
+
+  test('guard precedes the credential scan: restart_required even for credential-shaped input', async () => {
+    const inj = { ...makeChoiceInjections(), choiceRuntimeReady: () => false };
+    const fx = makeFixture({ selectAnswer: 'Connect', injections: inj });
+    try {
+      await fx.run('tg', '');
+      const secret = 'ghp_' + 'a'.repeat(25);
+      const { toolPromise, refused } = await callRefusingFast(fx, choiceParams({
+        question: `use ${secret} now?`,
+      }));
+      assert.equal(refused, true, 'the guard must fire before any credential scan');
+      const result = await toolPromise;
+      assertChoiceResult(result, { status: 'refused', reason: 'restart_required' });
+      assert.equal(choiceRequestEvents(fx).length, 0);
+    } finally { await fx.cleanup(); }
+  });
+
+  test('refusal result leaks nothing: no ids, paths or raw errors in text or details', async () => {
+    const inj = { ...makeChoiceInjections(), choiceRuntimeReady: () => false };
+    const fx = makeFixture({ selectAnswer: 'Connect', injections: inj });
+    try {
+      await fx.run('tg', '');
+      const { toolPromise, refused } = await callRefusingFast(fx, choiceParams());
+      assert.equal(refused, true);
+      const result = await toolPromise;
+      const text = result.content[0].text;
+      assert.ok(!text.includes(fx.stateDirectory));
+      assert.ok(!text.includes(fx.sqlitePath));
+      assert.ok(!text.includes(REQUEST_ID));
+      assert.doesNotMatch(text, /error|exception|typeerror/i);
+      assert.deepEqual(result.details, { status: 'refused', reason: 'restart_required' });
+    } finally { await fx.cleanup(); }
+  });
+});

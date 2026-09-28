@@ -64,7 +64,7 @@ Si algo falla, tu configuración anterior queda intacta y no se guarda nada a me
 
 Cada ventana de Pi queda **desconectada hasta que tú la vincules** — esto es intencional.
 
-1. Abre Pi en una terminal de tu PC. Si Pi ya estaba abierto durante la configuración, escribe `/reload` una vez para que descubra el auxiliar nuevo.
+1. Abre Pi en una terminal de tu PC. Si Pi ya estaba abierto durante la configuración, ciérralo por completo y vuelve a abrirlo para que cargue el auxiliar nuevo; con `/reload` solo no alcanza.
 2. Escribe `/tg` y elige **Connect** en la confirmación que aparece.
 3. Envía un mensaje de texto normal a tu bot desde el teléfono.
 
@@ -128,7 +128,7 @@ Reglas simples:
 - Solo hay **una pregunta a la vez por ventana de Pi**, y cada pregunta vence a los **30 minutos**. Cuando vence no llega ningún mensaje de Telegram: la herramienta simplemente agota su tiempo en la PC. Solo si tocas una tarjeta vencida responde el bot con el aviso fijo de pregunta desactualizada; Pi vuelve a preguntar si todavía lo necesita.
 - **Escribir texto no es una respuesta.** Mientras una pregunta está pendiente, la única forma de responderla es con los botones de la propia tarjeta.
 - Esto sirve solo para decisiones normales de la tarea en curso. Los permisos, aprobaciones y avisos de seguridad que Pi muestra en la pantalla de la PC nunca se convierten en botones de Telegram.
-- Si actualizaste el puente y la pregunta no aparece, la ventana de Pi que ya estaba abierta puede necesitar `/reload` una vez — la misma regla de siempre después de instalar o actualizar.
+- Si actualizaste el puente y la pregunta no aparece, cierra Pi por completo y vuelve a abrirlo, y después escribe `/tg` de nuevo. Con `/reload` solo no alcanza: hace falta cerrar y abrir Pi después de instalar o actualizar.
 
 En la PC, esta función es la herramienta interna `telegram_ask_user_choice` de la extensión. No necesitas hacer nada con ella: aparece sola cuando Pi pregunta. Los comandos siguen siendo parte de la capa avanzada.
 

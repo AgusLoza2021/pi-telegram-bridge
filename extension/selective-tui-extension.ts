@@ -52,7 +52,7 @@ import { randomBytes } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import type { ExtensionAPI, ExtensionContext } from '@earendil-works/pi-coding-agent';
 import { Type } from 'typebox';
-import { Store } from '../src/store.mjs';
+import { Store, TUI_COMMAND_KINDS, TUI_EVENT_KINDS } from '../src/store.mjs';
 import { TuiBridgeClient } from '../src/tui-bridge-client.mjs';
 import {
   choiceQuestionText,
@@ -125,6 +125,32 @@ interface ChoiceToolResult {
 interface RefusedChoiceResult {
   status: 'refused';
   reason: string;
+}
+
+/**
+ * Default runtime capability probe for the remote choice tool. The
+ * extension ships as SEVERAL runtime modules, so after an install, update
+ * or removal a `/reload` can leave a NEW extension instance wired to OLD
+ * cached modules (production incident: a fresh selective-tui-extension.ts
+ * calling an old cached beginner-copy.mjs threw
+ * `containsCredentialShape is not a function`; old TuiBridgeClient/Store
+ * copies were loaded alongside it). Before any remote-choice helper call,
+ * publish or credential scan, the whole call surface is re-verified:
+ * - the imported beginner-copy helpers exist as functions;
+ * - the connected client exposes both choice methods as functions;
+ * - the imported protocol kind tables include both choice kinds.
+ * Any mismatch means a mixed-version runtime: the caller must refuse with
+ * a fixed `restart_required` result instead of throwing raw errors.
+ */
+function defaultChoiceRuntimeReady(c: BridgeConnection): boolean {
+  return (
+    typeof containsCredentialShape === 'function'
+    && typeof choiceQuestionText === 'function'
+    && typeof c.client.publishChoiceRequest === 'function'
+    && typeof c.client.settleChoiceResponse === 'function'
+    && TUI_EVENT_KINDS.includes('choice_request')
+    && TUI_COMMAND_KINDS.includes('choice_response')
+  );
 }
 
 type ChoiceToolPayload = ChoiceToolResult | RefusedChoiceResult;
@@ -578,6 +604,8 @@ interface T3BChoiceInjections {
   requestIdFactory?: () => string;
   scheduleChoiceTimeout?: (callback: () => void, ms: number) => unknown;
   clearChoiceTimeout?: (handle: unknown) => void;
+  /** Test-only override of the mixed-runtime capability probe. */
+  choiceRuntimeReady?: (c: BridgeConnection) => boolean;
 }
 
 export class SelectiveTuiBridgeExtension {
@@ -594,6 +622,7 @@ export class SelectiveTuiBridgeExtension {
   #newRequestId: () => string;
   #scheduleChoiceTimeout: (callback: () => void, ms: number) => unknown;
   #clearChoiceTimeout: (handle: unknown) => void;
+  #choiceRuntimeReady: (c: BridgeConnection) => boolean;
   #pendingChoice: PendingChoiceRequest | null = null;
   #choiceTimerHandle: unknown = null;
 
@@ -613,6 +642,7 @@ export class SelectiveTuiBridgeExtension {
       });
     this.#clearChoiceTimeout = choiceInjections.clearChoiceTimeout
       ?? ((handle) => clearTimeout(handle as ReturnType<typeof setTimeout>));
+    this.#choiceRuntimeReady = choiceInjections.choiceRuntimeReady ?? defaultChoiceRuntimeReady;
   }
 
   register(pi: ExtensionAPI): void {
@@ -1427,6 +1457,13 @@ export class SelectiveTuiBridgeExtension {
 
     const c = this.#connection;
     if (!c) return refused('not_linked');
+
+    // Mixed-runtime guard, BEFORE any credential scan, sanitization,
+    // helper call or publish: a `/reload` after an install/update/removal
+    // can wire this instance to stale cached modules. Refuse with the
+    // fixed compact JSON — no event, no pending state, no timer, no
+    // leaked ids/paths/raw errors. A full Pi process restart is required.
+    if (!this.#choiceRuntimeReady(c)) return refused('restart_required');
 
     // One pending choice per instance: a second concurrent call is refused.
     if (this.#pendingChoice) return refused('busy');
