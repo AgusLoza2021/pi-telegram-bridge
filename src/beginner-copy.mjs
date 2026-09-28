@@ -58,8 +58,10 @@ const PREBUILT_PREFIXED_RE = new RegExp(
  * ids (long hex tokens), pid mentions, filesystem paths and jargon words.
  * Pure input hygiene — callers pass broker labels, but a hostile or buggy
  * label still cannot smuggle internals into beginner-visible text.
+ * `stripJargon: false` keeps the same structural hygiene for copy where
+ * those words can be legitimate content (see the choice-card section).
  */
-function sanitizeLabelPart(raw) {
+function sanitizeLabelPart(raw, { stripJargon = true } = {}) {
   let text = typeof raw === 'string' ? raw : '';
   // A leading state circle is presentation, never identity (F5).
   text = text.replace(LEADING_STATE_CIRCLES_RE, ' ');
@@ -68,7 +70,7 @@ function sanitizeLabelPart(raw) {
   text = text.replace(/\bpid\s*[=:#]?\s*\d+\b/gi, ' ');
   text = text.replace(/[A-Za-z]:[\\/][^\s]*/g, ' ');
   text = text.replace(/(^|[\s·(])[\\/][^\s]*/g, ' ');
-  text = text.replace(JARGON_RE, ' ');
+  if (stripJargon) text = text.replace(JARGON_RE, ' ');
   return text
     .replace(/\s+/g, ' ')
     // Stripping fragments can orphan the `·` separators that surrounded
@@ -461,6 +463,147 @@ export function eventCommandResult(rawLabel, ok, resultCode) {
     ? clip(resultCode, 64)
     : 'failed';
   return `${displayLabel(rawLabel)} — command failed (${code}).`;
+}
+
+// --- remote ordinary choice card (T2A) ---------------------------------------
+//
+// Pure copy/sanitization for the bridge-owned `telegram_ask_user_choice`
+// flow (the remote ordinary choice feature document). The broker
+// (T2B) renders these builders and screens every card with
+// `containsCredentialShape`; this module owns no state, callbacks or
+// transport.
+//
+// Hygiene note: choice copy is the Pi agent's ordinary technical question,
+// so words like SQLite or argv can be legitimate CONTENT here. The hazard
+// list for this copy is the V1 contract's leak list — cwd/paths, tg ids,
+// long hex ids, pid mentions and credential shapes — not the session-label
+// jargon list, so the builders reuse the same hygiene WITHOUT the jargon
+// strip.
+
+/** Question and rendered-option-line budget in Unicode code points. */
+export const MAX_CHOICE_QUESTION_CHARS = 500;
+
+/**
+ * Pinned once: tests and docs/BEGINNER_UX.md quote this sentence — change
+ * them together. An ordinary choice card must say plainly that it is not
+ * a permission, approval or security prompt.
+ */
+export const CHOICE_NOT_PERMISSION_SENTENCE =
+  'This is an ordinary workflow choice for the current task — not a permission, '
+  + 'approval or security prompt.';
+
+/** The card's cancel row label. */
+export const CHOICE_BUTTON_CANCEL = 'Cancel this question';
+
+/**
+ * Fixed toasts (answerCallbackQuery text, inside Telegram's 200-char cap):
+ * a stale/expired request, an accepted answer and an explicit cancel.
+ */
+export const staleChoiceToast =
+  'That question is out of date. Pi will ask again if it still needs an answer.';
+export const choiceAnsweredToast =
+  'Answer received. Pi is continuing with your choice.';
+export const choiceCancelledToast =
+  'Okay — the question was cancelled. Nothing was chosen.';
+
+/**
+ * Plain-text guard shown while a choice request is pending: the buttons on
+ * the card above are the ONLY way to answer.
+ */
+export const choicePendingPlain =
+  'Pi asked you a question above. Use the buttons on that question to answer it — '
+  + 'typing here is not an answer.';
+
+/**
+ * Credential shapes mirrored EXACTLY from src/policy.mjs `containsSensitive`
+ * (GitHub PAT/OAuth, OpenAI-style keys, AWS access key ids, Telegram bot
+ * tokens, Bearer JWTs, PEM private keys). Intentionally duplicated instead
+ * of imported: this module is packaged into the Pi extension, which must
+ * not import broker modules.
+ */
+const CREDENTIAL_SHAPE_PATTERNS = [
+  /\bghp_[A-Za-z0-9]{20,}\b/, // GitHub PAT
+  /\bgho_[A-Za-z0-9]{20,}\b/, // GitHub OAuth
+  /\bsk-[A-Za-z0-9_-]{20,}\b/, // OpenAI-style secret keys
+  /\bAKIA[0-9A-Z]{16}\b/, // AWS access key id
+  /[0-9]{5,10}:[A-Za-z0-9_-]{30,}/, // Telegram-style bot token
+  /\bBearer\s+[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/, // JWT
+  /-----BEGIN [A-Z ]*PRIVATE KEY-----/, // PEM private keys
+];
+
+/** True when the text carries a credential shape; non-strings are clean. */
+export function containsCredentialShape(text) {
+  if (typeof text !== 'string') return false;
+  return CREDENTIAL_SHAPE_PATTERNS.some((pattern) => pattern.test(text));
+}
+
+/** Sanitize one piece of choice copy: identity hygiene, no jargon strip. */
+function sanitizeChoicePart(raw) {
+  return sanitizeLabelPart(stripLoneSurrogates(raw), { stripJargon: false });
+}
+
+/** The agent's question, sanitized and bounded to 500 code points. */
+export function choiceQuestionText(raw) {
+  return clipToCodePoints(sanitizeChoicePart(raw), MAX_CHOICE_QUESTION_CHARS);
+}
+
+/** Sanitized option label, or null when the caller must apply the fallback. */
+function choiceOptionName(raw) {
+  const sanitized = sanitizeChoicePart(raw);
+  return sanitized.length > 0 ? sanitized : null;
+}
+
+/**
+ * One rendered option line `N. Label — Description`. A sanitized-empty
+ * description drops the dash; a sanitized-empty label falls back to
+ * `Option N`. Bounded to 500 code points without splitting a surrogate pair.
+ */
+export function choiceOptionText(index, label, description) {
+  const n = Number.isInteger(index) && index >= 0 ? index : 0;
+  const name = choiceOptionName(label) ?? `Option ${n + 1}`;
+  const desc = typeof description === 'string' ? sanitizeChoicePart(description) : '';
+  const line = desc.length > 0 ? `${n + 1}. ${name} — ${desc}` : `${n + 1}. ${name}`;
+  return clipToCodePoints(line, MAX_CHOICE_QUESTION_CHARS);
+}
+
+/**
+ * One inline-button label `N. Label` with the same hygiene and fallback,
+ * always inside Telegram's button-text cap.
+ */
+export function choiceOptionButton(index, label) {
+  const n = Number.isInteger(index) && index >= 0 ? index : 0;
+  const name = choiceOptionName(label) ?? `Option ${n + 1}`;
+  return clipToCodePoints(`${n + 1}. ${name}`, MAX_BUTTON_TEXT_CHARS);
+}
+
+/**
+ * Assemble the full choice card, or return null for any input that would
+ * not render safely: a missing/blank header, a question that sanitizes
+ * empty, a non-array option list, a list outside the 2..4 band, or any
+ * option that is not a plain object. The header always goes through the
+ * identity logic (`displayLabel`), never raw concatenation.
+ */
+export function choiceCard({ header, question, options } = {}) {
+  if (typeof header !== 'string' || header.trim().length === 0) return null;
+  const headerText = displayLabel(header);
+  const questionText = choiceQuestionText(question);
+  if (questionText.length === 0) return null;
+  if (!Array.isArray(options) || options.length < 2 || options.length > 4) return null;
+  const lines = [];
+  for (let index = 0; index < options.length; index++) {
+    const option = options[index];
+    if (option === null || typeof option !== 'object' || Array.isArray(option)) return null;
+    lines.push(choiceOptionText(index, option.label, option.description));
+  }
+  return [
+    headerText,
+    '',
+    questionText,
+    '',
+    ...lines,
+    '',
+    CHOICE_NOT_PERMISSION_SENTENCE,
+  ].join('\n');
 }
 
 // --- /help and friendly errors (BEGINNER_UX.md section 11) -------------------

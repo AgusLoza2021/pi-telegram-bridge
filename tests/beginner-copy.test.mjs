@@ -791,3 +791,227 @@ describe('beginner copy: per-session /alias (T4C2)', () => {
       'the advanced command table must list /alias <name>');
   });
 });
+
+describe('beginner copy: remote ordinary choice card (T2)', () => {
+  const HEADER = '🟫 Pi · alpha';
+
+  test('the fixed choice copy constants are stable, bounded and jargon-free', () => {
+    assert.equal(
+      copyModule.CHOICE_NOT_PERMISSION_SENTENCE,
+      'This is an ordinary workflow choice for the current task — not a permission, '
+      + 'approval or security prompt.',
+    );
+    assert.ok(
+      copyModule.CHOICE_NOT_PERMISSION_SENTENCE.includes('not a permission'),
+      'the card must say plainly that this is not a permission/approval prompt',
+    );
+    assert.equal(copyModule.CHOICE_BUTTON_CANCEL, 'Cancel this question');
+    for (const toast of [
+      copyModule.staleChoiceToast,
+      copyModule.choiceAnsweredToast,
+      copyModule.choiceCancelledToast,
+    ]) {
+      assert.ok(typeof toast === 'string' && toast.length > 0 && toast.length <= 200,
+        'every choice toast must fit the answerCallbackQuery 200-char cap');
+      for (const word of JARGON) {
+        assert.doesNotMatch(toast, new RegExp(word.replace(' ', '\\s+'), 'i'),
+          `jargon "${word}" leaked into a choice toast`);
+      }
+    }
+    assert.equal(
+      copyModule.choicePendingPlain,
+      'Pi asked you a question above. Use the buttons on that question to answer it — '
+      + 'typing here is not an answer.',
+    );
+  });
+
+  test('choiceCard assembles header, question, numbered sanitized options and the not-permission sentence', () => {
+    const text = copyModule.choiceCard({
+      header: HEADER,
+      question: 'Which database should we ship?',
+      options: [
+        { label: 'SQLite local', description: 'Zero-config file' },
+        { label: 'Postgres', description: 'Managed server' },
+      ],
+    });
+    assert.equal(text, [
+      HEADER,
+      '',
+      'Which database should we ship?',
+      '',
+      '1. SQLite local — Zero-config file',
+      '2. Postgres — Managed server',
+      '',
+      copyModule.CHOICE_NOT_PERMISSION_SENTENCE,
+    ].join('\n'));
+  });
+
+  test('choiceCard refuses option lists outside the 2..4 band and empty questions', () => {
+    for (const count of [0, 1, 5]) {
+      const options = Array.from({ length: count }, (_, i) => ({ label: `o${i}`, description: 'd' }));
+      assert.equal(
+        copyModule.choiceCard({ header: HEADER, question: 'q?', options }),
+        null,
+        `${count} options must refuse to render`,
+      );
+    }
+    assert.equal(copyModule.choiceCard({ header: HEADER, question: '   ', options: [
+      { label: 'a', description: 'd' }, { label: 'b', description: 'd' },
+    ] }), null);
+    assert.equal(copyModule.choiceCard({ header: HEADER, question: 'q?', options: 'two' }), null);
+  });
+
+  test('choice question, option lines and buttons are sanitized and bounded', () => {
+    // Long hex tokens (16+), drive paths, leading /paths and tg: tokens never survive.
+    assert.equal(copyModule.choiceQuestionText(`Pick one ${'a'.repeat(16)}`), 'Pick one');
+    assert.equal(copyModule.choiceQuestionText('C:/secret/path thing'), 'thing');
+    assert.equal(copyModule.choiceQuestionText('tg:abc123 keep me'), 'keep me');
+    assert.equal(copyModule.choiceQuestionText('x'.repeat(600)).length,
+      copyModule.MAX_CHOICE_QUESTION_CHARS);
+    assert.equal(copyModule.choiceQuestionText('What now?'), 'What now?');
+    assert.equal(copyModule.choiceOptionText(1, 'Postgres', 'Managed server'),
+      '2. Postgres — Managed server');
+    assert.equal(copyModule.choiceOptionText(0, 'OnlyLabel', ''), '1. OnlyLabel');
+    assert.equal(copyModule.choiceOptionButton(0, `Opt ${'b'.repeat(16)}`), '1. Opt');
+    assert.equal(copyModule.choiceOptionButton(2, ''), '3. Option 3');
+    assert.ok(copyModule.choiceOptionButton(1, 'L'.repeat(200)).length <= MAX_BUTTON_TEXT_CHARS,
+      'an option button must fit one Telegram button');
+    assert.ok(copyModule.choiceOptionText(3, 'L'.repeat(200), 'D'.repeat(400))
+      .length < 600, 'an option card line stays bounded');
+  });
+
+  test('containsCredentialShape mirrors the transport credential screening', () => {
+    const secrets = [
+      'token ghp_A1b2C3d4E5f6G7h8I9j0Kk',
+      'key sk-A1b2C3d4E5f6G7h8I9j0KkLm',
+      'id AKIAIOSFODNN7EXAMPLE',
+      '1234567890:AAHaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+      'Bearer eyJhbGc.eyJzdWI.sig',
+      '-----BEGIN RSA PRIVATE KEY-----',
+    ];
+    for (const secret of secrets) {
+      assert.equal(copyModule.containsCredentialShape(secret), true, `must refuse: ${secret.slice(0, 12)}`);
+      assert.equal(copyModule.containsCredentialShape(`label with ${secret} inside`), true);
+    }
+    for (const clean of [
+      'Which database should we ship?',
+      'Postgres — Managed server, richer types',
+      'ship it on Friday',
+      '',
+      null,
+      undefined,
+      42,
+    ]) {
+      assert.equal(copyModule.containsCredentialShape(clean), false);
+    }
+  });
+
+  test('choiceCard rejects malformed option entries and never renders a partial card', () => {
+    for (const badOptions of [
+      [null, { label: 'a', description: 'd' }],
+      [{ label: 'a', description: 'd' }, 'not-an-object'],
+      [{ label: 'a', description: 'd' }, 42],
+      [{ label: 'a', description: 'd' }, ['a', 'b']],
+    ]) {
+      assert.equal(
+        copyModule.choiceCard({ header: HEADER, question: 'q?', options: badOptions }),
+        null,
+        'a non-plain-object option must refuse the whole card',
+      );
+    }
+    // A plain object with a non-string label is still a valid entry: the
+    // label falls back, and extra local-only fields (e.g. `value`) never render.
+    const withValue = copyModule.choiceCard({
+      header: HEADER,
+      question: 'q?',
+      options: [
+        { label: 'a', description: 'd', value: 'local-only-value' },
+        { label: 7, description: 'd' },
+      ],
+    });
+    assert.ok(withValue.includes('1. a — d'));
+    assert.equal(withValue.includes('local-only-value'), false,
+      'the local option value must never enter Telegram text');
+    assert.ok(withValue.includes('2. Option 2'));
+  });
+
+  test('lone surrogates never survive any choice builder output', () => {
+    const dirty = 'a \uD800 b \uDC00 c';
+    const outputs = [
+      copyModule.choiceQuestionText(dirty),
+      copyModule.choiceOptionText(0, dirty, dirty),
+      copyModule.choiceOptionButton(0, dirty),
+      copyModule.choiceCard({
+        header: dirty,
+        question: dirty,
+        options: [
+          { label: dirty, description: dirty },
+          { label: dirty, description: dirty },
+        ],
+      }),
+    ];
+    for (const rendered of outputs) {
+      assert.equal(LONE_SURROGATE_RE.test(rendered), false);
+      assert.ok(rendered.length > 0);
+    }
+  });
+
+  test('choice bounds are Unicode-safe: astral text clips whole code points', () => {
+    const clippedQuestion = copyModule.choiceQuestionText('𝕒'.repeat(600));
+    assert.equal(codePoints(clippedQuestion), copyModule.MAX_CHOICE_QUESTION_CHARS);
+    assert.equal(LONE_SURROGATE_RE.test(clippedQuestion), false);
+    const clippedLine = copyModule.choiceOptionText(0, '𝕒'.repeat(600), '');
+    assert.ok(codePoints(clippedLine) <= 500);
+    assert.equal(LONE_SURROGATE_RE.test(clippedLine), false);
+    const clippedButton = copyModule.choiceOptionButton(0, '𝕒'.repeat(100));
+    assert.ok(codePoints(clippedButton) <= MAX_BUTTON_TEXT_CHARS);
+    assert.equal(LONE_SURROGATE_RE.test(clippedButton), false);
+  });
+
+  test('sanitized-empty labels fall back and sanitized-empty descriptions drop the dash', () => {
+    assert.equal(copyModule.choiceOptionText(0, 'tg:abc123', 'C:/secret/x'), '1. Option 1');
+    assert.equal(copyModule.choiceOptionText(1, 'Postgres', 'tg:abc123'), '2. Postgres');
+    assert.equal(copyModule.choiceOptionButton(1, 'tg:abc123'), '2. Option 2');
+  });
+
+  test('the card header goes through the identity logic, never raw concatenation', () => {
+    const card = copyModule.choiceCard({
+      header: 'tg:abc123 aaaaaaaaaaaaaaaa1111 C:/Users/me alpha',
+      question: 'q?',
+      options: [
+        { label: 'a', description: '' },
+        { label: 'b', description: '' },
+      ],
+    });
+    assert.equal(card.split('\n')[0], 'Pi · alpha');
+    assert.doesNotMatch(card, /abc123|aaaaaaaa|Users/);
+    // A missing or blank header is malformed input, not an anonymous card.
+    assert.equal(copyModule.choiceCard({ question: 'q?', options: [
+      { label: 'a', description: 'd' }, { label: 'b', description: 'd' },
+    ] }), null);
+    assert.equal(copyModule.choiceCard({ header: '   ', question: 'q?', options: [
+      { label: 'a', description: 'd' }, { label: 'b', description: 'd' },
+    ] }), null);
+  });
+
+  test('containsCredentialShape refuses every mirrored credential shape', () => {
+    const shapes = [
+      ['github personal access token', 'token ghp_A1b2C3d4E5f6G7h8I9j0Kk'],
+      ['github oauth token', 'token gho_A1b2C3d4E5f6G7h8I9j0Kk'],
+      ['openai-style key', 'key sk-A1b2C3d4E5f6G7h8I9j0KkLm'],
+      ['aws access key id', 'id AKIAIOSFODNN7EXAMPLE'],
+      ['telegram bot token', '1234567890:AAHaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'],
+      ['bearer jwt', 'Bearer eyJhbGc.eyJzdWI.sig'],
+      ['pem private key', '-----BEGIN RSA PRIVATE KEY-----'],
+    ];
+    for (const [name, secret] of shapes) {
+      assert.equal(copyModule.containsCredentialShape(secret), true, `must refuse: ${name}`);
+      assert.equal(
+        copyModule.containsCredentialShape(`label with ${secret} inside`),
+        true,
+        `must refuse embedded: ${name}`,
+      );
+    }
+    assert.equal(copyModule.MAX_CHOICE_QUESTION_CHARS, 500);
+  });
+});
