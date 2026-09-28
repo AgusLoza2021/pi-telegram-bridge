@@ -6054,3 +6054,308 @@ describe('SelectiveTelegramBroker: remote choice callback consumption (T2B2)', (
   });
 });
 
+describe('TuiBridgeClient: remote choice publish + silent settle (T3A)', () => {
+  const REQUEST_ID = 'ab12cd34ef56ab12'; // 16 lowercase hex chars
+
+  /** Fresh store + two connected clients per test: every T3A scenario
+   *  starts from its own quiet transport with its own injected clock. */
+  function makeFixture() {
+    const dir = mkdtempSync(join(TEST_RUNS, 'sel-choice-client-'));
+    let t = Date.now();
+    const store = new Store(join(dir, 'bridge.sqlite'), { now: () => t, isProcessAlive: () => true });
+    const clientA = new TuiBridgeClient(store, { staleAfterMs: 30_000 });
+    const clientB = new TuiBridgeClient(store, { staleAfterMs: 30_000 });
+    return {
+      store,
+      clientA,
+      clientB,
+      dbPath: join(dir, 'bridge.sqlite'),
+      advance(ms) { t += ms; },
+      backdate(ms) { t -= ms; },
+      connectA() {
+        assert.equal(clientA.connect({ ...A, shortId: 'aaa111', label: 'alpha', pid: 1111, cwd: 'C:/proj/alpha' }).ok, true);
+      },
+      connectB() {
+        assert.equal(clientB.connect({ ...B, shortId: 'bbb222', label: 'beta', pid: 2222, cwd: 'C:/proj/beta' }).ok, true);
+      },
+      close() { store.close(); },
+    };
+  }
+
+  /** Direct durable-state read: a SILENT settle emits no event, so the
+   *  command row itself is the only observable outcome. */
+  function commandRow(dbPath, commandId) {
+    const db = new DatabaseSync(dbPath);
+    try {
+      return db
+        .prepare('SELECT state, result_code AS resultCode FROM tui_commands WHERE command_id = ?')
+        .get(commandId);
+    } finally { db.close(); }
+  }
+
+  function choiceRequest(overrides = {}) {
+    return {
+      requestId: REQUEST_ID,
+      question: 'Deploy now or wait?',
+      options: [
+        { label: 'Deploy now', description: 'Ship to production' },
+        { label: 'Wait', description: 'Keep it local' },
+      ],
+      expiresAt: Date.now() + 1_800_000,
+      ...overrides,
+    };
+  }
+
+  test('owner-bound choice_request round-trips with the EXACT payload shape and identity snapshot', () => {
+    const fx = makeFixture();
+    try {
+      fx.connectA();
+      const request = choiceRequest();
+      const res = fx.clientA.publishChoiceRequest({ ...A, ...request });
+      assert.equal(res.ok, true);
+      assert.ok(Number.isSafeInteger(res.eventId));
+      const events = fx.store.listPendingBrokerTuiEvents({ limit: 256 })
+        .filter((e) => e.kind === 'choice_request');
+      assert.equal(events.length, 1);
+      const event = events[0];
+      assert.equal(event.trackingId, A.trackingId);
+      assert.deepEqual(Object.keys(event.payload).sort(),
+        ['expiresAt', 'options', 'question', 'requestId'],
+        'the transported payload must be exactly {requestId, question, options, expiresAt}');
+      assert.deepEqual(event.payload, request);
+      for (const option of event.payload.options) {
+        assert.deepEqual(Object.keys(option).sort(), ['description', 'label'],
+          'each transported option must be exactly {label, description}');
+      }
+    } finally { fx.close(); }
+  });
+
+  test('an injected option value is rejected before persistence', () => {
+    const fx = makeFixture();
+    try {
+      fx.connectA();
+      assert.throws(
+        () => fx.clientA.publishChoiceRequest({
+          ...A,
+          ...choiceRequest({
+            options: [
+              { label: 'A', description: 'a', value: 'MUST-NOT-LEAK' },
+              { label: 'B', description: 'b' },
+            ],
+          }),
+        }),
+        /option entries must not carry a value/,
+      );
+      assert.equal(
+        fx.store.listPendingBrokerTuiEvents({ limit: 256 }).some((e) => e.kind === 'choice_request'),
+        false,
+        'a refused choice_request must leave nothing behind',
+      );
+    } finally { fx.close(); }
+  });
+
+  test('a wrong or replaced connection can never publish a choice_request', () => {
+    const fx = makeFixture();
+    try {
+      fx.connectA();
+      fx.connectB();
+      const request = choiceRequest({ question: 'Who owns this?' });
+      assert.deepEqual(
+        fx.clientB.publishChoiceRequest({ trackingId: A.trackingId, connectionId: B.connectionId, ...request }),
+        { ok: false, reason: 'not_owner' },
+      );
+      assert.equal(
+        fx.store.listPendingBrokerTuiEvents({ limit: 256 }).some((e) => e.kind === 'choice_request'),
+        false,
+      );
+      // Age alpha's ownership out of the client's REAL-time 30s staleness
+      // window (the client cutoff reads Date.now(), so backdate the
+      // injected clock and re-heartbeat, mirroring the sibling
+      // stale-replacement test above).
+      fx.backdate(40_000);
+      assert.equal(fx.clientA.heartbeat(A).ok, true);
+      const replace = fx.clientB.connect({
+        trackingId: A.trackingId, connectionId: B.connectionId,
+        shortId: 'bbb222', label: 'beta2', pid: 2222,
+      });
+      assert.equal(replace.ok, true);
+      assert.equal(replace.replaced, true);
+      assert.deepEqual(
+        fx.clientA.publishChoiceRequest({ ...A, ...request }),
+        { ok: false, reason: 'not_owner' },
+        'the replaced connection must fail closed even with the right tracking id',
+      );
+      assert.equal(
+        fx.clientB.publishChoiceRequest({ trackingId: A.trackingId, connectionId: B.connectionId, ...request }).ok,
+        true,
+        'the exact new owner publishes successfully',
+      );
+    } finally { fx.close(); }
+  });
+
+  test('a successful silent settle flips the command to completed with ZERO command_result event', () => {
+    const fx = makeFixture();
+    try {
+      fx.connectA();
+      const enq = fx.store.enqueueTuiCommand({
+        trackingId: A.trackingId,
+        kind: 'choice_response',
+        payload: { requestId: REQUEST_ID, index: 1 },
+        commandId: 'd'.repeat(32),
+      });
+      assert.equal(enq.ok, true);
+      const claimed = fx.clientA.poll(A).commands;
+      assert.equal(claimed.length, 1);
+      const res = fx.clientA.settleChoiceResponse({
+        commandId: claimed[0].commandId, connectionId: A.connectionId, ok: true,
+      });
+      assert.deepEqual(res, { ok: true }, 'the Store result must be returned unchanged');
+      const row = commandRow(fx.dbPath, claimed[0].commandId);
+      assert.equal(row.state, 'completed');
+      assert.equal(row.resultCode, null);
+      assert.equal(
+        fx.store.listPendingBrokerTuiEvents({ limit: 256 }).some((e) => e.kind === 'command_result'),
+        false,
+        'a silent settle must never append a command_result event',
+      );
+    } finally { fx.close(); }
+  });
+
+  test('a failed silent settle records its fixed code-only result with ZERO command_result event', () => {
+    const fx = makeFixture();
+    try {
+      fx.connectA();
+      const enq = fx.store.enqueueTuiCommand({
+        trackingId: A.trackingId,
+        kind: 'choice_response',
+        payload: { requestId: REQUEST_ID, cancelled: true },
+        commandId: 'd'.repeat(32),
+      });
+      assert.equal(enq.ok, true);
+      const claimed = fx.clientA.poll(A).commands;
+      assert.equal(claimed.length, 1);
+      const res = fx.clientA.settleChoiceResponse({
+        commandId: claimed[0].commandId, connectionId: A.connectionId,
+        ok: false, resultCode: 'choice_expired',
+      });
+      assert.deepEqual(res, { ok: true }, 'the Store result must be returned unchanged');
+      const row = commandRow(fx.dbPath, claimed[0].commandId);
+      assert.equal(row.state, 'failed');
+      assert.equal(row.resultCode, 'choice_expired');
+      assert.equal(
+        fx.store.listPendingBrokerTuiEvents({ limit: 256 }).some((e) => e.kind === 'command_result'),
+        false,
+        'even a failed settle must stay silent — no Telegram chat spam',
+      );
+    } finally { fx.close(); }
+  });
+
+  test('a wrong owner can never settle a claimed choice_response', () => {
+    const fx = makeFixture();
+    try {
+      fx.connectA();
+      fx.connectB();
+      const enq = fx.store.enqueueTuiCommand({
+        trackingId: A.trackingId,
+        kind: 'choice_response',
+        payload: { requestId: REQUEST_ID, index: 0 },
+        commandId: 'd'.repeat(32),
+      });
+      assert.equal(enq.ok, true);
+      const claimed = fx.clientA.poll(A).commands;
+      assert.equal(claimed.length, 1);
+      assert.deepEqual(
+        fx.clientB.settleChoiceResponse({
+          commandId: claimed[0].commandId, connectionId: B.connectionId, ok: true,
+        }),
+        { ok: false, reason: 'not_owner' },
+      );
+      assert.deepEqual(
+        fx.clientB.settleChoiceResponse({
+          commandId: claimed[0].commandId, connectionId: B.connectionId,
+          ok: false, resultCode: 'choice_expired',
+        }),
+        { ok: false, reason: 'not_owner' },
+      );
+      const row = commandRow(fx.dbPath, claimed[0].commandId);
+      assert.equal(row.state, 'claimed', 'a refused settle must leave the claim intact');
+      assert.equal(row.resultCode, null);
+    } finally { fx.close(); }
+  });
+
+  test('invalid ok or resultCode fails closed before the Store is touched', () => {
+    const fx = makeFixture();
+    try {
+      fx.connectA();
+      const enq = fx.store.enqueueTuiCommand({
+        trackingId: A.trackingId,
+        kind: 'choice_response',
+        payload: { requestId: REQUEST_ID, index: 0 },
+        commandId: 'd'.repeat(32),
+      });
+      assert.equal(enq.ok, true);
+      const claimed = fx.clientA.poll(A).commands;
+      assert.equal(claimed.length, 1);
+      const commandId = claimed[0].commandId;
+      assert.throws(
+        () => fx.clientA.settleChoiceResponse({ commandId, connectionId: A.connectionId, ok: 'yes' }),
+        /ok must be a boolean/,
+      );
+      assert.throws(
+        () => fx.clientA.settleChoiceResponse({ commandId, connectionId: A.connectionId, ok: 1 }),
+        /ok must be a boolean/,
+      );
+      assert.throws(
+        () => fx.clientA.settleChoiceResponse({ commandId, connectionId: A.connectionId, ok: false }),
+        /resultCode must be a whitespace-free string/,
+      );
+      assert.throws(
+        () => fx.clientA.settleChoiceResponse({
+          commandId, connectionId: A.connectionId, ok: false, resultCode: '',
+        }),
+        /resultCode must be a whitespace-free string/,
+      );
+      assert.throws(
+        () => fx.clientA.settleChoiceResponse({
+          commandId, connectionId: A.connectionId, ok: false, resultCode: 'choice expired',
+        }),
+        /resultCode must be a whitespace-free string/,
+      );
+      assert.throws(
+        () => fx.clientA.settleChoiceResponse({
+          commandId, connectionId: A.connectionId, ok: false, resultCode: 'x'.repeat(65),
+        }),
+        /resultCode must be a whitespace-free string/,
+      );
+      const row = commandRow(fx.dbPath, commandId);
+      assert.equal(row.state, 'claimed', 'every invalid settle must leave the claim intact');
+      assert.equal(row.resultCode, null);
+    } finally { fx.close(); }
+  });
+
+  test('reportCommandResult keeps emitting its command_result event for ordinary commands', () => {
+    const fx = makeFixture();
+    try {
+      fx.connectA();
+      const enq = fx.store.enqueueTuiCommand({
+        trackingId: A.trackingId, kind: 'prompt', payload: { text: 'ordinary run' },
+      });
+      assert.equal(enq.ok, true);
+      const claimed = fx.clientA.poll(A).commands;
+      assert.equal(claimed.length, 1);
+      const res = fx.clientA.reportCommandResult({
+        ...A, commandId: claimed[0].commandId, ok: true, text: 'done',
+      });
+      assert.equal(res.ok, true);
+      assert.ok(typeof res.eventId === 'number');
+      const row = commandRow(fx.dbPath, claimed[0].commandId);
+      assert.equal(row.state, 'completed');
+      const result = fx.store.listPendingBrokerTuiEvents({ limit: 256 })
+        .find((e) => e.kind === 'command_result');
+      assert.ok(result, 'the ordinary command result event must still be emitted');
+      assert.equal(result.payload.ok, true);
+      assert.equal(result.payload.text, 'done');
+    } finally { fx.close(); }
+  });
+});
+

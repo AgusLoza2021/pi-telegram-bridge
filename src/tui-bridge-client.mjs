@@ -15,6 +15,7 @@ import { Store } from './store.mjs';
 
 const ID_BYTES = 16;
 const MAX_TEXT_CHARS = 4000;
+const MAX_RESULT_CODE_CHARS = 64;
 const MAX_EVENTS_PER_POLL = 32;
 const MAX_COMMANDS_PER_POLL = 8;
 const DEFAULT_STALE_AFTER_MS = 30000;
@@ -176,6 +177,60 @@ export class TuiBridgeClient {
       return { ok: true, commandAcknowledged: true, eventFailed: true, reason: event.reason };
     }
     return { ok: true, commandAcknowledged: true, eventId: event.eventId };
+  }
+
+  /**
+   * Publish one ordinary-choice request as a `choice_request` event for
+   * the broker to render in Telegram. Owner-bound: a replaced or foreign
+   * connection fails closed. The option list is forwarded as-is EXCEPT
+   * that any entry carrying a `value` field is rejected here, before
+   * persistence: option values must never enter SQLite, Telegram text,
+   * logs or callback data. The Store's exact-shape validation remains the
+   * final guard for everything else (requestId, question, option count,
+   * sizes, expiresAt).
+   */
+  publishChoiceRequest({ trackingId, connectionId, requestId, question, options, expiresAt }) {
+    if (Array.isArray(options)) {
+      for (const option of options) {
+        if (option !== null && typeof option === 'object' && 'value' in option) {
+          throw new TypeError('option entries must not carry a value field');
+        }
+      }
+    }
+    return this.#store.appendTuiEvent({
+      trackingId,
+      kind: 'choice_request',
+      payload: { requestId, question, options, expiresAt },
+      connectionId,
+    });
+  }
+
+  /**
+   * Silently settle one claimed `choice_response` command. Requires a
+   * boolean `ok`; a failed settle requires a bounded code-only
+   * `resultCode`. The Store result is returned unchanged. Deliberately
+   * NEVER appends a `command_result` event — unlike reportCommandResult —
+   * because a remote choice settlement must not create Telegram chat
+   * spam; the command row itself is the settlement record.
+   */
+  settleChoiceResponse({ commandId, connectionId, ok, resultCode }) {
+    if (typeof ok !== 'boolean') {
+      throw new TypeError('ok must be a boolean');
+    }
+    if (!ok) {
+      if (
+        typeof resultCode !== 'string'
+        || resultCode.length === 0
+        || resultCode.length > MAX_RESULT_CODE_CHARS
+        || /\s/.test(resultCode)
+      ) {
+        throw new TypeError(
+          `resultCode must be a whitespace-free string of at most ${MAX_RESULT_CODE_CHARS} chars`,
+        );
+      }
+      return this.#store.failTuiCommand({ commandId, connectionId, resultCode });
+    }
+    return this.#store.completeTuiCommand({ commandId, connectionId });
   }
 
   /**
