@@ -15,8 +15,14 @@
 //   /telegram-connect in the interactive TUI; nothing connects on its own.
 // - Uses ONLY the synchronous bridge Store + TuiBridgeClient against the
 //   module-default <module>/.local/state/bridge.sqlite. No shell, no API
-//   process, no network, no Telegram access, no tool registration: the
-//   broker process is the only side that talks to Telegram.
+//   process, no network, no Telegram access: the broker process is the
+//   only side that talks to Telegram. The extension registers exactly ONE
+//   deliberate custom tool, telegram_ask_user_choice, which publishes an
+//   ordinary 2–4 option choice question through the same store transport
+//   so the linked Telegram owner can answer it from their phone; the tool
+//   itself adds no shell, network or Telegram access. It never answers
+//   provider-owned consent envelopes, native ui_prompt dialogs or any
+//   other local-only prompt.
 // - Forwarded data is deliberately narrow: connection state transitions
 //   (agent_start/agent_settled, ui_prompt_start/ui_prompt_end) and, on
 //   assistant message_end, FINALIZED text blocks only. Thinking/reasoning
@@ -42,11 +48,17 @@
 import { existsSync, lstatSync, mkdirSync, readFileSync, statSync } from 'node:fs';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { homedir } from 'node:os';
+import { randomBytes } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import type { ExtensionAPI, ExtensionContext } from '@earendil-works/pi-coding-agent';
+import { Type } from 'typebox';
 import { Store } from '../src/store.mjs';
 import { TuiBridgeClient } from '../src/tui-bridge-client.mjs';
-import { displayLabel } from '../src/beginner-copy.mjs';
+import {
+  choiceQuestionText,
+  containsCredentialShape,
+  displayLabel,
+} from '../src/beginner-copy.mjs';
 
 // Footer status key (ctx.ui.setStatus) so the user always sees the live
 // short id of the tracked session while connected.
@@ -71,6 +83,111 @@ const POLL_INTERVAL_MS = 500;
 // Rejected prompt-like text: leading whitespace then a slash. This covers
 // extension commands, skills and prompt templates alike.
 const SLASH_PREFIX_RE = /^\s*\//;
+
+// --- Remote ordinary choice tool (T3B) --------------------------------------
+//
+// Bounds mirror the store's T1 choice contract and the schema below
+// EXACTLY. Pi validates tool arguments against the schema before calling;
+// execute() repeats every security-critical bound defensively because the
+// model-facing schema is trust boundary input, not a guarantee.
+const CHOICE_TOOL_NAME = 'telegram_ask_user_choice';
+const MAX_CHOICE_QUESTION_CHARS = 500;
+const MAX_CHOICE_LABEL_CHARS = 64;
+const MAX_CHOICE_DESCRIPTION_CHARS = 300;
+const MAX_CHOICE_VALUE_CHARS = 512;
+const MIN_CHOICE_OPTIONS = 2;
+const MAX_CHOICE_OPTIONS = 4;
+// Default hard deadline: exactly 30 minutes (production; never externally
+// configurable — tests may inject a different duration for observation).
+const CHOICE_REQUEST_TTL_MS = 30 * 60 * 1000;
+const CHOICE_REQUEST_ID_RE = /^[0-9a-f]{16}$/;
+
+/** A remote ordinary choice waiting for the owner's Telegram answer. */
+interface PendingChoiceRequest {
+  requestId: string;
+  question: string;
+  /** Local-only option payloads; never published to the store. */
+  values: string[];
+  expiresAt: number;
+  /** Single-shot completion; a second settle is a no-op. */
+  settled: boolean;
+  resolve: (result: ChoiceToolResult) => void;
+}
+
+/** Fixed JSON shape the choice tool resolves with. */
+interface ChoiceToolResult {
+  status: 'selected' | 'cancelled' | 'timed_out' | 'aborted' | 'interrupted';
+  index?: number;
+  value?: string;
+}
+
+/** Fixed local refusal shape; `reason` is a bounded machine code. */
+interface RefusedChoiceResult {
+  status: 'refused';
+  reason: string;
+}
+
+type ChoiceToolPayload = ChoiceToolResult | RefusedChoiceResult;
+
+const CHOICE_PARAMETERS = Type.Object(
+  {
+    question: Type.String({
+      minLength: 1,
+      maxLength: MAX_CHOICE_QUESTION_CHARS,
+      description:
+        'Short question shown on the phone. Plain text; it is sent to Telegram as-is.',
+    }),
+    options: Type.Array(
+      Type.Object(
+        {
+          label: Type.String({
+            minLength: 1,
+            maxLength: MAX_CHOICE_LABEL_CHARS,
+            description: 'Button text, e.g. "Deploy now".',
+          }),
+          description: Type.String({
+            minLength: 1,
+            maxLength: MAX_CHOICE_DESCRIPTION_CHARS,
+            description: 'One-line explanation of what choosing this option does.',
+          }),
+          value: Type.String({
+            minLength: 1,
+            maxLength: MAX_CHOICE_VALUE_CHARS,
+            description:
+              'Machine value returned to you when this option is chosen; never sent to Telegram.',
+          }),
+        },
+        { additionalProperties: false },
+      ),
+      {
+        minItems: MIN_CHOICE_OPTIONS,
+        maxItems: MAX_CHOICE_OPTIONS,
+        description: 'Between 2 and 4 options.',
+      },
+    ),
+  },
+  { additionalProperties: false },
+);
+
+const CHOICE_TOOL_DESCRIPTION =
+  'Ask the linked Telegram owner to pick one of 2-4 options from their phone ' +
+  'and block until they answer (or the 30 minute deadline passes). Use this ' +
+  'instead of deciding an ordinary workflow question on your own when the ' +
+  'owner is away from the keyboard. Never use it for provider-owned consent ' +
+  'or permission envelopes, Gentle AI review consent envelopes, security ' +
+  'confirmations, destructive maintenance, project trust decisions, secrets, ' +
+  'or anything a native editor dialog or free-text/custom response should ' +
+  'handle.';
+
+const CHOICE_TOOL_PROMPT_SNIPPET =
+  'telegram_ask_user_choice lets you put an ordinary 2-4 option decision to ' +
+  'the linked Telegram owner and wait for their tap; the answer comes back ' +
+  'as the exact option value you supplied.';
+
+const CHOICE_TOOL_PROMPT_GUIDELINES = [
+  `${CHOICE_TOOL_NAME} is for ORDINARY workflow choices only — for example "deploy now or wait?". Never call it for consent envelopes, permission or security prompts, destructive maintenance, project trust decisions, secrets, editor input, or anything needing a free-text or custom response: those stay with their native local-only mechanisms.`,
+  `Call ${CHOICE_TOOL_NAME} alone: never in parallel with other tools, and only when a plain question with 2-4 fixed options is exactly what you need.`,
+];
 
 // --- Beginner /tg copy (docs/BEGINNER_UX.md section 4) ----------------------
 // Local TUI surface only; Telegram-side beginner copy stays centralized in
@@ -454,6 +571,15 @@ function defaultStateDirectory(): string {
   return resolve(here, '..', '.local', 'state');
 }
 
+/** Optional seams for deterministic testing; production uses the defaults. */
+interface T3BChoiceInjections {
+  now?: () => number;
+  choiceTimeoutMs?: number;
+  requestIdFactory?: () => string;
+  scheduleChoiceTimeout?: (callback: () => void, ms: number) => unknown;
+  clearChoiceTimeout?: (handle: unknown) => void;
+}
+
 export class SelectiveTuiBridgeExtension {
   readonly #stateDirectory: string;
   #pi: ExtensionAPI | null = null;
@@ -462,8 +588,31 @@ export class SelectiveTuiBridgeExtension {
   /** Latest live session context; the ONLY context abort/status may use. */
   #latestCtx: ExtensionContext | null = null;
 
-  constructor(stateDirectory: string) {
+  // --- remote choice tool state (memory-only, never persisted) ------------
+  #now: () => number;
+  #choiceTimeoutMs: number;
+  #newRequestId: () => string;
+  #scheduleChoiceTimeout: (callback: () => void, ms: number) => unknown;
+  #clearChoiceTimeout: (handle: unknown) => void;
+  #pendingChoice: PendingChoiceRequest | null = null;
+  #choiceTimerHandle: unknown = null;
+
+  constructor(stateDirectory: string, choiceInjections: T3BChoiceInjections = {}) {
     this.#stateDirectory = stateDirectory;
+    this.#now = choiceInjections.now ?? (() => Date.now());
+    this.#choiceTimeoutMs = choiceInjections.choiceTimeoutMs ?? CHOICE_REQUEST_TTL_MS;
+    this.#newRequestId = choiceInjections.requestIdFactory
+      // 16 lowercase hex chars: exactly the store's request-id contract.
+      ?? (() => randomBytes(8).toString('hex'));
+    this.#scheduleChoiceTimeout = choiceInjections.scheduleChoiceTimeout
+      ?? ((callback, ms) => {
+        const handle = setTimeout(callback, ms);
+        // A pending choice must never keep the Pi process alive by itself.
+        (handle as { unref?: () => void }).unref?.();
+        return handle;
+      });
+    this.#clearChoiceTimeout = choiceInjections.clearChoiceTimeout
+      ?? ((handle) => clearTimeout(handle as ReturnType<typeof setTimeout>));
   }
 
   register(pi: ExtensionAPI): void {
@@ -692,6 +841,28 @@ export class SelectiveTuiBridgeExtension {
       } catch {
         // Never crash Pi on forwarding; never echo the payload anywhere.
       }
+    });
+
+    // --- Remote ordinary choice tool (T3B) ------------------------------
+
+    pi.registerTool({
+      name: CHOICE_TOOL_NAME,
+      label: 'Ask the Telegram owner (choice)',
+      description: CHOICE_TOOL_DESCRIPTION,
+      promptSnippet: CHOICE_TOOL_PROMPT_SNIPPET,
+      promptGuidelines: CHOICE_TOOL_PROMPT_GUIDELINES,
+      parameters: CHOICE_PARAMETERS,
+      executionMode: 'sequential',
+      execute: async (
+        _toolCallId: string,
+        params: unknown,
+        signal: AbortSignal | undefined,
+        _onUpdate: unknown,
+        ctx: ExtensionContext,
+      ) => {
+        this.#latestCtx = ctx;
+        return await this.#runRemoteChoice(params, signal);
+      },
     });
   }
 
@@ -994,6 +1165,14 @@ export class SelectiveTuiBridgeExtension {
     c: BridgeConnection,
     command: { commandId: string; kind: string; payload: unknown },
   ): void {
+    // Remote choice settlements are SILENT by design (T3B): the command row
+    // itself is the record and the tool result is the user-visible answer.
+    // They must never produce a command_result event and never fall into
+    // the ordinary report machinery below.
+    if (command.kind === 'choice_response') {
+      this.#handleChoiceResponse(c, command);
+      return;
+    }
     // Exactly-one terminal report per claimed command, whatever happens.
     let reported = false;
     const report = (ok: boolean, text?: string, resultCode?: string) => {
@@ -1096,7 +1275,9 @@ export class SelectiveTuiBridgeExtension {
   }
 
   #derivedState(c: BridgeConnection): 'connected' | 'busy' | 'waiting' {
-    if (c.uiPromptActive) return 'waiting';
+    // A pending remote choice IS waiting for the human: it outranks both
+    // the busy run and the native ui_prompt indication.
+    if (this.#pendingChoice || c.uiPromptActive) return 'waiting';
     if (c.agentActive) return 'busy';
     return 'connected';
   }
@@ -1139,7 +1320,12 @@ export class SelectiveTuiBridgeExtension {
   #disposeConnection({ disconnectRemote }: { disconnectRemote: boolean }): void {
     const c = this.#connection;
     if (!c) return;
+    // Null the connection FIRST so the interrupted settle cannot push a
+    // state update into a row that is being torn down, then settle the
+    // pending choice synchronously BEFORE timers/store close: the blocked
+    // tool must always receive a terminal result, never hang forever.
     this.#connection = null;
+    this.#settlePendingChoice({ status: 'interrupted' });
     for (const timer of [c.heartbeatTimer, c.pollTimer]) {
       if (timer) clearInterval(timer);
     }
@@ -1207,6 +1393,282 @@ export class SelectiveTuiBridgeExtension {
     } catch {
       // Footer is cosmetic; ignore stale or non-TUI contexts.
     }
+  }
+
+  // --- Remote ordinary choice tool (T3B) ----------------------------------
+
+  /** Fixed JSON tool result: text and details carry the exact same object. */
+  #choiceResult(result: ChoiceToolPayload): {
+    content: Array<{ type: 'text'; text: string }>;
+    details: ChoiceToolPayload;
+  } {
+    return {
+      content: [{ type: 'text', text: JSON.stringify(result) }],
+      details: result,
+    };
+  }
+
+  /**
+   * Execute the remote ordinary choice tool. Refusals are fixed local JSON
+   * (never throws to the model, never leaks paths or payloads); publishing
+   * strips option values; the tool then blocks until the owner answers on
+   * Telegram, cancels, the 30 minute deadline passes, the call is aborted,
+   * or the connection dies.
+   */
+  async #runRemoteChoice(
+    rawParams: unknown,
+    signal: AbortSignal | undefined,
+  ): Promise<ReturnType<SelectiveTuiBridgeExtension['#choiceResult']>> {
+    const refused = (reason: string) =>
+      this.#choiceResult({ status: 'refused', reason });
+
+    // An already-aborted call never publishes anything.
+    if (signal?.aborted) return this.#choiceResult({ status: 'aborted' });
+
+    const c = this.#connection;
+    if (!c) return refused('not_linked');
+
+    // One pending choice per instance: a second concurrent call is refused.
+    if (this.#pendingChoice) return refused('busy');
+
+    // The broker must be alive before we promise the owner an answer.
+    if (!this.#brokerAvailable()) return refused('broker_unavailable');
+
+    // Defensive re-validation: the model-facing schema is trust-boundary
+    // input, not a guarantee. Every security-critical bound is repeated.
+    const params = rawParams as Record<string, unknown> | null;
+    if (!params || typeof params !== 'object' || Array.isArray(params)) {
+      return refused('invalid_input');
+    }
+    const allowedKeys = ['question', 'options'];
+    const keys = Object.keys(params);
+    if (keys.length !== allowedKeys.length || keys.some((k) => !allowedKeys.includes(k))) {
+      return refused('invalid_input');
+    }
+    const question = params.question;
+    const rawOptions = params.options;
+    if (
+      typeof question !== 'string'
+      || question.length < 1
+      || question.length > MAX_CHOICE_QUESTION_CHARS
+      || !Array.isArray(rawOptions)
+      || rawOptions.length < MIN_CHOICE_OPTIONS
+      || rawOptions.length > MAX_CHOICE_OPTIONS
+    ) {
+      return refused('invalid_input');
+    }
+    const options: Array<{ label: string; description: string; value: string }> = [];
+    for (const raw of rawOptions) {
+      if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+        return refused('invalid_input');
+      }
+      const entry = raw as Record<string, unknown>;
+      const entryKeys = Object.keys(entry).sort();
+      if (
+        entryKeys.length !== 3
+        || entryKeys[0] !== 'description'
+        || entryKeys[1] !== 'label'
+        || entryKeys[2] !== 'value'
+        || typeof entry.label !== 'string'
+        || entry.label.length < 1
+        || entry.label.length > MAX_CHOICE_LABEL_CHARS
+        || typeof entry.description !== 'string'
+        || entry.description.length < 1
+        || entry.description.length > MAX_CHOICE_DESCRIPTION_CHARS
+        || typeof entry.value !== 'string'
+        || entry.value.length < 1
+        || entry.value.length > MAX_CHOICE_VALUE_CHARS
+      ) {
+        return refused('invalid_input');
+      }
+      options.push({ label: entry.label, description: entry.description, value: entry.value });
+    }
+
+    // Credential-shaped text never travels: question and the PUBLISHED
+    // fields are scanned; the local-only value deliberately is not, so a
+    // secret can be used as a machine value without ever leaving the TUI.
+    if (
+      containsCredentialShape(question)
+      || options.some(
+        (o) => containsCredentialShape(o.label) || containsCredentialShape(o.description),
+      )
+    ) {
+      return refused('refused_credentials');
+    }
+
+    // Telegram-visible text is sanitized; a question that sanitizes to
+    // nothing cannot be asked meaningfully.
+    const sanitizedQuestion = choiceQuestionText(question);
+    if (sanitizedQuestion.length === 0) return refused('refused_empty_question');
+
+    const requestId = this.#newRequestId();
+    const expiresAt = this.#now() + this.#choiceTimeoutMs;
+    try {
+      const published = c.client.publishChoiceRequest({
+        trackingId: c.trackingId,
+        connectionId: c.connectionId,
+        requestId,
+        question: sanitizedQuestion,
+        // Only label+description travel; values stay in this process.
+        options: options.map((o) => ({ label: o.label, description: o.description })),
+        expiresAt,
+      });
+      if (!published || published.ok !== true) return refused('publish_failed');
+    } catch {
+      return refused('publish_failed');
+    }
+
+    // Publish succeeded: install the pending choice and arm the deadline.
+    let resolvePending!: (result: ChoiceToolResult) => void;
+    const pendingPromise = new Promise<ChoiceToolResult>((res) => {
+      resolvePending = res;
+    });
+    this.#pendingChoice = {
+      requestId,
+      question: sanitizedQuestion,
+      values: options.map((o) => o.value),
+      expiresAt,
+      settled: false,
+      resolve: resolvePending,
+    };
+    this.#choiceTimerHandle = this.#scheduleChoiceTimeout(() => {
+      this.#settlePendingChoice({ status: 'timed_out' });
+    }, this.#choiceTimeoutMs);
+    this.#pushState(c);
+
+    const onAbort = () => {
+      this.#settlePendingChoice({ status: 'aborted' });
+    };
+    signal?.addEventListener('abort', onAbort, { once: true });
+    try {
+      const result = await pendingPromise;
+      return this.#choiceResult(result);
+    } finally {
+      signal?.removeEventListener('abort', onAbort);
+    }
+  }
+
+  /**
+   * Single-shot local settle: clears the deadline timer exactly once and
+   * resolves the blocked tool. A second call (late timer, double event) is
+   * a no-op; the first result always wins.
+   */
+  #settlePendingChoice(result: ChoiceToolResult): void {
+    const pending = this.#pendingChoice;
+    if (!pending || pending.settled) return;
+    pending.settled = true;
+    this.#pendingChoice = null;
+    if (this.#choiceTimerHandle !== null) {
+      const handle = this.#choiceTimerHandle;
+      this.#choiceTimerHandle = null;
+      this.#clearChoiceTimeout(handle);
+    }
+    pending.resolve(result);
+    const c = this.#connection;
+    if (c) this.#pushState(c);
+  }
+
+  /** Deadline fired: the choice simply times out. */
+  #expirePendingChoice(): void {
+    this.#settlePendingChoice({ status: 'timed_out' });
+  }
+
+  /**
+   * Silent dispatcher for claimed `choice_response` commands. Revalidates
+   * the exact payload shape, binds it to the pending request on the SAME
+   * connection, settles the command row via settleChoiceResponse BEFORE
+   * resolving the tool, and NEVER appends a command_result event. Any
+   * mismatch, staleness or settle failure is a bounded silent code — a
+   * refusal must never settle the real pending choice and a settle failure
+   * must never fabricate an answer or fall through to chat reporting.
+   */
+  #handleChoiceResponse(
+    c: BridgeConnection,
+    command: { commandId: string; kind: string; payload: unknown },
+  ): void {
+    const failSilently = (resultCode: string) => {
+      try {
+        c.client.settleChoiceResponse({
+          commandId: command.commandId,
+          connectionId: c.connectionId,
+          ok: false,
+          resultCode,
+        });
+      } catch {
+        // A lost silent settle degrades to claim-expiry on the broker side.
+      }
+    };
+
+    // 1. Exact payload shape (defense-in-depth: raw rows bypass the store's
+    //    enqueue validation, so execute-side revalidation is mandatory).
+    const payload = command.payload as Record<string, unknown> | null;
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+      failSilently('choice_invalid');
+      return;
+    }
+    const keys = Object.keys(payload).sort();
+    const requestId = payload.requestId;
+    const hasIndex = keys.includes('index');
+    const hasCancelled = keys.includes('cancelled');
+    if (
+      keys.length !== 2
+      || typeof requestId !== 'string'
+      || !CHOICE_REQUEST_ID_RE.test(requestId)
+      || !(hasIndex || hasCancelled)
+      || (hasIndex && hasCancelled)
+    ) {
+      failSilently('choice_invalid');
+      return;
+    }
+    if (hasCancelled && payload.cancelled !== true) {
+      failSilently('choice_invalid');
+      return;
+    }
+    const index = hasIndex ? payload.index : undefined;
+    if (hasIndex && (typeof index !== 'number' || !Number.isSafeInteger(index))) {
+      failSilently('choice_invalid');
+      return;
+    }
+
+    // 2. Binding: same connection, still pending, same request, not expired.
+    const pending = this.#pendingChoice;
+    if (
+      this.#connection !== c
+      || !pending
+      || pending.settled
+      || pending.requestId !== requestId
+    ) {
+      failSilently('choice_stale');
+      return;
+    }
+    if (this.#now() > pending.expiresAt) {
+      failSilently('choice_stale');
+      return;
+    }
+    if (hasIndex && (index < 0 || index >= pending.values.length)) {
+      failSilently('choice_invalid');
+      return;
+    }
+
+    // 3. Settle the command row FIRST; a failed/lost settle must never
+    //    fabricate an answer, so the tool stays pending in that case.
+    try {
+      const settled = c.client.settleChoiceResponse({
+        commandId: command.commandId,
+        connectionId: c.connectionId,
+        ok: true,
+      });
+      if (!settled || settled.ok !== true) return; // silently stay pending
+    } catch {
+      return; // silently stay pending
+    }
+
+    // 4. Resolve the blocked tool with the EXACT local answer.
+    this.#settlePendingChoice(
+      hasCancelled
+        ? { status: 'cancelled' }
+        : { status: 'selected', index: index as number, value: pending.values[index as number] },
+    );
   }
 
   #errorCode(error: unknown): string {

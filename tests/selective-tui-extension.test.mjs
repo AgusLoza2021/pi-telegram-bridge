@@ -12,16 +12,47 @@ import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, mkdtempSync, mkdirSync, symlinkSync, writeFileSync } from 'node:fs';
 import { basename, join } from 'node:path';
-import { tmpdir } from 'node:os';
-import { fileURLToPath } from 'node:url';
+import { tmpdir, homedir } from 'node:os';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import { registerHooks } from 'node:module';
+import { DatabaseSync } from 'node:sqlite';
 
 import { Store } from '../src/store.mjs';
 import { TuiBridgeClient } from '../src/tui-bridge-client.mjs';
-import {
+
+// The extension imports `Type` from 'typebox' — a host-provided package
+// Pi resolves for extension code at runtime (see Pi's extension loader
+// aliases). The bridge repo deliberately does not depend on typebox, so
+// this test process maps the bare specifier to the first locally installed
+// copy (repo-local first, then Pi's bundled module tree) BEFORE loading the
+// extension source. No install, no network, no dependency mutation.
+function resolveHostTypebox() {
+  const candidates = [
+    fileURLToPath(new URL('../node_modules/typebox/build/index.mjs', import.meta.url)),
+    join(homedir(), '.pi', 'agent', 'npm', 'node_modules', 'typebox', 'build', 'index.mjs'),
+  ];
+  for (const candidate of candidates) {
+    if (existsSync(candidate)) return pathToFileURL(candidate).href;
+  }
+  return null;
+}
+
+const TYPEBOX_ENTRY = resolveHostTypebox();
+if (!TYPEBOX_ENTRY) {
+  throw new Error('host typebox package not found: the selective extension requires it');
+}
+registerHooks({
+  resolve(specifier, context, nextResolve) {
+    if (specifier === 'typebox') return { url: TYPEBOX_ENTRY, shortCircuit: true };
+    return nextResolve(specifier, context);
+  },
+});
+
+const {
   SelectiveTuiBridgeExtension,
   createSelectiveTuiExtension,
   readGitBranch,
-} from '../extension/selective-tui-extension.ts';
+} = await import('../extension/selective-tui-extension.ts');
 
 const TEST_RUNS = fileURLToPath(new URL('../.local/test-runs/', import.meta.url));
 mkdirSync(TEST_RUNS, { recursive: true });
@@ -138,7 +169,7 @@ function writeBrokerHealthFixture(stateDirectory, state = 'live') {
  * context. Cleanup is idempotent: the advanced disconnect is invoked (a
  * no-op when not connected) and the process-global opt-in flag is cleared.
  */
-function makeFixture({ credentials = true, brokerState = 'live', cwd, idle, selectAnswer } = {}) {
+function makeFixture({ credentials = true, brokerState = 'live', cwd, idle, selectAnswer, injections } = {}) {
   const dir = mkdtempSync(join(TEST_RUNS, 'ext-t05-'));
   const stateDirectory = join(dir, 'state');
   if (credentials) {
@@ -146,7 +177,7 @@ function makeFixture({ credentials = true, brokerState = 'live', cwd, idle, sele
     writeFileSync(join(stateDirectory, 'credentials.bin'), 'presence-only-placeholder');
     writeBrokerHealthFixture(stateDirectory, brokerState);
   }
-  const extension = new SelectiveTuiBridgeExtension(stateDirectory);
+  const extension = new SelectiveTuiBridgeExtension(stateDirectory, injections);
   const pi = makePi();
   extension.register(pi);
   const context = makeCtx({ cwd, idle, selectAnswer });
@@ -205,7 +236,11 @@ describe('/tg registration and argument completion', () => {
       assert.deepEqual(complete('off'), [{ value: 'off', label: 'off' }]);
       assert.equal(complete('x'), null);
       assert.equal(complete('offx'), null);
-      assert.equal(fx.pi.toolRegistrations.length, 0, 'the extension must register no tools');
+      // T3B: exactly ONE deliberate tool — the remote ordinary-choice tool.
+      // The native ask_user_choice is never overridden.
+      assert.equal(fx.pi.toolRegistrations.length, 1, 'exactly the one deliberate choice tool');
+      assert.equal(fx.pi.toolRegistrations[0].name, 'telegram_ask_user_choice');
+      assert.notEqual(fx.pi.toolRegistrations[0].name, 'ask_user_choice');
     } finally { await fx.cleanup(); }
   });
 });
@@ -756,7 +791,9 @@ describe('no model involvement and factory wiring', () => {
       await fx.run('tg', '');
       await fx.run('tg', 'off', makeCtx({ selectAnswer: 'Unlink' }).ctx);
       assert.equal(fx.pi.sentMessages.length, 0, 'sendUserMessage must never be called by /tg');
-      assert.equal(fx.pi.toolRegistrations.length, 0);
+      // T3B: the single deliberate remote-choice tool, unchanged by /tg use.
+      assert.equal(fx.pi.toolRegistrations.length, 1);
+      assert.equal(fx.pi.toolRegistrations[0].name, 'telegram_ask_user_choice');
     } finally { await fx.cleanup(); }
   });
 
@@ -1088,5 +1125,887 @@ describe('readGitBranch correction round (F1/F2/F3)', () => {
     if (made) {
       assert.equal(readGitBranch(root), null, 'a symlinked HEAD must fail closed');
     }
+  });
+});
+
+// --- T3B: telegram_ask_user_choice — the remote ordinary-choice tool --------
+
+const CHOICE_TOOL_NAME = 'telegram_ask_user_choice';
+const REQUEST_ID = 'ab12cd34ef56ab12'; // 16 lowercase hex chars
+const CHOICE_TTL_MS = 30 * 60 * 1000; // production default: exactly 30 minutes
+const POLL_INTERVAL_MS = 500;
+const HEARTBEAT_INTERVAL_MS = 10_000;
+
+/** Test injections: fixed request id, captured timeout scheduling, optional clock. */
+function makeChoiceInjections({ now, timeoutMs, requestId = REQUEST_ID } = {}) {
+  const scheduled = [];
+  const cleared = [];
+  const injections = {
+    scheduled,
+    cleared,
+    scheduleChoiceTimeout(callback, ms) {
+      scheduled.push({ callback, ms });
+      return scheduled.length;
+    },
+    clearChoiceTimeout(handle) {
+      cleared.push(handle);
+    },
+  };
+  if (now) injections.now = now;
+  if (timeoutMs !== undefined) injections.choiceTimeoutMs = timeoutMs;
+  if (requestId !== undefined) injections.requestIdFactory = () => requestId;
+  return injections;
+}
+
+/**
+ * Connect with interval capture: the poll/heartbeat interval callbacks are
+ * captured instead of scheduled, so T3B tests drive ticks deterministically
+ * and prove the real timers keep firing during an awaited execute.
+ */
+async function connectWithCapturedTicks(fx, args = '') {
+  const originalSetInterval = globalThis.setInterval;
+  const originalClearInterval = globalThis.clearInterval;
+  const captured = [];
+  globalThis.setInterval = (callback, ms) => {
+    captured.push({ callback, ms });
+    return captured.length;
+  };
+  globalThis.clearInterval = () => {};
+  try {
+    await fx.run('tg', args);
+  } finally {
+    globalThis.setInterval = originalSetInterval;
+    globalThis.clearInterval = originalClearInterval;
+  }
+  return {
+    poll: captured.find((t) => t.ms === POLL_INTERVAL_MS)?.callback ?? null,
+    heartbeat: captured.find((t) => t.ms === HEARTBEAT_INTERVAL_MS)?.callback ?? null,
+  };
+}
+
+/** Direct durable reads: raw event/command rows bypass every in-process view. */
+function rawEvents(dbPath) {
+  const db = new DatabaseSync(dbPath);
+  try {
+    return db
+      .prepare('SELECT kind, payload_json AS payloadJson FROM tui_events ORDER BY event_id')
+      .all();
+  } finally { db.close(); }
+}
+
+function rawCommandRow(dbPath, commandId) {
+  const db = new DatabaseSync(dbPath);
+  try {
+    return db
+      .prepare('SELECT state, result_code AS resultCode FROM tui_commands WHERE command_id = ?')
+      .get(commandId);
+  } finally { db.close(); }
+}
+
+function rawSetHeartbeatAt(dbPath, trackingId, heartbeatAt) {
+  const db = new DatabaseSync(dbPath);
+  try {
+    db.prepare('UPDATE tui_sessions SET heartbeat_at = ? WHERE tracking_id = ?')
+      .run(heartbeatAt, trackingId);
+  } finally { db.close(); }
+}
+
+function rawHeartbeatAt(dbPath, trackingId) {
+  const db = new DatabaseSync(dbPath);
+  try {
+    return db
+      .prepare('SELECT heartbeat_at AS heartbeatAt FROM tui_sessions WHERE tracking_id = ?')
+      .get(trackingId)?.heartbeatAt;
+  } finally { db.close(); }
+}
+
+/** Insert a command row bypassing Store validation: only raw-row corruption
+ *  can deliver a malformed payload past the T1 fail-closed persistence. */
+function rawInsertCommand(dbPath, trackingId, commandId, kind, payload) {
+  const db = new DatabaseSync(dbPath);
+  try {
+    db.prepare(
+      `INSERT INTO tui_commands
+         (command_id, tracking_id, kind, payload_json, state, created_at, updated_at)
+       VALUES (?, ?, ?, ?, 'pending', ?, ?)`,
+    ).run(commandId, trackingId, kind, JSON.stringify(payload), Date.now(), Date.now());
+  } finally { db.close(); }
+}
+
+function choiceTool(fx) {
+  assert.equal(fx.pi.toolRegistrations.length, 1, 'exactly the one deliberate tool');
+  return fx.pi.toolRegistrations[0];
+}
+
+function callChoiceTool(fx, params, signal) {
+  return choiceTool(fx).execute('tool-call-1', params, signal, undefined, fx.ctx);
+}
+
+function choiceParams(overrides = {}) {
+  return {
+    question: 'Deploy now or wait?',
+    options: [
+      { label: 'Deploy now', description: 'Ship to production', value: 'deploy-now' },
+      { label: 'Wait', description: 'Keep it local', value: 'wait' },
+    ],
+    ...overrides,
+  };
+}
+
+function choiceRequestEvents(fx) {
+  return rawEvents(fx.sqlitePath).filter((e) => e.kind === 'choice_request');
+}
+
+function commandResultEvents(fx) {
+  return rawEvents(fx.sqlitePath).filter((e) => e.kind === 'command_result');
+}
+
+/** Bounded wait used only to observe that a promise did NOT settle. */
+function settleDelay(ms = 25) {
+  return new Promise((resolvePromise) => setTimeout(resolvePromise, ms));
+}
+
+/** Fixed JSON tool-result contract: text and details match, nothing else. */
+function assertChoiceResult(result, expectedPayload) {
+  const text = typeof result.content?.[0]?.text === 'string' ? result.content[0].text : null;
+  assert.ok(text, 'the tool result must carry one text content block');
+  assert.equal(result.content[0].type, 'text');
+  assert.deepEqual(JSON.parse(text), expectedPayload);
+  assert.deepEqual(result.details, expectedPayload, 'details must match the JSON text exactly');
+}
+
+/**
+ * One connected extension with a pending remote choice. Poll/heartbeat tick
+ * callbacks are captured; the pending tool promise is returned unresolved.
+ */
+async function makePendingFixture({ params = choiceParams(), injections, selectAnswer = 'Connect', idle } = {}) {
+  const inj = injections ?? makeChoiceInjections();
+  const fx = makeFixture({ selectAnswer, injections: inj, idle });
+  const ticks = await connectWithCapturedTicks(fx);
+  let outcome;
+  let settled = false;
+  const pendingPromise = callChoiceTool(fx, params, undefined).then(
+    (value) => { settled = true; outcome = value; return value; },
+    (error) => { settled = true; outcome = error; return Promise.reject(error); },
+  );
+  await new Promise((resolvePromise) => setImmediate(resolvePromise));
+  const p = fx.probe();
+  const sessions = p.sessions();
+  const trackingId = sessions[0].trackingId;
+  const connectionId = sessions[0].connectionId;
+  p.close();
+  return {
+    fx, inj, ticks, pendingPromise,
+    isSettled: () => settled,
+    outcome: () => outcome,
+    trackingId,
+    connectionId,
+    /** Enqueue one choice_response through the shared store. */
+    enqueue(payload) {
+      const probe = fx.probe();
+      try {
+        const res = probe.store.enqueueTuiCommand({
+          trackingId, kind: 'choice_response', payload,
+        });
+        assert.equal(res.ok, true);
+        return res.commandId;
+      } finally { probe.close(); }
+    },
+  };
+}
+
+describe('telegram_ask_user_choice registration, schema and metadata (T3B)', () => {
+  test('exactly one distinct tool is registered and ask_user_choice is never overridden', async () => {
+    const fx = makeFixture();
+    try {
+      assert.equal(fx.pi.toolRegistrations.length, 1);
+      const tool = fx.pi.toolRegistrations[0];
+      assert.equal(tool.name, CHOICE_TOOL_NAME);
+      assert.notEqual(tool.name, 'ask_user_choice');
+      assert.equal(typeof tool.execute, 'function');
+    } finally { await fx.cleanup(); }
+  });
+
+  test('schema: strict bounds, exact keys, additionalProperties:false at both levels, no custom-response field', async () => {
+    const fx = makeFixture();
+    try {
+      const schema = choiceTool(fx).parameters;
+      assert.equal(schema.additionalProperties, false, 'top level must close extras');
+      assert.deepEqual(Object.keys(schema.properties).sort(), ['options', 'question']);
+      const question = schema.properties.question;
+      assert.equal(question.type, 'string');
+      assert.equal(question.minLength, 1);
+      assert.equal(question.maxLength, 500);
+      const options = schema.properties.options;
+      assert.equal(options.type, 'array');
+      assert.equal(options.minItems, 2);
+      assert.equal(options.maxItems, 4);
+      const option = options.items;
+      assert.equal(option.type, 'object');
+      assert.equal(option.additionalProperties, false, 'option level must close extras');
+      assert.deepEqual(Object.keys(option.properties).sort(), ['description', 'label', 'value']);
+      assert.equal(option.properties.label.minLength, 1);
+      assert.equal(option.properties.label.maxLength, 64);
+      assert.equal(option.properties.description.minLength, 1);
+      assert.equal(option.properties.description.maxLength, 300);
+      assert.equal(option.properties.value.minLength, 1);
+      assert.equal(option.properties.value.maxLength, 512);
+      // No custom-response / free-text field anywhere in the schema.
+      assert.equal(option.properties.customResponse, undefined);
+      assert.equal(schema.properties.customResponse, undefined);
+      assert.equal(schema.properties.responseText, undefined);
+    } finally { await fx.cleanup(); }
+  });
+
+  test('metadata: ordinary-choice guidance, call-alone and the explicit native-consent exclusion', async () => {
+    const fx = makeFixture();
+    try {
+      const tool = choiceTool(fx);
+      const allMetadata = [tool.description, ...(tool.promptGuidelines ?? [])].join('\n');
+      assert.match(allMetadata, /instead of/i, 'use it instead of a local-only ordinary choice');
+      assert.match(allMetadata, /2[–-]4/, 'names the 2–4 option band');
+      assert.match(allMetadata, /workflow/i);
+      assert.match(allMetadata, /alone/i, 'call it alone');
+      assert.match(allMetadata, /parallel/i, 'never parallel with other tools');
+      assert.match(allMetadata, /never/i);
+      assert.match(allMetadata, /consent/i, 'excludes provider-owned consent');
+      assert.match(allMetadata, /gentle ai/i, 'excludes Gentle AI review consent');
+      assert.match(allMetadata, /permission/i);
+      assert.match(allMetadata, /security/i);
+      assert.match(allMetadata, /maintenance/i);
+      assert.match(allMetadata, /destructive/i);
+      assert.match(allMetadata, /trust/i, 'excludes project trust');
+      assert.match(allMetadata, /secret/i, 'excludes secrets');
+      assert.match(allMetadata, /editor/i, 'excludes editor input');
+      assert.match(allMetadata, /free-text|custom/i, 'excludes free-text/custom responses');
+      assert.match(tool.promptSnippet, /telegram/i, 'promptSnippet names the capability');
+      assert.match(tool.promptSnippet, /choice|decision|question/i);
+      assert.ok(Array.isArray(tool.promptGuidelines) && tool.promptGuidelines.length >= 1);
+      for (const guideline of tool.promptGuidelines) {
+        assert.match(guideline, /telegram_ask_user_choice/, 'every guideline names the tool');
+      }
+      assert.equal(tool.executionMode, 'sequential', 'defense-in-depth: never parallel');
+    } finally { await fx.cleanup(); }
+  });
+});
+
+describe('telegram_ask_user_choice refusals return fixed local JSON', () => {
+  test('not linked: fixed refused JSON, no store created, nothing published', async () => {
+    const fx = makeFixture();
+    try {
+      const result = await callChoiceTool(fx, choiceParams(), undefined);
+      assertChoiceResult(result, { status: 'refused', reason: 'not_linked' });
+      assert.equal(fx.probe(), null, 'the refusal must not create the store');
+    } finally { await fx.cleanup(); }
+  });
+
+  test('broker unavailable: links fine but the tool refuses with a fixed code, nothing published', async () => {
+    const fx = makeFixture({ brokerState: 'stale', selectAnswer: 'Connect' });
+    try {
+      await fx.run('tg', '');
+      assert.ok(fx.probe(), 'linking still succeeds locally');
+      const result = await callChoiceTool(fx, choiceParams(), undefined);
+      assertChoiceResult(result, { status: 'refused', reason: 'broker_unavailable' });
+      assert.equal(choiceRequestEvents(fx).length, 0);
+    } finally { await fx.cleanup(); }
+  });
+
+  for (const [label, params] of Object.entries({
+    'empty question': { question: '', options: choiceParams().options },
+    'overlong question': { question: 'q'.repeat(501), options: choiceParams().options },
+    'one option': { question: 'q', options: choiceParams().options.slice(0, 1) },
+    'five options': {
+      question: 'q',
+      options: [
+        ...choiceParams().options,
+        ...choiceParams().options,
+        choiceParams().options[0],
+      ],
+    },
+    'missing value': {
+      question: 'q',
+      options: [
+        { label: 'A', description: 'a' },
+        { label: 'B', description: 'b', value: 'b' },
+      ],
+    },
+    'extra option field': {
+      question: 'q',
+      options: [
+        { label: 'A', description: 'a', value: 'a', extra: 'x' },
+        { label: 'B', description: 'b', value: 'b' },
+      ],
+    },
+    'overlong label': {
+      question: 'q',
+      options: [
+        { label: 'l'.repeat(65), description: 'a', value: 'a' },
+        { label: 'B', description: 'b', value: 'b' },
+      ],
+    },
+    'overlong description': {
+      question: 'q',
+      options: [
+        { label: 'A', description: 'd'.repeat(301), value: 'a' },
+        { label: 'B', description: 'b', value: 'b' },
+      ],
+    },
+    'overlong value': {
+      question: 'q',
+      options: [
+        { label: 'A', description: 'a', value: 'v'.repeat(513) },
+        { label: 'B', description: 'b', value: 'b' },
+      ],
+    },
+    'empty label': {
+      question: 'q',
+      options: [
+        { label: '', description: 'a', value: 'a' },
+        { label: 'B', description: 'b', value: 'b' },
+      ],
+    },
+    'non-object option': { question: 'q', options: ['A', { label: 'B', description: 'b', value: 'b' }] },
+    'extra top-level field': {
+      question: 'q',
+      options: choiceParams().options,
+      customResponse: 'free text',
+    },
+  })) {
+    test(`invalid input (${label}): fixed refused JSON, nothing published`, async () => {
+      const fx = makeFixture({ selectAnswer: 'Connect' });
+      try {
+        await fx.run('tg', '');
+        const result = await callChoiceTool(fx, params, undefined);
+        assertChoiceResult(result, { status: 'refused', reason: 'invalid_input' });
+        assert.equal(choiceRequestEvents(fx).length, 0);
+        const p = fx.probe();
+        assert.equal(p.sessions()[0].state, 'connected', 'state must not flip to waiting');
+        p.close();
+      } finally { await fx.cleanup(); }
+    });
+  }
+
+  test('credential-shaped question, label or description: refused before persistence', async () => {
+    const fx = makeFixture({ selectAnswer: 'Connect' });
+    try {
+      await fx.run('tg', '');
+      const secret = 'ghp_' + 'a'.repeat(25);
+      const cases = [
+        { question: `use ${secret} now?`, options: choiceParams().options },
+        {
+          question: 'pick one',
+          options: [
+            { label: `key sk-${'x'.repeat(24)}`, description: 'a', value: secret },
+            { label: 'B', description: 'b', value: 'b' },
+          ],
+        },
+        {
+          question: 'pick one',
+          options: [
+            { label: 'A', description: `token 12345:${'z'.repeat(35)}`, value: 'a' },
+            { label: 'B', description: 'b', value: 'b' },
+          ],
+        },
+      ];
+      for (const params of cases) {
+        const result = await callChoiceTool(fx, params, undefined);
+        assertChoiceResult(result, { status: 'refused', reason: 'refused_credentials' });
+      }
+      assert.equal(choiceRequestEvents(fx).length, 0, 'nothing may be published');
+      const p = fx.probe();
+      assert.equal(p.sessions()[0].state, 'connected');
+      p.close();
+    } finally { await fx.cleanup(); }
+  });
+
+  test('question that sanitizes empty: refused_empty_question', async () => {
+    const fx = makeFixture({ selectAnswer: 'Connect' });
+    try {
+      await fx.run('tg', '');
+      const result = await callChoiceTool(fx, choiceParams({ question: 'tg:abc123' }), undefined);
+      assertChoiceResult(result, { status: 'refused', reason: 'refused_empty_question' });
+      assert.equal(choiceRequestEvents(fx).length, 0);
+    } finally { await fx.cleanup(); }
+  });
+
+  test('one pending per instance: a second concurrent call is busy and disturbs nothing', async () => {
+    const pending = await makePendingFixture();
+    try {
+      assert.equal(choiceRequestEvents(pending.fx).length, 1);
+      const busyResult = await callChoiceTool(pending.fx, choiceParams({
+        question: 'Second question?',
+      }), undefined);
+      assertChoiceResult(busyResult, { status: 'refused', reason: 'busy' });
+      assert.equal(choiceRequestEvents(pending.fx).length, 1, 'no second request published');
+      assert.equal(pending.isSettled(), false, 'the first request stays pending');
+      // The original pending request still resolves normally afterwards.
+      pending.enqueue({ requestId: REQUEST_ID, index: 0 });
+      pending.ticks.poll();
+      const result = await pending.pendingPromise;
+      assertChoiceResult(result, { status: 'selected', index: 0, value: 'deploy-now' });
+    } finally { await pending.fx.cleanup(); }
+  });
+
+  test('publish failure: refused with a fixed code, no pending left behind', async () => {
+    const fx = makeFixture({ selectAnswer: 'Connect' });
+    try {
+      const ticks = await connectWithCapturedTicks(fx);
+      // Force the publish to throw by patching the client prototype; the
+      // extension must fail closed, not crash Pi and not leave a pending.
+      const originalPublish = TuiBridgeClient.prototype.publishChoiceRequest;
+      TuiBridgeClient.prototype.publishChoiceRequest = () => {
+        throw new TypeError('store gone');
+      };
+      let result;
+      try {
+        result = await callChoiceTool(fx, choiceParams(), undefined);
+      } finally {
+        TuiBridgeClient.prototype.publishChoiceRequest = originalPublish;
+      }
+      assertChoiceResult(result, { status: 'refused', reason: 'publish_failed' });
+      assert.equal(choiceRequestEvents(fx).length, 0);
+      // The instance must accept a later request (no stuck pending state):
+      // a retried call publishes and resolves normally.
+      const probe = fx.probe();
+      let trackingId;
+      try {
+        trackingId = probe.sessions()[0].trackingId;
+      } finally { probe.close(); }
+      const retryPromise = callChoiceTool(fx, choiceParams(), undefined);
+      await new Promise((resolvePromise) => setImmediate(resolvePromise));
+      assert.equal(choiceRequestEvents(fx).length, 1, 'the retry published');
+      // Answer the ACTUAL published request (production crypto id here).
+      const publishedRequestId = JSON.parse(choiceRequestEvents(fx)[0].payloadJson).requestId;
+      const retryProbe = fx.probe();
+      let commandId;
+      try {
+        commandId = retryProbe.store.enqueueTuiCommand({
+          trackingId,
+          kind: 'choice_response',
+          payload: { requestId: publishedRequestId, index: 0 },
+        }).commandId;
+      } finally { retryProbe.close(); }
+      ticks.poll();
+      const retry = await retryPromise;
+      assertChoiceResult(retry, { status: 'selected', index: 0, value: 'deploy-now' });
+      const row = rawCommandRow(fx.sqlitePath, commandId);
+      assert.equal(row.state, 'completed');
+    } finally { await fx.cleanup(); }
+  });
+});
+
+describe('telegram_ask_user_choice selection lifecycle', () => {
+  test('selected: exact request published (no value), waiting state, exact local value/index back', async () => {
+    const FIXED_NOW = 1_700_000_000_000;
+    const inj = makeChoiceInjections({ now: () => FIXED_NOW });
+    const pending = await makePendingFixture({ injections: inj });
+    try {
+      // The published request: exact shape, values excluded, injected clock.
+      const events = choiceRequestEvents(pending.fx);
+      assert.equal(events.length, 1);
+      const payload = JSON.parse(events[0].payloadJson);
+      assert.deepEqual(Object.keys(payload).sort(), ['expiresAt', 'options', 'question', 'requestId']);
+      assert.equal(payload.requestId, REQUEST_ID);
+      assert.equal(payload.question, 'Deploy now or wait?');
+      assert.equal(payload.expiresAt, FIXED_NOW + CHOICE_TTL_MS, 'exactly 30 minutes ahead of the injected now');
+      assert.deepEqual(
+        payload.options,
+        [
+          { label: 'Deploy now', description: 'Ship to production' },
+          { label: 'Wait', description: 'Keep it local' },
+        ],
+        'only label+description travel; value never enters the store',
+      );
+      // Timeout scheduled for the exact production TTL.
+      assert.equal(inj.scheduled.length, 1);
+      assert.equal(inj.scheduled[0].ms, CHOICE_TTL_MS);
+      // Waiting state while pending.
+      let p = pending.fx.probe();
+      assert.equal(p.sessions()[0].state, 'waiting');
+      p.close();
+      // The exact local answer: index 1 → value 'wait'.
+      pending.enqueue({ requestId: REQUEST_ID, index: 1 });
+      pending.ticks.poll();
+      const result = await pending.pendingPromise;
+      assertChoiceResult(result, { status: 'selected', index: 1, value: 'wait' });
+      // The command settles silently: no command_result event ever.
+      assert.equal(commandResultEvents(pending.fx).length, 0);
+      p = pending.fx.probe();
+      assert.equal(p.sessions()[0].state, 'connected', 'derived state restored');
+      p.close();
+      // Timer cleared exactly once; firing it late is a no-op.
+      assert.equal(inj.cleared.length, 1);
+      assert.equal(inj.cleared[0], 1, 'the exact scheduled handle was cleared');
+      inj.scheduled[0].callback();
+      const p2 = pending.fx.probe();
+      assert.equal(p2.sessions()[0].state, 'connected', 'late timer fire changes nothing');
+      p2.close();
+    } finally { await pending.fx.cleanup(); }
+  });
+
+  test('production defaults: crypto request id, exactly 30-minute TTL, real clock expiry', async () => {
+    const inj = makeChoiceInjections({ requestId: undefined });
+    const pending = await makePendingFixture({ injections: inj });
+    try {
+      const payload = JSON.parse(choiceRequestEvents(pending.fx)[0].payloadJson);
+      assert.match(payload.requestId, /^[0-9a-f]{16}$/, '16 lowercase hex chars from node:crypto');
+      assert.equal(inj.scheduled[0].ms, CHOICE_TTL_MS, 'production default is exactly 30 minutes');
+      assert.ok(
+        Math.abs(payload.expiresAt - (Date.now() + CHOICE_TTL_MS)) < 5_000,
+        'expiresAt is now + 30 minutes on the real clock',
+      );
+      pending.enqueue({ requestId: payload.requestId, cancelled: true });
+      pending.ticks.poll();
+      await pending.pendingPromise;
+    } finally { await pending.fx.cleanup(); }
+  });
+
+  test('cancelled: fixed JSON, silent completion, state restored, timer cleared', async () => {
+    const pending = await makePendingFixture();
+    try {
+      const commandId = pending.enqueue({ requestId: REQUEST_ID, cancelled: true });
+      pending.ticks.poll();
+      const result = await pending.pendingPromise;
+      assertChoiceResult(result, { status: 'cancelled' });
+      const row = rawCommandRow(pending.fx.sqlitePath, commandId);
+      assert.equal(row.state, 'completed');
+      assert.equal(row.resultCode, null);
+      assert.equal(commandResultEvents(pending.fx).length, 0, 'no chat spam');
+      const p = pending.fx.probe();
+      assert.equal(p.sessions()[0].state, 'connected');
+      p.close();
+      assert.equal(pending.inj.cleared.length, 1);
+    } finally { await pending.fx.cleanup(); }
+  });
+
+  test('timeout: fixed JSON, command after deadline is silently stale and cannot resurrect', async () => {
+    const pending = await makePendingFixture();
+    try {
+      pending.inj.scheduled[0].callback();
+      const result = await pending.pendingPromise;
+      assertChoiceResult(result, { status: 'timed_out' });
+      assert.equal(pending.inj.cleared.length, 1);
+      const p = pending.fx.probe();
+      assert.equal(p.sessions()[0].state, 'connected');
+      p.close();
+      // A matching response arriving after the deadline is silently failed.
+      const commandId = pending.enqueue({ requestId: REQUEST_ID, index: 0 });
+      pending.ticks.poll();
+      const row = rawCommandRow(pending.fx.sqlitePath, commandId);
+      assert.equal(row.state, 'failed');
+      assert.equal(row.resultCode, 'choice_stale');
+      assert.equal(commandResultEvents(pending.fx).length, 0, 'no chat spam even for stale taps');
+    } finally { await pending.fx.cleanup(); }
+  });
+});
+
+describe('telegram_ask_user_choice abort paths', () => {
+  test('already-aborted signal: fixed JSON without publishing anything', async () => {
+    const fx = makeFixture({ selectAnswer: 'Connect' });
+    try {
+      await fx.run('tg', '');
+      const controller = new AbortController();
+      controller.abort();
+      const result = await callChoiceTool(fx, choiceParams(), controller.signal);
+      assertChoiceResult(result, { status: 'aborted' });
+      assert.equal(choiceRequestEvents(fx).length, 0, 'no request for an already-aborted call');
+    } finally { await fx.cleanup(); }
+  });
+
+  test('abort while pending: fixed JSON, timer cleared, later response is silently stale', async () => {
+    const controller = new AbortController();
+    const fx = makeFixture({ selectAnswer: 'Connect' });
+    try {
+      const ticks = await connectWithCapturedTicks(fx);
+      const pendingPromise = callChoiceTool(fx, choiceParams(), controller.signal);
+      await new Promise((resolvePromise) => setImmediate(resolvePromise));
+      assert.equal(choiceRequestEvents(fx).length, 1);
+      controller.abort();
+      const result = await pendingPromise;
+      assertChoiceResult(result, { status: 'aborted' });
+      const p = fx.probe();
+      assert.equal(p.sessions()[0].state, 'connected');
+      p.close();
+      const probe = fx.probe();
+      let commandId;
+      try {
+        commandId = probe.store.enqueueTuiCommand({
+          trackingId: probe.sessions()[0].trackingId,
+          kind: 'choice_response',
+          payload: { requestId: REQUEST_ID, index: 0 },
+        }).commandId;
+      } finally { probe.close(); }
+      ticks.poll();
+      const row = rawCommandRow(fx.sqlitePath, commandId);
+      assert.equal(row.state, 'failed');
+      assert.equal(row.resultCode, 'choice_stale');
+      assert.equal(commandResultEvents(fx).length, 0);
+    } finally { await fx.cleanup(); }
+  });
+
+  test('waiting beats busy: agentActive and uiPromptActive never mask the pending choice', async () => {
+    const pending = await makePendingFixture();
+    try {
+      await pending.fx.pi.emit('agent_start', {}, pending.fx.ctx);
+      let p = pending.fx.probe();
+      assert.equal(p.sessions()[0].state, 'waiting', 'waiting has priority over busy');
+      p.close();
+      await pending.fx.pi.emit('agent_settled', {}, pending.fx.ctx);
+      await pending.fx.pi.emit('ui_prompt_start', {}, pending.fx.ctx);
+      p = pending.fx.probe();
+      assert.equal(p.sessions()[0].state, 'waiting', 'native uiPromptActive remains waiting too');
+      p.close();
+      await pending.fx.pi.emit('ui_prompt_end', {}, pending.fx.ctx);
+      pending.enqueue({ requestId: REQUEST_ID, index: 1 });
+      pending.ticks.poll();
+      await pending.pendingPromise;
+      p = pending.fx.probe();
+      assert.equal(p.sessions()[0].state, 'connected');
+      p.close();
+    } finally { await pending.fx.cleanup(); }
+  });
+
+  test('native ui_prompt path remains notification-only: state flips, no choice machinery', async () => {
+    const fx = makeFixture({ selectAnswer: 'Connect' });
+    try {
+      await fx.run('tg', '');
+      await fx.pi.emit('ui_prompt_start', {}, fx.ctx);
+      let p = fx.probe();
+      assert.equal(p.sessions()[0].state, 'waiting');
+      p.close();
+      await fx.pi.emit('ui_prompt_end', {}, fx.ctx);
+      p = fx.probe();
+      assert.equal(p.sessions()[0].state, 'connected');
+      p.close();
+      assert.equal(choiceRequestEvents(fx).length, 0, 'ui_prompt never publishes a choice');
+      assert.equal(fx.pi.sentMessages.length, 0);
+    } finally { await fx.cleanup(); }
+  });
+});
+
+describe('telegram_ask_user_choice interruption paths', () => {
+  for (const reason of ['quit', 'reload', 'new', 'resume', 'fork']) {
+    test(`session_shutdown (${reason}) settles the blocked tool as interrupted`, async () => {
+      const pending = await makePendingFixture();
+      try {
+        await pending.fx.pi.emit('session_shutdown', { reason }, pending.fx.ctx);
+        const result = await pending.pendingPromise;
+        assertChoiceResult(result, { status: 'interrupted' });
+        assert.equal(pending.isSettled(), true);
+      } finally { await pending.fx.cleanup(); }
+    });
+  }
+
+  test('explicit unlink (tg off) during a pending choice resolves interrupted', async () => {
+    const pending = await makePendingFixture();
+    try {
+      await pending.fx.run('tg', 'off', makeCtx({ selectAnswer: 'Unlink' }).ctx);
+      const result = await pending.pendingPromise;
+      assertChoiceResult(result, { status: 'interrupted' });
+    } finally { await pending.fx.cleanup(); }
+  });
+
+  test('remote disconnect command during a pending choice: tool interrupted, ordinary report intact', async () => {
+    const pending = await makePendingFixture();
+    try {
+      const probe = pending.fx.probe();
+      let commandId;
+      try {
+        commandId = probe.store.enqueueTuiCommand({
+          trackingId: pending.trackingId,
+          kind: 'disconnect',
+          payload: null,
+        }).commandId;
+      } finally { probe.close(); }
+      pending.ticks.poll();
+      const result = await pending.pendingPromise;
+      assertChoiceResult(result, { status: 'interrupted' });
+      // Ordinary command reporting is unchanged: completed WITH its event.
+      const row = rawCommandRow(pending.fx.sqlitePath, commandId);
+      assert.equal(row.state, 'completed');
+      const results = commandResultEvents(pending.fx);
+      assert.equal(results.length, 1, 'exactly one ordinary command_result event');
+      assert.equal(JSON.parse(results[0].payloadJson).ok, true);
+    } finally { await pending.fx.cleanup(); }
+  });
+
+  test('ownership loss during a pending choice resolves interrupted', async () => {
+    const pending = await makePendingFixture();
+    try {
+      // Age the owner row past the staleness window, then replace it from
+      // another client: the extension's next heartbeat must detect the loss.
+      rawSetHeartbeatAt(pending.fx.sqlitePath, pending.trackingId, Date.now() - 60_000);
+      const probe = pending.fx.probe();
+      let replaced;
+      try {
+        replaced = probe.client.connect({
+          trackingId: pending.trackingId,
+          label: 'thief',
+          pid: 424_242,
+        });
+      } finally { probe.close(); }
+      assert.equal(replaced.ok, true, 'the stale owner is safely replaced');
+      pending.ticks.heartbeat();
+      const result = await pending.pendingPromise;
+      assertChoiceResult(result, { status: 'interrupted' });
+    } finally { await pending.fx.cleanup(); }
+  });
+});
+
+describe('silent choice dispatch: exact binding, no events, no fabricated answers', () => {
+  test('mismatched requestId is silently failed and never settles the real pending tool', async () => {
+    const pending = await makePendingFixture();
+    try {
+      const commandId = pending.enqueue({ requestId: 'ffffffffffffffff', index: 0 });
+      pending.ticks.poll();
+      const row = rawCommandRow(pending.fx.sqlitePath, commandId);
+      assert.equal(row.state, 'failed');
+      assert.equal(row.resultCode, 'choice_stale');
+      assert.equal(pending.isSettled(), false, 'the real tool must stay pending');
+      await settleDelay();
+      assert.equal(pending.isSettled(), false);
+      // The tool is still alive: a matching command now resolves it.
+      pending.enqueue({ requestId: REQUEST_ID, index: 0 });
+      pending.ticks.poll();
+      const result = await pending.pendingPromise;
+      assertChoiceResult(result, { status: 'selected', index: 0, value: 'deploy-now' });
+      assert.equal(commandResultEvents(pending.fx).length, 0);
+    } finally { await pending.fx.cleanup(); }
+  });
+
+  test('out-of-local-range index is silently failed and the pending tool survives', async () => {
+    const pending = await makePendingFixture();
+    try {
+      // Two local options: store-legal index 2 is out of range locally.
+      const commandId = pending.enqueue({ requestId: REQUEST_ID, index: 2 });
+      pending.ticks.poll();
+      const row = rawCommandRow(pending.fx.sqlitePath, commandId);
+      assert.equal(row.state, 'failed');
+      assert.equal(row.resultCode, 'choice_invalid');
+      assert.equal(pending.isSettled(), false);
+      pending.enqueue({ requestId: REQUEST_ID, cancelled: true });
+      pending.ticks.poll();
+      await pending.pendingPromise;
+    } finally { await pending.fx.cleanup(); }
+  });
+
+  for (const [label, payload] of Object.entries({
+    'extra fields': { requestId: REQUEST_ID, index: 0, extra: 'x' },
+    'non-integer index': { requestId: REQUEST_ID, index: 1.5 },
+    'cancelled false': { requestId: REQUEST_ID, cancelled: false },
+    'mixed variant': { requestId: REQUEST_ID, index: 0, cancelled: true },
+    'string index': { requestId: REQUEST_ID, index: '0' },
+    'non-hex requestId': { requestId: 'NOT-HEX-AT-ALL', index: 0 },
+  })) {
+    test(`malformed response (${label}) via raw row: silently failed, pending untouched`, async () => {
+      const pending = await makePendingFixture();
+      try {
+        const commandId = `cmd-raw-${label.replaceAll(' ', '-')}`;
+        rawInsertCommand(pending.fx.sqlitePath, pending.trackingId, commandId, 'choice_response', payload);
+        pending.ticks.poll();
+        const row = rawCommandRow(pending.fx.sqlitePath, commandId);
+        assert.equal(row.state, 'failed', 'the malformed command must settle as failed');
+        assert.ok(
+          row.resultCode === 'choice_invalid' || row.resultCode === 'choice_stale',
+          `bounded code expected, got ${row.resultCode}`,
+        );
+        assert.equal(pending.isSettled(), false, 'a malformed command must never settle the tool');
+        await settleDelay();
+        assert.equal(pending.isSettled(), false);
+        assert.equal(commandResultEvents(pending.fx).length, 0, 'no chat spam on invalid paths');
+        // The pending tool still resolves from a valid command.
+        pending.enqueue({ requestId: REQUEST_ID, index: 1 });
+        pending.ticks.poll();
+        await pending.pendingPromise;
+      } finally { await pending.fx.cleanup(); }
+    });
+  }
+
+  test('silently failing to settle (throw) never fabricates an answer and never falls through to reporting', async () => {
+    const pending = await makePendingFixture();
+    const originalSettle = TuiBridgeClient.prototype.settleChoiceResponse;
+    TuiBridgeClient.prototype.settleChoiceResponse = () => {
+      throw new TypeError('store gone');
+    };
+    try {
+      const commandId = pending.enqueue({ requestId: REQUEST_ID, index: 1 });
+      pending.ticks.poll();
+      await settleDelay();
+      assert.equal(pending.isSettled(), false, 'no fabricated answer on a throwing settle');
+      const row = rawCommandRow(pending.fx.sqlitePath, commandId);
+      assert.equal(row.state, 'claimed', 'the command must not be reported completed or failed');
+      assert.equal(commandResultEvents(pending.fx).length, 0, 'no generic report fall-through');
+    } finally {
+      TuiBridgeClient.prototype.settleChoiceResponse = originalSettle;
+      await pending.fx.cleanup();
+    }
+  });
+
+  test('silently refused settle (ok:false) also leaves the tool pending without spam', async () => {
+    const pending = await makePendingFixture();
+    const originalSettle = TuiBridgeClient.prototype.settleChoiceResponse;
+    TuiBridgeClient.prototype.settleChoiceResponse = () => ({ ok: false, reason: 'claim_lost' });
+    try {
+      const commandId = pending.enqueue({ requestId: REQUEST_ID, index: 1 });
+      pending.ticks.poll();
+      await settleDelay();
+      assert.equal(pending.isSettled(), false);
+      const row = rawCommandRow(pending.fx.sqlitePath, commandId);
+      assert.equal(row.state, 'claimed');
+      assert.equal(commandResultEvents(pending.fx).length, 0);
+    } finally {
+      TuiBridgeClient.prototype.settleChoiceResponse = originalSettle;
+      await pending.fx.cleanup();
+    }
+  });
+
+  test('ordinary commands still report with events while choice commands never do', async () => {
+    const fx = makeFixture({ selectAnswer: 'Connect' });
+    try {
+      const ticks = await connectWithCapturedTicks(fx);
+      const probe = fx.probe();
+      let statusCommandId;
+      let promptCommandId;
+      try {
+        const trackingId = probe.sessions()[0].trackingId;
+        statusCommandId = probe.store.enqueueTuiCommand({
+          trackingId, kind: 'status', payload: null,
+        }).commandId;
+        promptCommandId = probe.store.enqueueTuiCommand({
+          trackingId, kind: 'prompt', payload: { text: '/tg off' },
+        }).commandId;
+      } finally { probe.close(); }
+      ticks.poll();
+      const statusRow = rawCommandRow(fx.sqlitePath, statusCommandId);
+      assert.equal(statusRow.state, 'completed');
+      const promptRow = rawCommandRow(fx.sqlitePath, promptCommandId);
+      assert.equal(promptRow.state, 'failed');
+      assert.equal(promptRow.resultCode, 'rejected_slash_prefix');
+      const results = commandResultEvents(fx);
+      assert.equal(results.length, 2, 'ordinary commands keep their command_result events');
+      const oks = results.map((e) => JSON.parse(e.payloadJson).ok).sort();
+      assert.deepEqual(oks, [false, true]);
+      assert.equal(choiceRequestEvents(fx).length, 0);
+    } finally { await fx.cleanup(); }
+  });
+
+  test('poll and heartbeat keep running during the awaited execute', async () => {
+    const pending = await makePendingFixture();
+    try {
+      assert.equal(typeof pending.ticks.poll, 'function', 'poll timer registered');
+      assert.equal(typeof pending.ticks.heartbeat, 'function', 'heartbeat timer registered');
+      const before = rawHeartbeatAt(pending.fx.sqlitePath, pending.trackingId);
+      const commandId = pending.enqueue({ requestId: REQUEST_ID, index: 0 });
+      // The poll tick fires while the tool promise is still unresolved —
+      // this IS the dispatch path — and the heartbeat tick still works too.
+      pending.ticks.poll();
+      pending.ticks.heartbeat();
+      const result = await pending.pendingPromise;
+      assertChoiceResult(result, { status: 'selected', index: 0, value: 'deploy-now' });
+      const after = rawHeartbeatAt(pending.fx.sqlitePath, pending.trackingId);
+      assert.ok(after >= before, 'the heartbeat tick refreshed the live session');
+      const row = rawCommandRow(pending.fx.sqlitePath, commandId);
+      assert.equal(row.state, 'completed');
+    } finally { await pending.fx.cleanup(); }
   });
 });
