@@ -19,7 +19,7 @@ import { fileURLToPath } from 'node:url';
 import { createHash } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 
-import { Store } from '../src/store.mjs';
+import { Store, TUI_COMMAND_KINDS, TUI_EVENT_KINDS } from '../src/store.mjs';
 import { TuiBridgeClient } from '../src/tui-bridge-client.mjs';
 import { SelectiveTelegramBroker } from '../src/selective-telegram-broker.mjs';
 import {
@@ -284,6 +284,18 @@ describe('selective transport: no reasoning/tool event or command kind is ever a
       () => store.enqueueTuiCommand({ trackingId, kind: 'reasoning', payload: null }),
       TypeError,
     );
+  });
+
+  // T1 (remote ordinary choice prompts): adding the ordinary-choice kinds
+  // must never widen the sets towards hidden model internals.
+  test('the ordinary-choice kinds keep both kind sets free of reasoning/tool kinds', () => {
+    assert.ok(TUI_EVENT_KINDS.includes('choice_request'), 'choice_request event kind exists');
+    assert.ok(TUI_COMMAND_KINDS.includes('choice_response'), 'choice_response command kind exists');
+    for (const kinds of [TUI_EVENT_KINDS, TUI_COMMAND_KINDS]) {
+      for (const forbidden of ['reasoning', 'thinking', 'tool_call', 'tool_result']) {
+        assert.ok(!kinds.includes(forbidden), `${forbidden} must never become a kind`);
+      }
+    }
   });
 });
 

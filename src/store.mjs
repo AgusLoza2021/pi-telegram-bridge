@@ -37,10 +37,10 @@ const ACTIVE_STATES = Object.freeze(['running', 'waiting_decision', 'resuming'])
 // the TUI.
 export const TUI_SESSION_STATES = Object.freeze(['connected', 'busy', 'waiting']);
 export const TUI_COMMAND_KINDS = Object.freeze([
-  'prompt', 'steer', 'followup', 'abort', 'status', 'disconnect',
+  'prompt', 'steer', 'followup', 'abort', 'status', 'disconnect', 'choice_response',
 ]);
 export const TUI_EVENT_KINDS = Object.freeze([
-  'connected', 'disconnected', 'status', 'final_output', 'command_result',
+  'connected', 'disconnected', 'status', 'final_output', 'command_result', 'choice_request',
 ]);
 
 // Allowed forward transitions; everything else fails closed.
@@ -104,6 +104,20 @@ const MAX_TUI_CODE_CHARS = 64;
 const MAX_TUI_EVENT_IDS = 256;
 const MAX_TUI_BRANCH_CHARS = 128;
 
+// T1 (remote ordinary choice prompts): strictly bounded payloads for the
+// `choice_request` event and the `choice_response` command. Exact shape,
+// fail closed before persistence: option `value`s and every extra field
+// stay in the Pi process and never enter SQLite, Telegram text, logs or
+// callback data. There is still deliberately NO reasoning/tool-call/
+// tool-result kind — hidden model reasoning must never leave the TUI.
+const CHOICE_REQUEST_ID_RE = /^[0-9a-f]{16}$/;
+const MAX_CHOICE_QUESTION_CHARS = 500;
+const MAX_CHOICE_LABEL_CHARS = 64;
+const MAX_CHOICE_DESCRIPTION_CHARS = 300;
+const MIN_CHOICE_OPTIONS = 2;
+const MAX_CHOICE_OPTIONS = 4;
+const MAX_CHOICE_INDEX = 3;
+
 // T1 (project library): durable per-project history behind the live TUI
 // transport. A separate history concept: tui_sessions rows are still
 // deleted on disconnect, but each project keeps a bounded history row that
@@ -154,6 +168,95 @@ function assertTuiCode(value, name) {
   return value;
 }
 
+/** Exact-shape helper: the object must carry exactly these fields, no
+ * more and no less. An extra field anywhere — including a `value` —
+ * throws before persistence; a `undefined`-valued key still counts as a
+ * key, so it can never smuggle an extra field through JSON.stringify. */
+function assertExactFields(obj, fields, name) {
+  const keys = Object.keys(obj);
+  for (const key of keys) {
+    if (!fields.includes(key)) {
+      throw new TypeError(`${name} has an unexpected field: ${key}`);
+    }
+  }
+  for (const field of fields) {
+    if (!keys.includes(field)) {
+      throw new TypeError(`${name} is missing the field: ${field}`);
+    }
+  }
+}
+
+/** Opaque per-choice request id: exactly 16 lowercase hex chars, never a
+ * session, tracking or any other identity. */
+function assertChoiceRequestId(value, name) {
+  if (typeof value !== 'string' || !CHOICE_REQUEST_ID_RE.test(value)) {
+    throw new TypeError(`${name} must be exactly 16 lowercase hex chars`);
+  }
+}
+
+function assertChoiceText(value, name, maxChars) {
+  if (typeof value !== 'string' || value.length === 0 || value.length > maxChars) {
+    throw new TypeError(`${name} must be a non-empty string of at most ${maxChars} chars`);
+  }
+}
+
+function assertChoiceRequestPayload(payload) {
+  assertPlainObject(payload, 'payload');
+  assertExactFields(
+    payload, ['requestId', 'question', 'options', 'expiresAt'], 'choice_request payload',
+  );
+  assertChoiceRequestId(payload.requestId, 'payload.requestId');
+  assertChoiceText(payload.question, 'payload.question', MAX_CHOICE_QUESTION_CHARS);
+  if (
+    !Array.isArray(payload.options)
+    || payload.options.length < MIN_CHOICE_OPTIONS
+    || payload.options.length > MAX_CHOICE_OPTIONS
+  ) {
+    throw new TypeError(
+      `payload.options must be an ordered list of ${MIN_CHOICE_OPTIONS}..${MAX_CHOICE_OPTIONS} options`,
+    );
+  }
+  for (const option of payload.options) {
+    assertPlainObject(option, 'each payload.options entry');
+    assertExactFields(option, ['label', 'description'], 'each payload.options entry');
+    assertChoiceText(option.label, 'option.label', MAX_CHOICE_LABEL_CHARS);
+    assertChoiceText(option.description, 'option.description', MAX_CHOICE_DESCRIPTION_CHARS);
+  }
+  if (!Number.isSafeInteger(payload.expiresAt) || payload.expiresAt <= 0) {
+    throw new TypeError('payload.expiresAt must be a positive safe integer');
+  }
+}
+
+/** Exact union: {requestId, index} XOR {requestId, cancelled:true}. Key
+ * sets are compared directly so an undefined-valued extra key, a mixed
+ * variant or cancelled:false all fail closed. */
+function assertChoiceResponsePayload(payload) {
+  assertPlainObject(payload, 'payload');
+  const keys = Object.keys(payload).sort();
+  const isIndexVariant = keys.length === 2 && keys[0] === 'index' && keys[1] === 'requestId';
+  const isCancelledVariant = keys.length === 2
+    && keys[0] === 'cancelled' && keys[1] === 'requestId';
+  if (!isIndexVariant && !isCancelledVariant) {
+    throw new TypeError(
+      'choice_response payload must be exactly {requestId, index} or {requestId, cancelled:true}',
+    );
+  }
+  assertChoiceRequestId(payload.requestId, 'payload.requestId');
+  if (isIndexVariant) {
+    if (
+      !Number.isSafeInteger(payload.index)
+      || payload.index < 0
+      || payload.index > MAX_CHOICE_INDEX
+    ) {
+      throw new TypeError(`payload.index must be an integer in [0, ${MAX_CHOICE_INDEX}]`);
+    }
+    return;
+  }
+  if (payload.cancelled !== true) {
+    throw new TypeError('payload.cancelled must be exactly true');
+  }
+}
+
 function assertTuiCommandPayload(kind, payload) {
   switch (kind) {
     case 'prompt':
@@ -167,6 +270,9 @@ function assertTuiCommandPayload(kind, payload) {
       if (payload === null) return;
       assertPlainObject(payload, 'payload');
       if (payload.reason !== undefined) assertTuiCode(payload.reason, 'payload.reason');
+      return;
+    case 'choice_response':
+      assertChoiceResponsePayload(payload);
       return;
     case 'status':
       if (payload === null) return;
@@ -188,6 +294,9 @@ function assertTuiEventPayload(kind, payload) {
     case 'final_output':
       assertPlainObject(payload, 'payload');
       assertTuiText(payload.text, 'payload.text');
+      return;
+    case 'choice_request':
+      assertChoiceRequestPayload(payload);
       return;
     case 'command_result':
       assertPlainObject(payload, 'payload');

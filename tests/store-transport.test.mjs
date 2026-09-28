@@ -20,6 +20,8 @@ import { DatabaseSync } from 'node:sqlite';
 import {
   MAX_TUI_RECENT_PROJECTS,
   Store,
+  TUI_COMMAND_KINDS,
+  TUI_EVENT_KINDS,
   TUI_PROJECT_RETENTION_MS,
 } from '../src/store.mjs';
 import { TuiBridgeClient } from '../src/tui-bridge-client.mjs';
@@ -1636,10 +1638,23 @@ describe('store: tui event identity snapshots (T4B1)', () => {
     store.appendTuiEvent({ trackingId, kind: 'status', payload: null });
     store.appendTuiEvent({ trackingId, kind: 'final_output', payload: { text: 'done' } });
     store.appendTuiEvent({ trackingId, kind: 'command_result', payload: { ok: true } });
+    store.appendTuiEvent({
+      trackingId,
+      kind: 'choice_request',
+      payload: {
+        requestId: 'a1b2c3d4e5f60718',
+        question: 'Ship which database?',
+        options: [
+          { label: 'SQLite', description: 'Zero-config local file' },
+          { label: 'Postgres', description: 'Managed server' },
+        ],
+        expiresAt: T0 + 30 * 60 * 1000,
+      },
+    });
     const events = brokerEvents().filter((e) => e.kind !== 'connected'
       || e.createdAt === T0 + 1000);
     const byKind = Object.fromEntries(events.map((e) => [e.kind, e]));
-    for (const kind of ['connected', 'status', 'final_output', 'command_result']) {
+    for (const kind of ['connected', 'status', 'final_output', 'command_result', 'choice_request']) {
       const event = byKind[kind];
       assert.ok(event, `${kind} event is pending`);
       assert.equal(event.label, 'alpha', `${kind} snapshots the session label`);
@@ -1930,3 +1945,215 @@ describe('store: tui event identity snapshots (T4B1)', () => {
     }
   });
 });
+
+// T1 (remote ordinary choice prompts): strictly bounded Store transport
+// contract for the `choice_request` TUI event and the `choice_response`
+// TUI command. Payloads are exact-shape and fail closed BEFORE persistence:
+// option `value`s and every extra field stay in the Pi process and never
+// enter SQLite, Telegram text, logs or callback data. The kind sets remain
+// closed: no reasoning/tool-call/tool-result kind is ever added.
+describe('store: remote ordinary choice transport contract (T1)', () => {
+  const REQUEST_ID = 'a1b2c3d4e5f60718';
+
+  let dir;
+  let t;
+  let store;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(TEST_RUNS, 'choice-t1-'));
+    t = T0;
+    store = new Store(join(dir, 'main.sqlite'), { now: () => t, isProcessAlive: () => true });
+  });
+
+  afterEach(() => {
+    store.close();
+  });
+
+  const reg = (over = {}) => ({
+    trackingId: 'a'.repeat(32),
+    connectionId: 'c'.repeat(32),
+    label: 'alpha',
+    pid: 1111,
+    staleCutoff: t + 30_000,
+    ...over,
+  });
+
+  const choiceRequest = (over = {}) => ({
+    requestId: REQUEST_ID,
+    question: 'Which database should we ship?',
+    options: [
+      { label: 'SQLite', description: 'Zero-config local file' },
+      { label: 'Postgres', description: 'Managed server, richer types' },
+    ],
+    expiresAt: T0 + 30 * 60 * 1000,
+    ...over,
+  });
+
+  const connected = () => {
+    assert.equal(store.registerTuiSession(reg({ cwd: 'C:/proj/choice' })).ok, true);
+    // Registration emits its own 'connected' event; only choice kinds are
+    // the subject of these tests.
+    const trackingId = reg().trackingId;
+    const connectedEvents = store
+      .listPendingTuiEvents({ trackingId })
+      .filter((e) => e.kind === 'connected');
+    if (connectedEvents.length > 0) {
+      store.acknowledgeTuiEvents({ eventIds: connectedEvents.map((e) => e.eventId) });
+    }
+    return trackingId;
+  };
+
+  /** After every rejected call the transport queues must stay untouched. */
+  const assertNothingPending = (trackingId) => {
+    assert.equal(
+      store.listPendingTuiEvents({ trackingId }).filter((e) => e.kind === 'choice_request').length,
+      0,
+      'a rejected choice_request must never persist an event',
+    );
+    assert.deepEqual(
+      store.claimNextTuiCommand({ trackingId, connectionId: 'c'.repeat(32) }),
+      { ok: false, reason: 'empty' },
+      'a rejected choice_response must never persist a command',
+    );
+  };
+
+  const rejectRequest = (trackingId, payload, why) => {
+    assert.throws(
+      () => store.appendTuiEvent({ trackingId, kind: 'choice_request', payload }),
+      TypeError,
+      why,
+    );
+    assertNothingPending(trackingId);
+  };
+
+  const rejectResponse = (trackingId, payload, why) => {
+    assert.throws(
+      () => store.enqueueTuiCommand({ trackingId, kind: 'choice_response', payload }),
+      TypeError,
+      why,
+    );
+    assertNothingPending(trackingId);
+  };
+
+  test('kind sets stay closed: exactly the ordinary-choice kinds, never reasoning/tool kinds', () => {
+    assert.deepEqual(
+      [...TUI_EVENT_KINDS].sort(),
+      ['choice_request', 'command_result', 'connected', 'disconnected', 'final_output', 'status'],
+    );
+    assert.deepEqual(
+      [...TUI_COMMAND_KINDS].sort(),
+      ['abort', 'choice_response', 'disconnect', 'followup', 'prompt', 'status', 'steer'],
+    );
+  });
+
+  test('a bounded choice_request event round-trips through the store exactly', () => {
+    const trackingId = connected();
+    assert.equal(
+      store.appendTuiEvent({ trackingId, kind: 'choice_request', payload: choiceRequest() }).ok,
+      true,
+    );
+    const events = store
+      .listPendingTuiEvents({ trackingId })
+      .filter((e) => e.kind === 'choice_request');
+    assert.equal(events.length, 1);
+    assert.equal(events[0].kind, 'choice_request');
+    assert.deepEqual(
+      events[0].payload,
+      choiceRequest(),
+      'payload must survive the JSON round-trip field-exactly',
+    );
+    assert.ok(!JSON.stringify(events).includes('value'), 'no option value ever persists');
+  });
+
+  test('both exact choice_response variants round-trip through the store', () => {
+    const trackingId = connected();
+    assert.equal(store.enqueueTuiCommand({
+      trackingId, kind: 'choice_response', payload: { requestId: REQUEST_ID, index: 1 },
+    }).ok, true);
+    assert.equal(store.enqueueTuiCommand({
+      trackingId, kind: 'choice_response', payload: { requestId: REQUEST_ID, cancelled: true },
+    }).ok, true);
+    const first = store.claimNextTuiCommand({ trackingId, connectionId: 'c'.repeat(32) });
+    assert.equal(first.ok, true);
+    assert.equal(first.command.kind, 'choice_response');
+    assert.deepEqual(first.command.payload, { requestId: REQUEST_ID, index: 1 });
+    const second = store.claimNextTuiCommand({ trackingId, connectionId: 'c'.repeat(32) });
+    assert.deepEqual(second.command.payload, { requestId: REQUEST_ID, cancelled: true });
+  });
+
+  test('choice_request rejects every extra or malformed field before persistence', () => {
+    const trackingId = connected();
+    const two = [
+      { label: 'A', description: 'first' },
+      { label: 'B', description: 'second' },
+    ];
+    rejectRequest(trackingId, { ...choiceRequest(), value: 'sqlite' },
+      'a top-level value must never persist');
+    rejectRequest(trackingId, {
+      ...choiceRequest(),
+      options: [{ label: 'A', description: 'a', value: 'sqlite' }, two[1]],
+    }, 'an option value must never persist');
+    rejectRequest(trackingId, { ...choiceRequest(), extra: 1 }, 'extra top-level field');
+    rejectRequest(trackingId, { ...choiceRequest(), question: undefined }, 'missing question');
+    rejectRequest(trackingId, { ...choiceRequest(), question: '' }, 'empty question');
+    rejectRequest(trackingId, { ...choiceRequest(), question: 'x'.repeat(501) },
+      'question above 500 chars');
+    rejectRequest(trackingId, { ...choiceRequest(), options: 'two' }, 'options must be an array');
+    rejectRequest(trackingId, { ...choiceRequest(), options: [two[0]] }, 'fewer than 2 options');
+    rejectRequest(trackingId, {
+      ...choiceRequest(),
+      options: ['A', 'B', 'C', 'D', 'E'].map((l) => ({ label: l, description: `option ${l}` })),
+    }, 'more than 4 options');
+    rejectRequest(trackingId, { ...choiceRequest(), options: [two[0], null] }, 'null option');
+    rejectRequest(trackingId, { ...choiceRequest(), options: [two[0], { label: 'B' }] },
+      'option missing description');
+    rejectRequest(trackingId, { ...choiceRequest(), options: [two[0], { label: '', description: 'b' }] },
+      'empty label');
+    rejectRequest(trackingId, {
+      ...choiceRequest(),
+      options: [two[0], { label: 'x'.repeat(65), description: 'b' }],
+    }, 'label above 64 chars');
+    rejectRequest(trackingId, {
+      ...choiceRequest(),
+      options: [two[0], { label: 'B', description: 'x'.repeat(301) }],
+    }, 'description above 300 chars');
+    rejectRequest(trackingId, { ...choiceRequest(), requestId: 'A1B2C3D4E5F60718' },
+      'uppercase hex id');
+    rejectRequest(trackingId, { ...choiceRequest(), requestId: 'a1b2c3d4e5f6071' },
+      '15-char id');
+    rejectRequest(trackingId, { ...choiceRequest(), requestId: 'a1b2c3d4e5f607188' },
+      '17-char id');
+    rejectRequest(trackingId, { ...choiceRequest(), requestId: 'zzzzzzzzzzzzzzzz' },
+      'non-hex id');
+    rejectRequest(trackingId, { ...choiceRequest(), requestId: 123 }, 'non-string id');
+    rejectRequest(trackingId, { ...choiceRequest(), expiresAt: 0 }, 'zero expiresAt');
+    rejectRequest(trackingId, { ...choiceRequest(), expiresAt: -1 }, 'negative expiresAt');
+    rejectRequest(trackingId, { ...choiceRequest(), expiresAt: 1.5 }, 'float expiresAt');
+    rejectRequest(trackingId, { ...choiceRequest(), expiresAt: 'soon' }, 'string expiresAt');
+    rejectRequest(trackingId, { ...choiceRequest(), expiresAt: undefined }, 'missing expiresAt');
+  });
+
+  test('choice_response rejects every malformed shape before persistence', () => {
+    const trackingId = connected();
+    rejectResponse(trackingId, { requestId: REQUEST_ID, index: 0, value: 'sqlite' },
+      'a value field must never persist');
+    rejectResponse(trackingId, { requestId: REQUEST_ID, index: 1, extra: true },
+      'extra field beside index');
+    rejectResponse(trackingId, { requestId: REQUEST_ID, index: 1, cancelled: undefined },
+      'an undefined extra key must not smuggle through');
+    rejectResponse(trackingId, { requestId: REQUEST_ID, cancelled: false },
+      'cancelled:false is not an accepted variant');
+    rejectResponse(trackingId, { requestId: REQUEST_ID, index: 0, cancelled: true },
+      'mixed index+cancelled');
+    rejectResponse(trackingId, { requestId: REQUEST_ID }, 'neither index nor cancelled');
+    rejectResponse(trackingId, { requestId: REQUEST_ID, index: 4 }, 'index out of range');
+    rejectResponse(trackingId, { requestId: REQUEST_ID, index: -1 }, 'negative index');
+    rejectResponse(trackingId, { requestId: REQUEST_ID, index: 1.5 }, 'float index');
+    rejectResponse(trackingId, { requestId: REQUEST_ID, index: '1' }, 'string index');
+    rejectResponse(trackingId, { requestId: 'nope', index: 0 }, 'malformed requestId');
+    rejectResponse(trackingId, { requestId: 123, index: 0 }, 'non-string requestId');
+    rejectResponse(trackingId, { index: 0 }, 'missing requestId');
+    rejectResponse(trackingId, null, 'null payload');
+  });
+});
+
