@@ -2181,8 +2181,18 @@ export class SelectiveTelegramBroker {
           this.#log('choice_capacity');
           return null;
         }
+        // Build the card ONCE and require a non-empty string: a question
+        // that sanitizes fully away (whitespace-only, a bare tg id, hex
+        // token, path or pid) makes the copy builder return null. Emitting
+        // that would send zero chunks, report 'sent' and register an
+        // INVISIBLE pending choice — the same fail-closed refusal instead.
+        const card = copy.choiceCard({ header, question: payload.question, options: payload.options });
+        if (typeof card !== 'string' || card.length === 0) {
+          this.#log('choice_refused');
+          return null;
+        }
         return {
-          text: copy.choiceCard({ header, question: payload.question, options: payload.options }),
+          text: card,
           replyMarkup: this.#choiceKeyboard(payload),
           pendingChoice: choice,
         };

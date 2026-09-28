@@ -5234,6 +5234,40 @@ describe('SelectiveTelegramBroker: remote ordinary choice cards (T2B1)', () => {
     } finally { fx.close(); }
   });
 
+  test('a question that sanitizes fully away is refused: no invisible card, no registration', async () => {
+    const fx = makeChoiceFixture();
+    try {
+      fx.connectA();
+      const api = makeFakeApi();
+      const broker = newBroker(fx, api);
+      await settle(fx, broker, api);
+      // Every question is Store-valid (non-empty, within caps) but none
+      // survives the copy hygiene: choiceCard returns null and the broker
+      // must refuse instead of emitting an invisible card and registering
+      // a pending choice nobody can see.
+      const invisibleQuestions = [
+        '   ',           // whitespace-only
+        'tg:aaa111',      // tg short id only
+        'a'.repeat(16),   // 16+ hex token only
+        'C:/proj/alpha',  // drive/root path only
+        'pid 1234',       // pid mention only
+      ];
+      for (const [i, question] of invisibleQuestions.entries()) {
+        fx.enqueueChoice(A.trackingId, fx.choicePayload({ requestId: hexRequestId(i), question }));
+      }
+      await broker.drainTuiEvents();
+      assert.equal(api.sent.length, 0, 'an invisible card must send zero messages');
+      assert.equal(fx.store.listPendingBrokerTuiEvents({ limit: 100 }).length, 0,
+        'every refusal must acknowledge its event so the queue never wedges');
+      assert.ok(fx.logs.filter((e) => e.code === 'choice_refused').length >= invisibleQuestions.length,
+        'only the fixed refusal code may be logged');
+      await deliverText(broker, api, 'still routable');
+      const commands = fx.client.poll(A).commands;
+      assert.equal(commands.length, 1, 'no invisible pending choice may guard plain text');
+      assert.equal(commands[0].payload.text, 'still routable');
+    } finally { fx.close(); }
+  });
+
   test('an expired choice request is refused, sends nothing, and leaves plain text routable', async () => {
     const fx = makeChoiceFixture();
     try {
