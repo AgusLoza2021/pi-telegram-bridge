@@ -22,6 +22,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { Store, TUI_COMMAND_KINDS, TUI_EVENT_KINDS } from '../src/store.mjs';
 import { TuiBridgeClient } from '../src/tui-bridge-client.mjs';
 import { SelectiveTelegramBroker } from '../src/selective-telegram-broker.mjs';
+import { TelegramApiError } from '../src/telegram-api.mjs';
 import {
   MAX_BUTTON_TEXT_CHARS,
   PROJECT_COLOR_SLOTS,
@@ -4982,6 +4983,626 @@ describe('SelectiveTelegramBroker: T5B integration smoke (one coherent two-windo
           assert.ok(!hit, `leaked "${needle}" in: ${JSON.stringify(text)}`);
         }
       }
+    } finally { fx.close(); }
+  });
+});
+
+describe('SelectiveTelegramBroker: remote ordinary choice cards (T2B1)', () => {
+  // The broker renders/sends/registers remote ordinary-choice cards from the
+  // T1 `choice_request` transport contract (commit 7c062f4) and the T2A copy
+  // builders (commit 3d2c428). The v1:w / v1:W callback grammar is RENDERED
+  // here but deliberately NOT parsed: the consumer branch belongs to the
+  // next work unit, never this one. No deploy, no live sends, no docs.
+  const T0 = 1_700_000_000_000;
+  const CHOICE_TTL_MS = 30 * 60 * 1000;
+  const REQUEST_ID = 'a1b2c3d4e5f60718';
+  const REQUEST_ID_2 = 'f0e1d2c3b4a59786';
+  const REQUEST_ID_3 = '0123456789abcdef';
+
+  const hexRequestId = (i) => i.toString(16).padStart(16, '0');
+
+  const FOUR_OPTIONS = Object.freeze([
+    { label: 'One', description: 'first' },
+    { label: 'Two', description: 'second' },
+    { label: 'Three', description: 'third' },
+    { label: 'Four', description: 'fourth' },
+  ]);
+
+  /** Fresh store + one client per test, mirroring the sibling fixtures. */
+  function makeChoiceFixture() {
+    const dir = mkdtempSync(join(TEST_RUNS, 'sel-choice-'));
+    let t = T0;
+    const store = new Store(join(dir, 'bridge.sqlite'), { now: () => t, isProcessAlive: () => true });
+    const client = new TuiBridgeClient(store, { staleAfterMs: 30_000 });
+    const logs = [];
+    return {
+      store,
+      client,
+      logs,
+      storePath: join(dir, 'bridge.sqlite'),
+      now: () => t,
+      advance(ms) { t += ms; },
+      connectA() {
+        assert.equal(client.connect({ ...A, shortId: 'aaa111', label: 'alpha', pid: 1111, cwd: 'C:/proj/alpha' }).ok, true);
+      },
+      connectB() {
+        assert.equal(client.connect({ ...B, shortId: 'bbb222', label: 'beta', pid: 2222, cwd: 'C:/proj/beta' }).ok, true);
+      },
+      choicePayload(over = {}) {
+        return {
+          requestId: REQUEST_ID,
+          question: 'Which database should we ship?',
+          options: [
+            { label: 'SQLite', description: 'Zero-config local file' },
+            { label: 'Postgres', description: 'Managed server, richer types' },
+          ],
+          expiresAt: t + CHOICE_TTL_MS,
+          ...over,
+        };
+      },
+      enqueueChoice(trackingId, payload) {
+        const res = store.appendTuiEvent({ trackingId, kind: 'choice_request', payload });
+        assert.equal(res.ok, true);
+        return res;
+      },
+      close() { store.close(); },
+    };
+  }
+
+  function newBroker(fx, api, config = BROKER_CONFIG) {
+    return new SelectiveTelegramBroker({
+      store: fx.store,
+      api,
+      config,
+      now: fx.now,
+      logger: (entry) => fx.logs.push(entry),
+    });
+  }
+
+  /** Clear the registration 'connected' card and early logs so each test
+   *  asserts only on what happens after the transport went quiet. */
+  async function settle(fx, broker, api) {
+    await broker.drainTuiEvents();
+    api.sent.length = 0;
+    fx.logs.length = 0;
+  }
+
+  async function deliverText(broker, api, text) {
+    broker.handleUpdate(msg(text));
+    await broker.flushReplies();
+  }
+
+  /** Every sent message that carries a choice-card keyboard. */
+  function choiceCards(api) {
+    return api.sent.filter((m) => m.replyMarkup?.inline_keyboard?.some((row) =>
+      row.some((button) => /^v1:[wW]:/.test(button.callback_data))));
+  }
+
+  const callbackDatas = (cards) => cards.flatMap((m) =>
+    m.replyMarkup.inline_keyboard.flat().map((button) => button.callback_data));
+
+  test('a valid two-option choice renders the frozen-header card with one button per option plus Cancel', async () => {
+    const fx = makeChoiceFixture();
+    try {
+      fx.connectA();
+      const api = makeFakeApi();
+      const broker = newBroker(fx, api);
+      await settle(fx, broker, api);
+      fx.enqueueChoice(A.trackingId, fx.choicePayload());
+      await broker.drainTuiEvents();
+      const cards = choiceCards(api);
+      assert.equal(cards.length, 1, 'exactly one choice card must be sent');
+      assert.match(cards[0].text, /Pi · alpha/, 'the card header must be the identity header');
+      assert.match(cards[0].text, /Which database should we ship\?/);
+      assert.match(cards[0].text, /1\. SQLite — Zero-config local file/);
+      assert.match(cards[0].text, /2\. Postgres — Managed server, richer types/);
+      assert.match(cards[0].text, /ordinary workflow choice for the current task/,
+        'the not-a-permission sentence must be on the card');
+      const kb = cards[0].replyMarkup.inline_keyboard;
+      assert.equal(kb.length, 3, 'one row per option plus one Cancel row');
+      assert.deepEqual(kb[0], [{ text: '1. SQLite', callback_data: `v1:w:${REQUEST_ID}:0` }]);
+      assert.deepEqual(kb[1], [{ text: '2. Postgres', callback_data: `v1:w:${REQUEST_ID}:1` }]);
+      assert.deepEqual(kb[2], [{ text: copyModule.CHOICE_BUTTON_CANCEL, callback_data: `v1:W:${REQUEST_ID}` }]);
+      assert.equal(fx.store.listPendingBrokerTuiEvents({ limit: 100 }).length, 0,
+        'the sent choice event must be acknowledged');
+    } finally { fx.close(); }
+  });
+
+  test('a valid four-option choice renders four ordered option rows plus Cancel', async () => {
+    const fx = makeChoiceFixture();
+    try {
+      fx.connectA();
+      const api = makeFakeApi();
+      const broker = newBroker(fx, api);
+      await settle(fx, broker, api);
+      fx.enqueueChoice(A.trackingId, fx.choicePayload({ options: FOUR_OPTIONS }));
+      await broker.drainTuiEvents();
+      const cards = choiceCards(api);
+      assert.equal(cards.length, 1);
+      const kb = cards[0].replyMarkup.inline_keyboard;
+      assert.equal(kb.length, 5, 'four option rows plus one Cancel row');
+      assert.deepEqual(kb[0], [{ text: '1. One', callback_data: `v1:w:${REQUEST_ID}:0` }]);
+      assert.deepEqual(kb[3], [{ text: '4. Four', callback_data: `v1:w:${REQUEST_ID}:3` }]);
+      assert.deepEqual(kb[4], [{ text: copyModule.CHOICE_BUTTON_CANCEL, callback_data: `v1:W:${REQUEST_ID}` }]);
+    } finally { fx.close(); }
+  });
+
+  test('every choice callback stays under 64 UTF-8 bytes and carries only the opaque request id and index', async () => {
+    const fx = makeChoiceFixture();
+    try {
+      fx.connectA();
+      const api = makeFakeApi();
+      const broker = newBroker(fx, api);
+      await settle(fx, broker, api);
+      fx.enqueueChoice(A.trackingId, fx.choicePayload({ options: FOUR_OPTIONS }));
+      await broker.drainTuiEvents();
+      const datas = callbackDatas(choiceCards(api));
+      assert.equal(datas.length, 5);
+      for (const data of datas) {
+        assert.ok(Buffer.byteLength(data, 'utf8') <= 64, `callback over 64 bytes: ${data}`);
+        assert.match(data, /^v1:[wW]:[0-9a-f]{16}(:[0-3])?$/,
+          `callback_data must carry only the grammar, request id and index: ${data}`);
+      }
+      // Privacy: option text, session identity and environment details stay
+      // out of callback_data; option `value`s never even reach the transport
+      // (the T1 store contract rejects them before persistence).
+      const joined = datas.join('\n');
+      for (const needle of ['SQLite', 'Postgres', 'One', 'Four', 'alpha', A.trackingId,
+        'C:', 'proj', '1111', 'secret', 'token']) {
+        assert.ok(!joined.includes(needle), `callback_data leaked "${needle}"`);
+      }
+      const card = choiceCards(api)[0];
+      assert.ok(!card.text.includes(A.trackingId), 'the card text must never carry the tracking id');
+      assert.ok(!card.text.includes('C:/proj/alpha'), 'the card text must never carry the cwd');
+    } finally { fx.close(); }
+  });
+
+  test('a card carrying a credential shape anywhere is refused with a fixed code, sends nothing and never blocks the queue', async () => {
+    const fx = makeChoiceFixture();
+    try {
+      fx.connectA();
+      const api = makeFakeApi();
+      const broker = newBroker(fx, api);
+      await settle(fx, broker, api);
+      const variants = [
+        fx.choicePayload({ question: `Deploy key ghp_${'a'.repeat(20)} — pick one` }),
+        fx.choicePayload({
+          options: [
+            { label: `Use key sk-${'x'.repeat(20)}`, description: 'local only' },
+            { label: 'Postgres', description: 'managed' },
+          ],
+        }),
+        fx.choicePayload({
+          options: [
+            { label: 'AWS', description: `key AKIA${'B2C3D4F5G7H1J9K0'}` },
+            { label: 'Postgres', description: 'managed' },
+          ],
+        }),
+      ];
+      for (const payload of variants) fx.enqueueChoice(A.trackingId, payload);
+      await broker.drainTuiEvents();
+      assert.equal(api.sent.length, 0, 'a refused card must send nothing and echo nothing');
+      assert.equal(fx.store.listPendingBrokerTuiEvents({ limit: 100 }).length, 0,
+        'the refusal must acknowledge the event so it never blocks the queue');
+      assert.ok(fx.logs.some((e) => e.code === 'choice_refused'),
+        'a fixed refusal code must be logged, never payload details');
+      for (const entry of fx.logs) {
+        assert.ok(!JSON.stringify(entry).includes('ghp_'), 'the refusal log must never echo the payload');
+      }
+      // Refusal blocks nothing: plain text still routes afterwards.
+      await deliverText(broker, api, 'carry on');
+      const commands = fx.client.poll(A).commands;
+      assert.equal(commands.length, 1);
+      assert.equal(commands[0].kind, 'prompt');
+    } finally { fx.close(); }
+  });
+
+  test('a payload corrupted after store validation fails closed at the broker', async () => {
+    const fx = makeChoiceFixture();
+    try {
+      fx.connectA();
+      const api = makeFakeApi();
+      const broker = newBroker(fx, api);
+      await settle(fx, broker, api);
+      fx.enqueueChoice(A.trackingId, fx.choicePayload({ requestId: REQUEST_ID }));
+      fx.enqueueChoice(A.trackingId, fx.choicePayload({ requestId: REQUEST_ID_2, options: FOUR_OPTIONS }));
+      fx.enqueueChoice(A.trackingId, fx.choicePayload({ requestId: REQUEST_ID_3 }));
+      // Corrupt the persisted rows AFTER the store's exact-shape validation:
+      // the broker must re-validate defensively and fail closed.
+      const raw = new DatabaseSync(fx.storePath);
+      const rows = raw.prepare("SELECT event_id FROM tui_events WHERE kind = 'choice_request' ORDER BY event_id").all();
+      assert.equal(rows.length, 3);
+      const update = raw.prepare('UPDATE tui_events SET payload_json = ? WHERE event_id = ?');
+      update.run(JSON.stringify({
+        requestId: 'NOT-HEX-AT-ALL', question: 'q', options: fx.choicePayload().options, expiresAt: fx.now() + CHOICE_TTL_MS,
+      }), rows[0].event_id);
+      update.run(JSON.stringify({
+        requestId: REQUEST_ID_2,
+        question: 'q',
+        options: [...FOUR_OPTIONS, { label: 'Five', description: 'too many' }],
+        expiresAt: fx.now() + CHOICE_TTL_MS,
+      }), rows[1].event_id);
+      update.run(JSON.stringify({
+        requestId: REQUEST_ID_3, question: 'q', options: fx.choicePayload().options,
+      }), rows[2].event_id);
+      raw.close();
+      await broker.drainTuiEvents();
+      assert.equal(api.sent.length, 0, 'a malformed payload must render nothing');
+      assert.equal(fx.store.listPendingBrokerTuiEvents({ limit: 100 }).length, 0,
+        'every refusal must acknowledge its event');
+      assert.ok(fx.logs.filter((e) => e.code === 'choice_refused').length >= 3);
+    } finally { fx.close(); }
+  });
+
+  test('an expired choice request is refused, sends nothing, and leaves plain text routable', async () => {
+    const fx = makeChoiceFixture();
+    try {
+      fx.connectA();
+      const api = makeFakeApi();
+      const broker = newBroker(fx, api);
+      await settle(fx, broker, api);
+      fx.enqueueChoice(A.trackingId, fx.choicePayload({ expiresAt: fx.now() - 1 }));
+      await broker.drainTuiEvents();
+      assert.equal(api.sent.length, 0, 'an expired request must never render');
+      assert.equal(fx.store.listPendingBrokerTuiEvents({ limit: 100 }).length, 0);
+      assert.ok(fx.logs.some((e) => e.code === 'choice_refused'));
+      await deliverText(broker, api, 'still here');
+      const commands = fx.client.poll(A).commands;
+      assert.equal(commands.length, 1, 'plain text must stay routable after a refusal');
+      assert.equal(commands[0].payload.text, 'still here');
+    } finally { fx.close(); }
+  });
+
+  test('a choice request whose session is no longer live is refused', async () => {
+    const fx = makeChoiceFixture();
+    try {
+      fx.connectA();
+      const api = makeFakeApi();
+      const broker = newBroker(fx, api);
+      await settle(fx, broker, api);
+      fx.enqueueChoice(A.trackingId, fx.choicePayload());
+      fx.advance(31_000); // alpha ages out of the 30s live window
+      await broker.drainTuiEvents();
+      assert.equal(api.sent.length, 0, 'a dead session must never render a card');
+      assert.equal(fx.store.listPendingBrokerTuiEvents({ limit: 100 }).length, 0,
+        'the refusal must acknowledge the event');
+      assert.ok(fx.logs.some((e) => e.code === 'choice_refused'));
+    } finally { fx.close(); }
+  });
+
+  test('the choice card header is frozen from the event snapshot, not later live identity', async () => {
+    const fx = makeChoiceFixture();
+    try {
+      assert.equal(fx.client.connect({ ...A, shortId: 'aaa111', label: 'v1', pid: 1111, cwd: 'C:/proj/alpha' }).ok, true);
+      const api = makeFakeApi();
+      const broker = newBroker(fx, api);
+      await settle(fx, broker, api);
+      fx.enqueueChoice(A.trackingId, fx.choicePayload());
+      // Replace the live row with a new label: the already-persisted event
+      // keeps its own snapshot identity.
+      assert.equal(fx.client.disconnect({ ...A }).ok, true);
+      assert.equal(fx.client.connect({
+        ...A, connectionId: '9'.repeat(32), shortId: 'aaa111', label: 'v2', pid: 1111, cwd: 'C:/proj/alpha',
+      }).ok, true);
+      await broker.drainTuiEvents();
+      const card = choiceCards(api).find((m) => m.text.includes('Which database'));
+      assert.ok(card, 'the choice card must still be sent for the live replacement');
+      assert.match(card.text, /Pi · v1/, 'the frozen snapshot header must win');
+      assert.doesNotMatch(card.text, /Pi · v2/);
+    } finally { fx.close(); }
+  });
+
+  test('the pending choice registers only after the card was definitively sent', async () => {
+    const fx = makeChoiceFixture();
+    try {
+      fx.connectA();
+      const api = makeFakeApi();
+      const broker = newBroker(fx, api);
+      await settle(fx, broker, api);
+      fx.enqueueChoice(A.trackingId, fx.choicePayload());
+      api.failNextSends(1); // definitive transport failure
+      await broker.drainTuiEvents();
+      assert.equal(fx.store.listPendingBrokerTuiEvents({ limit: 100 }).length, 1,
+        'a failed delivery stays unacknowledged and retried whole');
+      await deliverText(broker, api, 'plain before the card');
+      assert.equal(fx.client.poll(A).commands.length, 1,
+        'an unregistered choice must never steal plain text');
+      await broker.drainTuiEvents(); // transport healthy: the card retries and lands
+      const cards = choiceCards(api);
+      assert.equal(cards.length, 1);
+      await deliverText(broker, api, 'plain after the card');
+      assert.equal(fx.client.poll(A).commands.length, 0, 'the registered choice now guards plain text');
+      assert.equal(api.sent.at(-1).text, copyModule.choicePendingPlain);
+    } finally { fx.close(); }
+  });
+
+  test('an uncertain delivery never registers the pending choice', async () => {
+    const fx = makeChoiceFixture();
+    try {
+      fx.connectA();
+      const api = makeFakeApi();
+      const realSend = api.sendMessage.bind(api);
+      let uncertainSends = 0;
+      api.sendMessage = async (args) => {
+        if (uncertainSends > 0) {
+          uncertainSends -= 1;
+          throw new TelegramApiError({ code: 'timeout' });
+        }
+        return realSend(args);
+      };
+      const broker = newBroker(fx, api);
+      await settle(fx, broker, api);
+      fx.enqueueChoice(A.trackingId, fx.choicePayload());
+      uncertainSends = 1;
+      await broker.drainTuiEvents();
+      assert.equal(fx.store.listPendingBrokerTuiEvents({ limit: 100 }).length, 1,
+        'an uncertain delivery stays unacknowledged');
+      await deliverText(broker, api, 'plain while uncertain');
+      assert.equal(fx.client.poll(A).commands.length, 1,
+        'an uncertain delivery must not register the choice');
+      uncertainSends = 0;
+      await broker.drainTuiEvents();
+      assert.equal(choiceCards(api).length, 1, 'the card retries whole and lands');
+      await deliverText(broker, api, 'plain after landing');
+      assert.equal(fx.client.poll(A).commands.length, 0, 'now registered and guarded');
+    } finally { fx.close(); }
+  });
+
+  test('a rate-limited delivery never registers the pending choice and recovers on a later drain', async () => {
+    const fx = makeChoiceFixture();
+    try {
+      fx.connectA();
+      const api = makeFakeApi();
+      const throttledConfig = {
+        telegram: { allowedUserId: 101, allowedChatId: 202 },
+        bridge: { maxMessageChars: 3800, rateLimit: { max: 1, windowMs: 60_000 } },
+      };
+      const broker = newBroker(fx, api, throttledConfig);
+      await broker.drainTuiEvents(); // the connected card consumes the one allowed take
+      api.sent.length = 0;
+      fx.enqueueChoice(A.trackingId, fx.choicePayload());
+      await broker.drainTuiEvents(); // denied: rate_limited, no registration
+      assert.equal(api.sent.length, 0);
+      assert.equal(fx.store.listPendingBrokerTuiEvents({ limit: 100 }).length, 1);
+      await deliverText(broker, api, 'plain while throttled');
+      assert.equal(fx.client.poll(A).commands.length, 1,
+        'a rate-limited delivery must not register the choice');
+      fx.advance(60_001);
+      fx.client.heartbeat({ ...A }); // keep alpha live across the throttle window
+      await broker.drainTuiEvents();
+      assert.equal(choiceCards(api).length, 1, 'the card retries once the throttle ends');
+      await deliverText(broker, api, 'plain after landing');
+      assert.equal(fx.client.poll(A).commands.length, 0);
+    } finally { fx.close(); }
+  });
+
+  test('an exact retry of a live registered request is acknowledged without resending', async () => {
+    const fx = makeChoiceFixture();
+    try {
+      fx.connectA();
+      const api = makeFakeApi();
+      const broker = newBroker(fx, api);
+      await settle(fx, broker, api);
+      fx.enqueueChoice(A.trackingId, fx.choicePayload());
+      fx.enqueueChoice(A.trackingId, fx.choicePayload()); // the same request delivered twice
+      await broker.drainTuiEvents();
+      assert.equal(choiceCards(api).length, 1, 'the identical retry must not resend the card');
+      assert.equal(fx.store.listPendingBrokerTuiEvents({ limit: 100 }).length, 0,
+        'both events must be acknowledged');
+      await deliverText(broker, api, 'hi');
+      assert.equal(api.sent.filter((m) => m.text === copyModule.choicePendingPlain).length, 1,
+        'exactly one live registration guards plain text');
+      assert.equal(fx.client.poll(A).commands.length, 0);
+    } finally { fx.close(); }
+  });
+
+  test('a second live request for the same session fails closed without evicting the first', async () => {
+    const fx = makeChoiceFixture();
+    try {
+      fx.connectA();
+      const api = makeFakeApi();
+      const broker = newBroker(fx, api);
+      await settle(fx, broker, api);
+      fx.enqueueChoice(A.trackingId, fx.choicePayload({ requestId: REQUEST_ID }));
+      await broker.drainTuiEvents();
+      assert.equal(choiceCards(api).length, 1);
+      api.sent.length = 0;
+      fx.enqueueChoice(A.trackingId, fx.choicePayload({ requestId: REQUEST_ID_2 }));
+      await broker.drainTuiEvents();
+      assert.equal(choiceCards(api).length, 0, 'the conflicting request must not render');
+      assert.equal(fx.store.listPendingBrokerTuiEvents({ limit: 100 }).length, 0,
+        'the refusal must acknowledge the event');
+      assert.ok(fx.logs.some((e) => e.code === 'choice_conflict'));
+      // The first request stays live and guarded: no eviction, no overwrite.
+      await deliverText(broker, api, 'hi');
+      assert.equal(api.sent.at(-1).text, copyModule.choicePendingPlain);
+      assert.equal(fx.client.poll(A).commands.length, 0);
+    } finally { fx.close(); }
+  });
+
+  test('different sessions hold independent pending choices', async () => {
+    const fx = makeChoiceFixture();
+    try {
+      const C = Object.freeze({ trackingId: 'c'.repeat(32), connectionId: '3'.repeat(32) });
+      fx.connectA();
+      fx.connectB();
+      assert.equal(fx.client.connect({ ...C, shortId: 'ccc333', label: 'gamma', pid: 3333, cwd: 'C:/proj/gamma' }).ok, true);
+      const api = makeFakeApi();
+      const broker = newBroker(fx, api);
+      await settle(fx, broker, api);
+      fx.enqueueChoice(A.trackingId, fx.choicePayload({ requestId: REQUEST_ID }));
+      fx.enqueueChoice(B.trackingId, fx.choicePayload({ requestId: REQUEST_ID_2 }));
+      await broker.drainTuiEvents();
+      const cards = choiceCards(api);
+      assert.equal(cards.length, 2, 'each session gets its own card');
+      const datas = callbackDatas(cards);
+      assert.ok(datas.includes(`v1:w:${REQUEST_ID}:0`) && datas.includes(`v1:W:${REQUEST_ID}`));
+      assert.ok(datas.includes(`v1:w:${REQUEST_ID_2}:0`) && datas.includes(`v1:W:${REQUEST_ID_2}`));
+      assert.equal(fx.store.listPendingBrokerTuiEvents({ limit: 100 }).length, 0);
+      // A is guarded; C (no pending choice) stays fully routable. B holds
+      // its own pending choice, so plain text is guarded there too.
+      await deliverText(broker, api, '/use aaa111');
+      await deliverText(broker, api, 'hi alpha');
+      assert.equal(api.sent.at(-1).text, copyModule.choicePendingPlain);
+      assert.equal(fx.client.poll(A).commands.length, 0);
+      await deliverText(broker, api, '/use bbb222');
+      await deliverText(broker, api, 'hi beta');
+      assert.equal(fx.client.poll(B).commands.length, 0);
+      assert.equal(api.sent.at(-1).text, copyModule.choicePendingPlain);
+      await deliverText(broker, api, '/use ccc333');
+      await deliverText(broker, api, 'hi gamma');
+      const gamma = fx.client.poll(C).commands;
+      assert.equal(gamma.length, 1, 'a session without a pending choice must remain routable');
+      assert.equal(gamma[0].kind, 'prompt');
+      assert.equal(gamma[0].payload.text, 'hi gamma');
+    } finally { fx.close(); }
+  });
+
+  test('the 32-entry cap refuses overflow without evicting live entries', async () => {
+    const fx = makeChoiceFixture();
+    try {
+      const TOTAL = 33;
+      const sessions = [];
+      for (let i = 0; i < TOTAL; i++) {
+        const trackingId = `t${i}`.padEnd(32, '-');
+        const connectionId = `c${i}`.padEnd(32, '-');
+        sessions.push({ trackingId, connectionId });
+        const res = fx.store.registerTuiSession({
+          trackingId,
+          connectionId,
+          shortId: String(i).padStart(3, '0'),
+          label: `win-${i}`,
+          pid: 1000 + i,
+          staleCutoff: fx.now() + 30_000,
+          cwd: `C:/proj/cap${i}`,
+        });
+        assert.equal(res.ok, true);
+      }
+      for (let i = 0; i < TOTAL; i++) {
+        fx.enqueueChoice(sessions[i].trackingId, fx.choicePayload({ requestId: hexRequestId(i) }));
+      }
+      const api = makeFakeApi();
+      const broker = newBroker(fx, api);
+      for (let guard = 0; guard < 20; guard++) {
+        if (fx.store.listPendingBrokerTuiEvents({ limit: 256 }).length === 0) break;
+        await broker.drainTuiEvents();
+      }
+      const cards = choiceCards(api);
+      assert.equal(cards.length, 32, 'exactly the first 32 requests render');
+      const ids = new Set(callbackDatas(cards)
+        .map((data) => /v1:[wW]:([0-9a-f]{16})/.exec(data)?.[1]));
+      assert.equal(ids.size, 32);
+      assert.ok(!ids.has(hexRequestId(32)), 'the 33rd request must not render');
+      assert.equal(fx.store.listPendingBrokerTuiEvents({ limit: 256 }).length, 0,
+        'the overflow is refused and acknowledged');
+      assert.ok(fx.logs.some((e) => e.code === 'choice_capacity'));
+      // No eviction: the first session's registration still guards plain text.
+      await deliverText(broker, api, '/use 000');
+      await deliverText(broker, api, 'still guarded');
+      assert.equal(api.sent.at(-1).text, copyModule.choicePendingPlain);
+      assert.equal(fx.client.poll(sessions[0]).commands.length, 0);
+    } finally { fx.close(); }
+  });
+
+  test('expired entries are pruned: plain text is released and the session accepts a new request', async () => {
+    const fx = makeChoiceFixture();
+    try {
+      fx.connectA();
+      const api = makeFakeApi();
+      const broker = newBroker(fx, api);
+      await settle(fx, broker, api);
+      fx.enqueueChoice(A.trackingId, fx.choicePayload({ requestId: REQUEST_ID }));
+      await broker.drainTuiEvents();
+      assert.equal(choiceCards(api).length, 1);
+      api.sent.length = 0;
+      fx.advance(CHOICE_TTL_MS + 1);
+      fx.client.heartbeat({ ...A }); // keep alpha live across the jump
+      await deliverText(broker, api, 'released');
+      const released = fx.client.poll(A).commands;
+      assert.equal(released.length, 1, 'the expired choice must not guard plain text');
+      assert.equal(released[0].payload.text, 'released');
+      fx.enqueueChoice(A.trackingId, fx.choicePayload({ requestId: REQUEST_ID_2 }));
+      await broker.drainTuiEvents();
+      const cards = choiceCards(api);
+      assert.equal(cards.length, 1, 'the new request renders after the prune');
+      assert.ok(callbackDatas(cards).includes(`v1:W:${REQUEST_ID_2}`), 'it is the NEW request card');
+      assert.equal(fx.store.listPendingBrokerTuiEvents({ limit: 100 }).length, 0);
+      await deliverText(broker, api, 'guarded again');
+      assert.equal(api.sent.at(-1).text, copyModule.choicePendingPlain);
+    } finally { fx.close(); }
+  });
+
+  test('a broker restart empties the pending-choice registry (memory-only, fail closed)', async () => {
+    const fx = makeChoiceFixture();
+    try {
+      fx.connectA();
+      const api = makeFakeApi();
+      const first = newBroker(fx, api);
+      await settle(fx, first, api);
+      fx.enqueueChoice(A.trackingId, fx.choicePayload({ requestId: REQUEST_ID }));
+      await first.drainTuiEvents();
+      assert.equal(choiceCards(api).length, 1);
+      const restarted = newBroker(fx, api); // fresh broker instance, same store
+      await deliverText(restarted, api, 'after restart');
+      assert.equal(fx.client.poll(A).commands.length, 1,
+        'the restarted broker must not inherit pending choices');
+      fx.enqueueChoice(A.trackingId, fx.choicePayload({ requestId: REQUEST_ID_2 }));
+      await restarted.drainTuiEvents();
+      const cards = choiceCards(api);
+      assert.equal(cards.length, 2, 'no false conflict after the restart');
+      assert.ok(callbackDatas(cards).includes(`v1:W:${REQUEST_ID_2}`));
+    } finally { fx.close(); }
+  });
+
+  test('plain text is never a custom response; slash commands stay unchanged', async () => {
+    const fx = makeChoiceFixture();
+    try {
+      fx.connectA();
+      const api = makeFakeApi();
+      const broker = newBroker(fx, api);
+      await settle(fx, broker, api);
+      fx.enqueueChoice(A.trackingId, fx.choicePayload());
+      await broker.drainTuiEvents();
+      await deliverText(broker, api, 'just pick option 1');
+      const guard = api.sent.at(-1);
+      assert.equal(guard.text, copyModule.choicePendingPlain);
+      assert.equal(guard.replyMarkup, undefined, 'the guard is a plain reply with no keyboard');
+      assert.equal(fx.client.poll(A).commands.length, 0, 'nothing may be enqueued behind a pending choice');
+      await deliverText(broker, api, '/status');
+      const status = fx.client.poll(A).commands;
+      assert.equal(status.length, 1, 'slash commands must still work while a choice is pending');
+      assert.equal(status[0].kind, 'status');
+    } finally { fx.close(); }
+  });
+
+  test('choice callbacks are not consumed yet and unknown event kinds stay inert', async () => {
+    const fx = makeChoiceFixture();
+    try {
+      fx.connectA();
+      const api = makeFakeApi();
+      const broker = newBroker(fx, api);
+      await settle(fx, broker, api);
+      fx.enqueueChoice(A.trackingId, fx.choicePayload());
+      await broker.drainTuiEvents();
+      // The v1:w grammar is RENDERED here but deliberately not parsed: the
+      // callback falls through the closed grammar as malformed. The consumer
+      // branch belongs to the NEXT work unit, never this one.
+      const sentBefore = api.sent.length;
+      broker.handleUpdate(cb(`v1:w:${REQUEST_ID}:1`));
+      await broker.flushReplies();
+      assert.equal(api.sent.length, sentBefore, 'an unparsed choice callback sends no chat reply');
+      assert.equal(fx.client.poll(A).commands.length, 0, 'no choice callback may enqueue anything yet');
+      assert.ok(fx.logs.some((e) => e.code === 'callback_rejected'));
+      // The render set stays closed: an unknown kind (raw row, bypassing the
+      // store's closed set) is acknowledged without being sent.
+      fx.enqueueChoice(A.trackingId, fx.choicePayload({ requestId: REQUEST_ID_2 }));
+      const raw = new DatabaseSync(fx.storePath);
+      raw.prepare("UPDATE tui_events SET kind = 'mystery_kind' WHERE kind = 'choice_request'").run();
+      raw.close();
+      await broker.drainTuiEvents();
+      assert.equal(api.sent.length, sentBefore, 'an unknown kind sends nothing');
+      assert.equal(fx.store.listPendingBrokerTuiEvents({ limit: 100 }).length, 0,
+        'an unknown kind is acknowledged so it never blocks the queue');
     } finally { fx.close(); }
   });
 });

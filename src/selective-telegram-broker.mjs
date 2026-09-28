@@ -28,24 +28,39 @@
 //   beginner guidance (open Pi and type /tg); with several live sessions
 //   and no selection it fails closed with a choice notice and NEVER
 //   guesses or exposes short ids.
-// - Inline keyboards exist ONLY for the T03a/T03b bounded cards: the
+// - Inline keyboards exist ONLY for the bounded cards: the
 //   Projects dashboard (v1:r, v1:s:<sid>, v1:p:<sid>:<pid>, v1:c),
-//   the busy decision card (v1:f/t/a:<sid>:<pid>, v1:n:<pid>) and the action
-//   keyboards (v1:q/x/d/D:<sid>, v1:C). Data never carries labels,
-//   prompt text, cwd, tokens or secrets; short ids stay inside
-//   callback_data, never in beginner-visible card text. Authorized
+//   the busy decision card (v1:f/t/a:<sid>:<pid>, v1:n:<pid>), the action
+//   keyboards (v1:q/x/d/D:<sid>, v1:C) and the remote choice card
+//   (v1:w:<requestId>:<index>, v1:W:<requestId> — T2B1 renders and registers
+//   these callbacks; the parser branch is deliberately NOT added until the
+//   dedicated consumer work unit, so a choice tap falls through the closed
+//   grammar as malformed). Data never carries labels,
+//   prompt text, cwd, tokens or secrets; short ids and opaque request ids
+//   stay inside callback_data, never in beginner-visible card text. Authorized
 //   callbacks get a best-effort answerCallbackQuery queued only AFTER the
 //   transaction and offset commit (and only when the API implements it);
 //   a failed answer never replays a command. Unauthorized or malformed
 //   callbacks are dropped without replies.
+// - Remote choice requests (T2B1) render ONLY when the already-Store-validated
+//   payload is still structurally safe, unexpired, free of credential shapes,
+//   and its tracking id resolves to exactly one currently live session with a
+//   valid current connection id. Every refusal logs one fixed code, echoes
+//   nothing, sends nothing and acknowledges the event so it never blocks the
+//   queue. A bounded memory-only registry (max 32 live entries, keyed by the
+//   opaque 16-hex request id) tracks definitively SENT pending requests as
+//   {trackingId, connectionId, optionCount, expiresAt} — registration happens
+//   only after #sendChunks returns 'sent' and before the acknowledgement, and
+//   a restart empties it (fail closed). Plain text never answers a pending
+//   choice; it gets a fixed guard reply and enqueues nothing.
 // - Text payloads are bounded and any line whose first non-whitespace
 //   character is '/' is rejected: remote input can never ride into local
 //   extension commands, skills or prompt templates. '!', CMD and PowerShell
 //   strings get no interpretation here — every accepted text is forwarded
 //   verbatim as a typed prompt/steer/follow-up for the Pi extension.
 // - Drained TUI events render ONLY: connected/disconnected notices,
-//   requested factual status, finalized assistant output and fixed
-//   command-result acknowledgements. Never thinking/reasoning, tool
+//   requested factual status, finalized assistant output, fixed
+//   command-result acknowledgements and bounded remote choice cards (T2B1). Never thinking/reasoning, tool
 //   args/results, session files, credentials or raw exception text. Every
 //   beginner-visible message names the session as `Pi · <label>` (T04:
 //   copy comes from beginner-copy.mjs; the old [label · shortId] prefix is
@@ -98,6 +113,14 @@ const CALLBACK_CHOOSER_RE = /^v1:c$/;
 const CALLBACK_CANCEL_RE = /^v1:C$/;
 const CALLBACK_MAX_DATA_BYTES = 64;
 const REFRESH_BUTTON_TEXT = 'Refresh';
+
+// T2B1 remote ordinary choice cards: a bounded memory-only pending registry
+// and render guards. The v1:w / v1:W callback grammar is rendered here and
+// consumed by the dedicated parser work unit only — no branch is added now.
+const MAX_PENDING_CHOICES = 32;
+const CHOICE_REQUEST_ID_RE = /^[0-9a-f]{16}$/;
+const MIN_CHOICE_OPTIONS = 2;
+const MAX_CHOICE_OPTIONS = 4;
 // T03b busy-decision button labels: readable outcomes only; short ids stay
 // inside callback_data and the held prompt text is never echoed back. All
 // other beginner-visible copy (notices, acks, event cards, /start, /help)
@@ -385,6 +408,15 @@ export class SelectiveTelegramBroker {
   #pendingReplies = [];
   /** Broker-memory pending prompt {pendingId, text}; a restart loses it fail-closed. */
   #pendingPrompt = null;
+  /**
+   * T2B1 memory-only pending remote choices, keyed by the opaque 16-hex
+   * requestId. Values are exactly {trackingId, connectionId, optionCount,
+   * expiresAt} — never labels, descriptions, values or option text. Bounded
+   * to 32 live entries; expired entries (expiresAt <= now) are pruned before
+   * every lookup and registration. A broker restart naturally empties it,
+   * so stale callbacks can never choose anything (fail closed).
+   */
+  #pendingChoices = new Map();
   /**
    * Bounded callback answers waiting for a best-effort answerCallbackQuery:
    * objects of the shape { callbackQueryId, text } where text is the
@@ -1621,6 +1653,13 @@ export class SelectiveTelegramBroker {
       this.#log('input_refused');
       return { replies: [SLASH_LINE_NOTICE], commands: [] };
     }
+    // T2B1: a pending remote choice owns the answer channel — plain text is
+    // NOT a custom response (V1 contract), so it enqueues nothing and gets
+    // only the fixed guard reply. Other sessions remain fully routable and
+    // slash-command behavior is unchanged.
+    if (this.#pendingChoiceFor(target.session.trackingId) !== null) {
+      return { replies: [copy.choicePendingPlain], commands: [] };
+    }
     if (target.session.state === 'busy') {
       // T03b: a busy session never receives a silent direct prompt. The
       // held text is screened exactly like a dispatched prompt (above).
@@ -1791,6 +1830,13 @@ export class SelectiveTelegramBroker {
         // send attempt, and for a throttle it would additionally log once per
         // poll cycle for as long as the throttle lasts.
         return;
+      }
+      // T2B1: a remote choice request is registered ONLY after its card was
+      // definitively sent, BEFORE the event is acknowledged. Uncertain,
+      // failed and rate-limited deliveries stay unregistered, and the
+      // unacknowledged event retries whole next cycle.
+      if (isPlainObject(rendered.pendingChoice)) {
+        this.#registerPendingChoice(rendered.pendingChoice);
       }
       this.#store.acknowledgeTuiEvents({ eventIds: [event.eventId] });
     }
@@ -2109,9 +2155,148 @@ export class SelectiveTelegramBroker {
           replyMarkup: null,
         };
       }
+      case 'choice_request': {
+        const choice = this.#validateChoiceRequest(event, payload);
+        if (choice === null) return null; // refused: fixed code logged, acked silently
+        this.#pruneExpiredChoices();
+        const existing = this.#pendingChoices.get(choice.requestId);
+        if (existing !== undefined) {
+          // An exact retry of a still-live registered request (same tracking
+          // id AND the same current connection) is acknowledged without
+          // resending; any other collision fails closed without evicting
+          // or overwriting the live entry.
+          if (existing.trackingId === choice.trackingId
+            && existing.connectionId === choice.connectionId) {
+            return null;
+          }
+          this.#log('choice_conflict');
+          return null;
+        }
+        // One pending request per session; a live request is never evicted.
+        if (this.#pendingChoiceFor(choice.trackingId) !== null) {
+          this.#log('choice_conflict');
+          return null;
+        }
+        if (this.#pendingChoices.size >= MAX_PENDING_CHOICES) {
+          this.#log('choice_capacity');
+          return null;
+        }
+        return {
+          text: copy.choiceCard({ header, question: payload.question, options: payload.options }),
+          replyMarkup: this.#choiceKeyboard(payload),
+          pendingChoice: choice,
+        };
+      }
       default:
         return null;
     }
+  }
+
+  /**
+   * T2B1 defensive re-validation of an already-Store-validated
+   * `choice_request` payload. Fails closed (null, one fixed code, no echo)
+   * for anything structurally unsafe: a bad shape, an expired deadline, a
+   * credential shape in the question or any option text, or a tracking id
+   * that does not resolve to exactly one currently live session with a
+   * valid current connection id. Returns the plain registration subject
+   * {requestId, trackingId, connectionId, optionCount, expiresAt} — never
+   * option text or values.
+   */
+  #validateChoiceRequest(event, payload) {
+    const structurallySafe = isPlainObject(payload)
+      && typeof payload.requestId === 'string'
+      && CHOICE_REQUEST_ID_RE.test(payload.requestId)
+      && typeof payload.question === 'string' && payload.question.length > 0
+      && Array.isArray(payload.options)
+      && payload.options.length >= MIN_CHOICE_OPTIONS
+      && payload.options.length <= MAX_CHOICE_OPTIONS
+      && payload.options.every((option) => isPlainObject(option)
+        && typeof option.label === 'string'
+        && typeof option.description === 'string')
+      && safeInt(payload.expiresAt) !== null
+      && payload.expiresAt > this.#now();
+    if (!structurallySafe) {
+      this.#log('choice_refused');
+      return null;
+    }
+    const credentialShape = copy.containsCredentialShape(payload.question)
+      || payload.options.some((option) =>
+        copy.containsCredentialShape(option.label)
+        || copy.containsCredentialShape(option.description));
+    if (credentialShape) {
+      this.#log('choice_refused');
+      return null;
+    }
+    const session = this.#liveByTrackingId(event.trackingId);
+    if (session === null
+      || typeof session.connectionId !== 'string'
+      || session.connectionId.length === 0) {
+      this.#log('choice_refused');
+      return null;
+    }
+    return {
+      requestId: payload.requestId,
+      trackingId: event.trackingId,
+      connectionId: session.connectionId,
+      optionCount: payload.options.length,
+      expiresAt: payload.expiresAt,
+    };
+  }
+
+  /**
+   * The choice-card keyboard: one option per row (`v1:w:<requestId>:<index>`)
+   * plus one Cancel row (`v1:W:<requestId>`). Callback data carries ONLY the
+   * opaque request id and the zero-based index — never labels, descriptions,
+   * values, tracking/connection/session ids or any environment detail — and
+   * every emitted callback stays far below Telegram's 64-byte cap.
+   */
+  #choiceKeyboard(payload) {
+    const rows = payload.options.map((option, index) => ([{
+      text: copy.choiceOptionButton(index, option.label),
+      callback_data: `v1:w:${payload.requestId}:${index}`,
+    }]));
+    rows.push([{ text: copy.CHOICE_BUTTON_CANCEL, callback_data: `v1:W:${payload.requestId}` }]);
+    return { inline_keyboard: rows };
+  }
+
+  /** Prune expired (expiresAt <= now) and malformed entries in place. */
+  #pruneExpiredChoices() {
+    const now = this.#now();
+    for (const [requestId, entry] of this.#pendingChoices) {
+      if (!isPlainObject(entry) || safeInt(entry.expiresAt) === null || entry.expiresAt <= now) {
+        this.#pendingChoices.delete(requestId);
+      }
+    }
+  }
+
+  /** The live pending choice for a tracking id, or null (prunes first). */
+  #pendingChoiceFor(trackingId) {
+    this.#pruneExpiredChoices();
+    for (const entry of this.#pendingChoices.values()) {
+      if (entry.trackingId === trackingId) return entry;
+    }
+    return null;
+  }
+
+  /**
+   * Register a definitively sent pending choice. Never evicts or overwrites
+   * a live entry: the pre-send validation already refused conflicts, so any
+   * residual collision here is skipped with a fixed code instead.
+   */
+  #registerPendingChoice(choice) {
+    this.#pruneExpiredChoices();
+    if (this.#pendingChoices.size >= MAX_PENDING_CHOICES
+      || this.#pendingChoices.has(choice.requestId)
+      || this.#pendingChoiceFor(choice.trackingId) !== null) {
+      this.#log('choice_register_refused');
+      return;
+    }
+    this.#pendingChoices.set(choice.requestId, {
+      trackingId: choice.trackingId,
+      connectionId: choice.connectionId,
+      optionCount: choice.optionCount,
+      expiresAt: choice.expiresAt,
+    });
   }
 
   #log(code, detail = null) {
