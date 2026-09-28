@@ -169,7 +169,7 @@ While it works, Pi sometimes needs a small decision from you — for example whi
 
 The rules that keep this predictable:
 
-- One question at a time per Pi window, and each question expires after 30 minutes. After expiry, the bot tells you the question is out of date, and Pi asks again if it still needs an answer.
+- One question at a time per Pi window, and each question expires after 30 minutes. Nothing arrives on Telegram when a question expires — the tool simply times out on the PC. Only if you tap an out-of-date card does the bot answer with the fixed out-of-date toast; Pi asks again if it still needs an answer.
 - Typing text while a question is pending is **not** an answer — the buttons on the card are the only way to answer it.
 - This is for ordinary workflow choices of the current task. Permissions, approvals, security prompts and everything else Pi shows on the PC screen never become Telegram buttons.
 - If the question never appears after an upgrade, an already-open Pi window may need `/reload` once — the same rule as any other upgrade, under [the Projects section](#the-projects-dashboard-your-project-library).

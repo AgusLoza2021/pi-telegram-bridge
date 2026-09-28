@@ -125,7 +125,7 @@ Mientras trabaja, Pi a veces necesita que elijas entre 2 y 4 opciones — por ej
 
 Reglas simples:
 
-- Solo hay **una pregunta a la vez por ventana de Pi**, y cada pregunta vence a los **30 minutos**. Si venció, el bot avisa que la pregunta está desactualizada y Pi vuelve a preguntar si todavía lo necesita.
+- Solo hay **una pregunta a la vez por ventana de Pi**, y cada pregunta vence a los **30 minutos**. Cuando vence no llega ningún mensaje de Telegram: la herramienta simplemente agota su tiempo en la PC. Solo si tocas una tarjeta vencida responde el bot con el aviso fijo de pregunta desactualizada; Pi vuelve a preguntar si todavía lo necesita.
 - **Escribir texto no es una respuesta.** Mientras una pregunta está pendiente, la única forma de responderla es con los botones de la propia tarjeta.
 - Esto sirve solo para decisiones normales de la tarea en curso. Los permisos, aprobaciones y avisos de seguridad que Pi muestra en la pantalla de la PC nunca se convierten en botones de Telegram.
 - Si actualizaste el puente y la pregunta no aparece, la ventana de Pi que ya estaba abierta puede necesitar `/reload` una vez — la misma regla de siempre después de instalar o actualizar.

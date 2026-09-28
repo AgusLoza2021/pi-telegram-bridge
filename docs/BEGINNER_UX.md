@@ -274,7 +274,7 @@ Section 8 covers what the *user* initiates while Pi is busy. This section is phy
 
 When the linked Pi calls `telegram_ask_user_choice`, the bot renders one card in the enrolled private chat (all copy below is implemented, §0):
 
-- `MSG-Q1`: the window's identity header (§5), then the sanitized question (at most 500 code points), then one numbered row per option — `1. Label — Description` — and finally the fixed sentence, verbatim:
+- `MSG-Q1`: the window's identity header (§5), then the sanitized question (at most 500 characters), then one numbered row per option — `1. Label — Description` — and finally the fixed sentence, verbatim:
 
   > This is an ordinary workflow choice for the current task — not a permission, approval or security prompt.
 
@@ -288,7 +288,7 @@ When the linked Pi calls `telegram_ask_user_choice`, the bot renders one card in
 - The card exists only in the enrolled private chat between the owner and the bot (§12); every callback is revalidated against the enrolled user and chat ids.
 - Callback data stays opaque and bounded: an answer is `v1:w:<16 hex>:<0-3>` (opaque request id plus zero-based option index) and a cancel is `v1:W:<16 hex>`. No labels, option values, question text or ids ever appear in visible copy — the card shows only the header, the question and the option labels/descriptions.
 
-What this card is NOT: it is never a permission, approval or security prompt, and it is never a general remote-control channel. Provider-owned consent, Gentle AI review consent, permission/security/maintenance gates, project trust, secrets and native editor UI stay on the PC (§12).
+What this card is NOT: it is never a permission, approval or security prompt, and it is never a general remote-control channel. Provider-owned consent, Gentle AI review consent, permission/security/maintenance gates, project trust, secrets and native editor UI stay on the PC — the bridge never answers them and Telegram never sees them.
 
 ---
 

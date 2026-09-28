@@ -430,6 +430,10 @@ describe('public repository hygiene', () => {
   test('BEGINNER_UX pins the remote choice card contract with the verbatim not-permission sentence', () => {
     // Normalize line endings: this file is checked out with CRLF on Windows.
     const beginner = read('docs/BEGINNER_UX.md').replace(/\r\n/g, '\n');
+    // Public docs say "characters"; the code point detail is an implementation
+    // note and must not survive as public wording.
+    assert.match(beginner, /500 characters/);
+    assert.doesNotMatch(beginner, /500 code points/);
     // Pinned once with src/beginner-copy.mjs CHOICE_NOT_PERMISSION_SENTENCE:
     // change code, this doc and this test together.
     assert.ok(beginner.includes(
@@ -494,6 +498,11 @@ describe('public repository hygiene', () => {
     assert.match(readme, /one button per option/i);
     assert.match(readme, /Cancel this question/);
     assert.match(readme, /30 minutes/);
+    // Expiry is silent: no proactive Telegram message. The fixed out-of-date
+    // toast is shown only when the owner taps an expired/stale card.
+    assert.match(readme, /Only if you tap an out-of-date card/i);
+    assert.doesNotMatch(readme, /the bot tells you the question is out of date/i,
+      'README must not claim a proactive expiry notification; the toast is tap-driven only');
   });
 
   test('no doc claims Telegram can answer provider, native or consent prompts', () => {
@@ -507,5 +516,22 @@ describe('public repository hygiene', () => {
         `${document} must not claim provider or native prompts are answerable remotely`,
       );
     }
+  });
+
+  test('QUICKSTART.es keeps expiry silent and tap-driven', () => {
+    const quickstart = read('QUICKSTART.es.md');
+    assert.match(quickstart, /Solo si tocas una tarjeta vencida/);
+    assert.doesNotMatch(quickstart, /el bot avisa que la pregunta est\u00e1 desactualizada/i,
+      'QUICKSTART.es must not claim a proactive expiry notification; the toast is tap-driven only');
+  });
+
+  test('the advanced stage 4 states registration never enables the connection and bans the start-the-broker claim', () => {
+    const advanced = read('docs/ADVANCED.md');
+    const stage4 = advanced.split('\n').find((line) => /^4\. \*\*Offer local installation\.\*\*/.test(line));
+    assert.ok(stage4, 'the advanced lifecycle must keep stage 4');
+    assert.match(stage4, /registration never enables it, and setup asks once at the end whether to turn the connection on, with No as the default/,
+      'stage 4 must state registration never enables the connection and the end-of-setup offer defaults to No');
+    assert.doesNotMatch(advanced, /\(always registered disabled\), and start the broker/i,
+      'the old start-the-broker claim must not survive in ADVANCED');
   });
 });
