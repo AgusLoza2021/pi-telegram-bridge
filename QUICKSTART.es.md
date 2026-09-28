@@ -115,6 +115,23 @@ Tres reglas del panel:
 - El nombre **sobrevive a que el puente se reinicie** y a que la misma ventana se reconecte (queda guardado hasta 30 días mientras la ventana no se cierre del todo).
 - Si **cerrás la ventana de Pi y abrís una nueva**, esa ventana nueva arranca con su etiqueta por defecto otra vez: el alias no salta de ventana.
 
+## Cuando Pi te hace una pregunta
+
+Mientras trabaja, Pi a veces necesita que elijas entre 2 y 4 opciones — por ejemplo, cuál de dos correcciones aplicar. Puedes responder desde el teléfono:
+
+1. Pi hace una pregunta normal con 2–4 opciones.
+2. El bot la muestra como una tarjeta con **un botón por opción**, más un botón **Cancel this question** (cancelar esta pregunta).
+3. Toca una opción y esa misma Pi continúa con tu elección. Toca **Cancel this question** y no se elige nada.
+
+Reglas simples:
+
+- Solo hay **una pregunta a la vez por ventana de Pi**, y cada pregunta vence a los **30 minutos**. Si venció, el bot avisa que la pregunta está desactualizada y Pi vuelve a preguntar si todavía lo necesita.
+- **Escribir texto no es una respuesta.** Mientras una pregunta está pendiente, la única forma de responderla es con los botones de la propia tarjeta.
+- Esto sirve solo para decisiones normales de la tarea en curso. Los permisos, aprobaciones y avisos de seguridad que Pi muestra en la pantalla de la PC nunca se convierten en botones de Telegram.
+- Si actualizaste el puente y la pregunta no aparece, la ventana de Pi que ya estaba abierta puede necesitar `/reload` una vez — la misma regla de siempre después de instalar o actualizar.
+
+En la PC, esta función es la herramienta interna `telegram_ask_user_choice` de la extensión. No necesitas hacer nada con ella: aparece sola cuando Pi pregunta. Los comandos siguen siendo parte de la capa avanzada.
+
 ## Enviar una foto al teléfono
 
 Puedes enviar una imagen desde tu PC a tu propio chat privado, sin abrir Telegram en la PC:

@@ -37,6 +37,38 @@ The beginner `/tg` command maps to these per-window commands:
 
 Multiple linked Pi windows remain independently addressable. One Pi process never owns or terminates another. A dead or stale process is not reported as live.
 
+## Remote choice prompts (`telegram_ask_user_choice`)
+
+When a linked Pi needs an ordinary decision mid-task, its extension registers the `telegram_ask_user_choice` tool. The tool publishes a bounded choice request through the local SQLite transport, the broker renders it in Telegram as one card (one button per option plus `Cancel this question`), and the owner's tap resolves the blocked tool from an at-most-once response command. It is a relay for ordinary workflow choices of the current task — never a general approval channel.
+
+Contract:
+
+- Input bounds: one question (at most 500 characters) and exactly 2–4 options in order, each with a label (1–64 characters), a description (1–300), and a local-only `value` (1–512).
+- The option `value` never leaves the Pi process: it is not written to SQLite, not sent to Telegram, and never appears in logs or callback data. Telegram receives only the question, the labels and descriptions, an opaque 16-hex request id, and the selected zero-based option index.
+- One pending request per Pi window: a second request fails closed immediately instead of replacing the first.
+- Deadline: 30 minutes. On expiry, abort, unlink, `/reload`, session replacement or shutdown the blocked tool is settled instead of hanging.
+- Routing is exact: the response command is bound to the exact live tracking/connection owner of the requesting window and is consumed at most once. Callbacks carry only the opaque request id and option index (`v1:w:<16 hex>:<0-3>` answer, `v1:W:<16 hex>` cancel, at most 64 bytes) and are revalidated against the enrolled private user and chat on every tap. Replay, expiry, malformed data, wrong session and post-restart callbacks never choose anything.
+- Settlement is silent: an accepted answer or explicit cancel produces no chat message and no command-result event — only the small callback toast.
+
+Local-only boundary — `telegram_ask_user_choice` MUST NOT answer, translate or relay:
+
+- provider-owned consent and Gentle AI review consent envelopes;
+- permission, approval, security, and maintenance gates, including destructive local operations;
+- project trust decisions;
+- secrets, credentials, and anything typed into masked local inputs;
+- editor or native UI prompts, and any free-text/custom response (V1 has no typed custom answer).
+
+Pi's TUI `ui_prompt_start` and `ui_prompt_end` events are notification-only in TUI mode: the bridge may report that Pi is waiting locally, but native remote answers require a separately approved RPC-host architecture that does not exist yet. The numbered-text fallback (answering an agent-authored open question by typing a number) applies only to an ordinary open question the agent asked when the tool is unavailable — it is never permission to translate opaque consent tokens.
+
+Troubleshooting:
+
+| Symptom | Meaning |
+|---|---|
+| The card never appears after an upgrade | An already-running Pi window needs `/reload` to discover or update the extension; new windows pick it up automatically. |
+| The tap answers "That question is out of date." | The request expired (30-minute deadline), was already answered, or the Pi window was replaced. Pi asks again if it still needs the answer. |
+| Typing a reply does nothing | Plain text never answers a pending choice; only the card's buttons do. |
+| A second question is refused | One pending request per window — answer or cancel the current one first. |
+
 ## Manual setup
 
 Run the advanced interactive setup directly from PowerShell:

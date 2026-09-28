@@ -123,6 +123,7 @@ Any three of the four means you are almost there — check [Fix problems](#fix-p
 | Tap **Disconnect** | Disconnect the selected Pi from Telegram. |
 | Send `/alias <name>` | Gives the selected Pi window a readable name, like `Home PC`. `/alias clear` resets it. |
 | Send text while Pi is busy | Choose whether to add it for later, redirect the current task, stop and use it, or leave the task alone. |
+| Pi asks a question | When Pi needs an ordinary decision mid-task, the bot shows the question with one button per option plus **Cancel this question**. Tap an option and the exact linked Pi continues with your choice — see [When Pi asks you a question](#when-pi-asks-you-a-question). |
 
 ### The Projects dashboard (your project library)
 
@@ -157,6 +158,21 @@ On the PC:
 - Every new Pi window starts disconnected. Link only the windows you want available from your phone.
 - Pi windows that were already running may need `/reload` once after an install or upgrade.
 - To send a picture **from your PC to your phone**, see [Send a picture to your phone](#send-a-picture-to-your-phone).
+
+### When Pi asks you a question
+
+While it works, Pi sometimes needs a small decision from you — for example which of two fixes to apply. You can answer from your phone:
+
+1. Pi asks an ordinary question with 2–4 options.
+2. Telegram shows the question as a card with one button per option, plus **Cancel this question**.
+3. Tap an option and the exact linked Pi continues with your choice. Tap **Cancel this question** and nothing is chosen.
+
+The rules that keep this predictable:
+
+- One question at a time per Pi window, and each question expires after 30 minutes. After expiry, the bot tells you the question is out of date, and Pi asks again if it still needs an answer.
+- Typing text while a question is pending is **not** an answer — the buttons on the card are the only way to answer it.
+- This is for ordinary workflow choices of the current task. Permissions, approvals, security prompts and everything else Pi shows on the PC screen never become Telegram buttons.
+- If the question never appears after an upgrade, an already-open Pi window may need `/reload` once — the same rule as any other upgrade, under [the Projects section](#the-projects-dashboard-your-project-library).
 
 ## Send a picture to your phone
 
@@ -234,6 +250,8 @@ Find your symptom, then follow the matching action. A failed setup never replace
 | You want to remove the bridge | Follow [Uninstall and rollback](docs/ADVANCED.md#uninstall-and-rollback). State and backups are preserved unless you remove them yourself. |
 | Sending a picture printed `FAILED: ...` | Each code names exactly one cause. `path_escape`: the file is outside the project folder — this check runs first, so you get it even when the file is also missing or misnamed; add `--root "C:\the\folder"` if the picture lives elsewhere. `not_found` or `not_a_file`: nothing readable at that path. `bad_extension`: not a `.png`, `.jpg`, `.jpeg`, or `.webp`. `too_large`: over 10 MB. `bad_root`: the folder you passed to `--root` does not exist. |
 | The bot answers "I couldn't transcribe that audio" | Check the three tool files exist: `.local/tools/whisper/whisper-cli.exe`, `.local/tools/whisper/models/ggml-small.bin`, and `.local/tools/ffmpeg/ffmpeg.exe`. Audio over 20 MB or longer than 5 minutes is refused by design. If you just installed the tools, no restart is needed — the next voice note picks them up. |
+| The question card vanished, or a tap says it is out of date | The question expired after 30 minutes or was already answered. Tap **Cancel this question** if it is still shown; Pi asks again if it still needs an answer. |
+| I typed a reply but Pi did not take it | Typing is not an answer while a question is pending — tap one of the option buttons on the card, or **Cancel this question**. |
 | You want voice transcription off | Set `transcription.enabled` to `false` in your local config. Voice notes then behave as if the feature did not exist: they are silently consumed, and no tool runs. |
 
 For service status, repair, manual setup, and the full command reference, see the [Advanced guide](docs/ADVANCED.md).
@@ -247,6 +265,7 @@ For service status, repair, manual setup, and the full command reference, see th
 | **`/tg`** | The command you type inside a Pi window to link (or unlink, with `/tg off`) that window to your phone. |
 | **Alias** | A readable name you give one Pi window from your phone with `/alias <name>`, like `Home PC`. It is useful mostly when several windows work in the same project. The name sticks to that exact window: it survives the bridge restarting and the window reconnecting, but if you close the window and open a new one, the new window starts with its default project label again. |
 | **Pi window** | One running copy of Pi in a terminal. You can have several; each one is linked separately. |
+| **Choice question** | An ordinary question Pi asks mid-task with 2–4 options. The bridge shows it on Telegram as one button per option plus **Cancel this question**; your tap answers the exact linked Pi. One question per window, 30-minute deadline. On the PC this is the `telegram_ask_user_choice` tool — it never turns permissions, approvals or security prompts into buttons. |
 | **Session / workspace** | A session is one live Pi window the bridge knows about; the workspace is the project folder that window is working in. Its folder name becomes the readable label you see on your phone, like `Pi · my-project`. |
 | **The background connection** | A small program that runs quietly on your PC and shuttles messages between Telegram and Pi, so Pi can answer even when that Pi window is doing something else. It is registered as a Windows scheduled task, but the beginner setup registers it DISABLED and leaves it off, and the advanced setup asks once at the end whether to turn it on, with No as the default: nothing starts at a sign-in unless you turn it on. After that you control it yourself: `telegram off` stops it, `telegram on` starts it again, and once you turned it off it stays off after a restart until you turn it on again. It talks to Telegram by long polling. |
 

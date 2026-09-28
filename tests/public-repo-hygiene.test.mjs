@@ -418,13 +418,94 @@ describe('public repository hygiene', () => {
       'the old auto-start claim must not survive in the Spanish quick-start');
   });
 
-  test('the advanced stage 4 states registration never enables the connection and bans the start-the-broker claim', () => {
+  test('every doc documents the remote choice feature and names it correctly', () => {
+    // The five public docs must all describe the same feature and name its
+    // tool, so a reader never meets two different names for one behavior.
+    for (const document of ['README.md', 'QUICKSTART.es.md', 'docs/BEGINNER_UX.md', 'docs/ADVANCED.md', 'docs/ARCHITECTURE.md']) {
+      assert.match(read(document), /telegram_ask_user_choice/,
+        `${document} must name the remote choice tool telegram_ask_user_choice`);
+    }
+  });
+
+  test('BEGINNER_UX pins the remote choice card contract with the verbatim not-permission sentence', () => {
+    // Normalize line endings: this file is checked out with CRLF on Windows.
+    const beginner = read('docs/BEGINNER_UX.md').replace(/\r\n/g, '\n');
+    // Pinned once with src/beginner-copy.mjs CHOICE_NOT_PERMISSION_SENTENCE:
+    // change code, this doc and this test together.
+    assert.ok(beginner.includes(
+      'This is an ordinary workflow choice for the current task — not a permission, approval or security prompt.',
+    ), 'BEGINNER_UX must quote the not-permission sentence verbatim');
+    for (const fragment of [
+      'v1:w:<16 hex>:<0-3>',
+      'v1:W:<16 hex>',
+      'Cancel this question',
+      '30-minute deadline',
+      'typing here is not\n  an answer',
+      'That question is out of date',
+      'enrolled private',
+    ]) {
+      assert.ok(beginner.includes(fragment), `BEGINNER_UX must document ${JSON.stringify(fragment)}`);
+    }
+  });
+
+  test('ADVANCED pins the exact remote choice contract and the local-only boundary', () => {
     const advanced = read('docs/ADVANCED.md');
-    const stage4 = advanced.split('\n').find((line) => /^4\. \*\*Offer local installation\.\*\*/.test(line));
-    assert.ok(stage4, 'the advanced lifecycle must keep stage 4');
-    assert.match(stage4, /registration never enables it, and setup asks once at the end whether to turn the connection on, with No as the default/,
-      'stage 4 must state registration never enables the connection and the end-of-setup offer defaults to No');
-    assert.doesNotMatch(advanced, /\(always registered disabled\), and start the broker/i,
-      'the old start-the-broker claim must not survive in ADVANCED');
+    assert.match(advanced, /2–4 options/);
+    assert.match(advanced, /30 minutes/);
+    assert.match(advanced, /`\/reload`/);
+    for (const boundary of [
+      'provider-owned consent',
+      'Gentle AI review consent',
+      'permission',
+      'security',
+      'maintenance',
+      'destructive',
+      'project trust',
+      'secrets',
+      'editor',
+      'native UI',
+      'free-text',
+      'custom response',
+      'ui_prompt_start',
+      'ui_prompt_end',
+      'RPC-host',
+    ]) {
+      assert.ok(advanced.includes(boundary), `ADVANCED must keep the local-only boundary: ${boundary}`);
+    }
+  });
+
+  test('ARCHITECTURE pins typed choice events with a local-only option value', () => {
+    const architecture = read('docs/ARCHITECTURE.md');
+    assert.match(architecture, /`choice_request`/);
+    assert.match(architecture, /`choice_response`/);
+    assert.match(architecture, /option `?value`? remains local/i);
+    assert.match(architecture, /never a general approval channel/i);
+  });
+
+  test('QUICKSTART.es pins the beginner remote choice rules', () => {
+    const quickstart = read('QUICKSTART.es.md');
+    assert.match(quickstart, /Cancel this question/);
+    assert.match(quickstart, /30 minutos/);
+    assert.match(quickstart, /no es una respuesta/i);
+  });
+
+  test('README pins the remote choice buttons and the Cancel row', () => {
+    const readme = read('README.md');
+    assert.match(readme, /one button per option/i);
+    assert.match(readme, /Cancel this question/);
+    assert.match(readme, /30 minutes/);
+  });
+
+  test('no doc claims Telegram can answer provider, native or consent prompts', () => {
+    for (const document of ['README.md', 'QUICKSTART.es.md', 'docs/BEGINNER_UX.md', 'docs/ADVANCED.md', 'docs/ARCHITECTURE.md']) {
+      const text = read(document);
+      assert.doesNotMatch(text, /Telegram (?:can|may|will) (?:answer|resolve|approve)/i,
+        `${document} must not claim Telegram can answer restricted prompts`);
+      assert.doesNotMatch(
+        text,
+        /(?:provider|native)[^.]{0,80}(?:consent|prompt|gate|envelope)[^.]{0,80}(?:can|may) (?:be )?(?:answered|resolved|approved)/i,
+        `${document} must not claim provider or native prompts are answerable remotely`,
+      );
+    }
   });
 });

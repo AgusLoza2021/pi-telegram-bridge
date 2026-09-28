@@ -60,6 +60,8 @@ Remote actions map to Pi's official extension APIs:
 - report status;
 - disconnect the selected session.
 
+The extension can also register `telegram_ask_user_choice` for ordinary workflow decisions: one question and 2–4 ordered options. Only the question and each option's label and description cross the boundary into SQLite and Telegram; the option `value` remains local to the Pi process. The request is settled by a typed `choice_response` command bound to the exact requesting window and consumed at most once.
+
 There is no arbitrary command execution API. The broker does not spawn, own, signal, or terminate Pi processes.
 
 ### Output boundary
@@ -67,6 +69,8 @@ There is no arbitrary command execution API. The broker does not spawn, own, sig
 The extension forwards only finalized assistant text and explicit command/status results. It does not forward chain-of-thought, model reasoning, token streams, tool calls, or tool results.
 
 Large final answers are split into bounded Telegram chunks. The transport acknowledges an outbound event only after every chunk succeeds.
+
+Choice requests add one bounded outbound shape: the question (at most 500 characters), 2–4 option labels and descriptions, and an opaque request id. Option values, dialogs the user never saw (native or provider), and free-text answers never cross this boundary.
 
 ## Data flow
 
@@ -83,6 +87,13 @@ Large final answers are split into bounded Telegram chunks. The transport acknow
 ### Busy Pi
 
 When a normal message targets a busy Pi, the broker does not guess. It offers bounded choices to queue the message, steer the active turn, abort and replace it, or leave the task unchanged. The chosen callback is authorized and consumed once.
+
+### Remote choice request and response
+
+1. The linked Pi publishes one typed `choice_request` event per pending question: the bounded question and 2–4 options with labels and descriptions only — the option `value` never enters the transport.
+2. The broker renders one card per request in the enrolled private chat: one button per option plus `Cancel this question`. Each callback carries only the opaque 16-hex request id and the zero-based option index (or a cancel marker), at most 64 bytes.
+3. After revalidating the exact enrolled user, chat, request id, expiry and requesting session, the broker enqueues one typed `choice_response` command with a deterministic id for the exact live window that asked. The command is claimed and settled at most once; stale, expired, replayed and malformed callbacks never enqueue anything.
+4. The Pi extension resolves the blocked tool with the local option value and settles the command silently — no command-result event and no chat message.
 
 ### Final answer
 
@@ -157,5 +168,6 @@ Graceful shutdown uses an instance-bound local control file and bounded waits. L
 8. Durable deduplication, command claims, and delivery acknowledgements.
 9. Reversible installation with dated backups before replacement.
 10. No mutation of unrelated Pi extensions or settings.
+11. Remote choice prompts relay only the question, option labels/descriptions, an opaque request id and an option index; the option `value` remains local, and the channel is never a general approval channel.
 
 For operating procedures, see the [Advanced guide](ADVANCED.md). For vulnerability reporting and the full public security policy, see [SECURITY.md](../SECURITY.md).

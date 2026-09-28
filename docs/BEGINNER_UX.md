@@ -60,6 +60,17 @@ Project library, identity headers and aliases (T3/T4A/T4B2/T4C — implemented):
 | `MSG-A4` | implemented | `src/beginner-copy.mjs` (`aliasFailed`) |
 | `MSG-A5` | implemented | `src/beginner-copy.mjs` (`aliasSaved`, `aliasCleared`) |
 
+Remote ordinary choice cards (T4A — implemented):
+
+| Id | Status | Source location (implemented) |
+|---|---|---|
+| `MSG-Q1` | implemented | `src/beginner-copy.mjs` (`choiceCard`): identity header, sanitized question, one numbered option row per option, and the fixed not-permission sentence |
+| `MSG-Q2` | implemented | `src/beginner-copy.mjs` (`choiceOptionButton`): exactly one button per option, labeled `N. Label` |
+| `MSG-Q3` | implemented | `src/beginner-copy.mjs` (`CHOICE_BUTTON_CANCEL`): the `Cancel this question` row |
+| `MSG-Q4` | implemented | `src/beginner-copy.mjs` (`choicePendingPlain`): the fixed typed-text guard |
+| `MSG-Q5` | implemented | `src/beginner-copy.mjs` (`staleChoiceToast`): the fixed stale/expired toast |
+| `MSG-Q6` | implemented | `src/beginner-copy.mjs` (`choiceAnsweredToast`, `choiceCancelledToast`): fixed settle toasts for an accepted answer and an explicit cancel |
+
 ---
 
 ## 1. The happy path: three actions
@@ -257,6 +268,30 @@ Hard rules:
 
 ---
 
+## 8A. Pi-initiated question cards (remote ordinary choices — implemented)
+
+Section 8 covers what the *user* initiates while Pi is busy. This section is physically distinct: it covers the card Pi itself raises when it needs an ordinary decision to continue the current task. The two flows never mix — a busy choice routes a held prompt, while a Pi-initiated question answers Pi's own tool call (`telegram_ask_user_choice`) with 2–4 ordered options.
+
+When the linked Pi calls `telegram_ask_user_choice`, the bot renders one card in the enrolled private chat (all copy below is implemented, §0):
+
+- `MSG-Q1`: the window's identity header (§5), then the sanitized question (at most 500 code points), then one numbered row per option — `1. Label — Description` — and finally the fixed sentence, verbatim:
+
+  > This is an ordinary workflow choice for the current task — not a permission, approval or security prompt.
+
+- `MSG-Q2`: exactly one button per option row, labeled `N. Label`. There is never a second button for the same option and never a button that is not an option.
+- `MSG-Q3`: one separate `Cancel this question` row. Cancel is explicit and chooses nothing.
+- `MSG-Q4`: while a question is pending, plain text is refused with the fixed typed-text guard: "Pi asked you a question above. Use the buttons on that question to answer it — typing here is not
+  an answer." The guard text is fixed and never echoes the typed text.
+- One pending question per Pi window and a fixed 30-minute deadline: a second request while one is pending fails closed instead of replacing the first.
+- `MSG-Q5`: tapping an expired, stale, replayed or post-restart button never chooses anything; the tap is answered with the fixed stale toast: "That question is out of date. Pi will ask again if it still needs an answer."
+- `MSG-Q6`: an accepted tap settles silently with the toast "Answer received. Pi is continuing with your choice."; an explicit cancel settles with "Okay — the question was cancelled. Nothing was chosen." Neither settlement sends a chat message.
+- The card exists only in the enrolled private chat between the owner and the bot (§12); every callback is revalidated against the enrolled user and chat ids.
+- Callback data stays opaque and bounded: an answer is `v1:w:<16 hex>:<0-3>` (opaque request id plus zero-based option index) and a cancel is `v1:W:<16 hex>`. No labels, option values, question text or ids ever appear in visible copy — the card shows only the header, the question and the option labels/descriptions.
+
+What this card is NOT: it is never a permission, approval or security prompt, and it is never a general remote-control channel. Provider-owned consent, Gentle AI review consent, permission/security/maintenance gates, project trust, secrets and native editor UI stay on the PC (§12).
+
+---
+
 ## 9. Final output card
 
 Every finalized Pi answer arrives as one message under the window's identity header (§5), followed by an action row. There is no streaming, no partial text, no hidden content.
@@ -389,3 +424,6 @@ Each row: observable state/event → required visible copy/action → the implem
 | A36 | Invalid alias input | `MSG-A3`, no echo of the rejected input | `#planAlias` — implemented |
 | A37 | Store refuses the alias save | `MSG-A4`, one fixed log code, no TUI command enqueued | `#planAlias` — implemented |
 | A38 | Alias persistence | Survives broker restart and same-tracking reconnect (30-day retention); does not survive a new Pi process (new tracking id) | `store.setTuiSessionAlias` — implemented |
+| A39 | Linked Pi calls `telegram_ask_user_choice` | Card per §8A: `MSG-Q1`–`MSG-Q3` rows plus Cancel; one pending per window, 30-minute deadline | Broker `choice_request` render — implemented |
+| A40 | Owner taps an option or Cancel | Exactly one `choice_response` command for that exact window; `MSG-Q6` toast; silent settlement, no chat message | Broker `v1:w`/`v1:W` callback handling — implemented |
+| A41 | Stale, expired, replayed or post-restart tap | `MSG-Q5` stale toast, nothing chosen, row dropped | Broker callback validation — implemented |
