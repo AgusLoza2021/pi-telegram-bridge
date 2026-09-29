@@ -14,7 +14,7 @@ function publicTextFiles(directory = ROOT) {
     // Mirrors the "not shipped" entries in .gitignore. Local workflow notes are
     // not part of the public text candidate, so a path inside them must never be
     // able to fail this guard.
-    if (['.git', '.local', '.atl', 'node_modules', 'odd'].includes(entry)) continue;
+    if (['.git', '.local', '.atl', '.codegraph', 'node_modules', 'odd'].includes(entry)) continue;
     const absolute = join(directory, entry);
     if (statSync(absolute).isDirectory()) {
       files.push(...publicTextFiles(absolute));
@@ -49,6 +49,11 @@ describe('public repository hygiene', () => {
     assert.match(read('README.md'), /\[SECURITY\.md\]\(SECURITY\.md\)/);
     assert.match(read('README.md'), /\[CONTRIBUTING\.md\]\(CONTRIBUTING\.md\)/);
     assert.match(read('.gitignore'), /^\.atl\/$/m, 'Pi-local runtime metadata must stay untracked');
+    assert.match(
+      read('.gitignore'),
+      /^\.codegraph\/$/m,
+      'the local CodeGraph index must stay untracked, so a machine-local cache can never enter the public text candidate',
+    );
   });
 
   test('security policy names the protected data and private reporting route', () => {
