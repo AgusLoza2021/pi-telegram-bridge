@@ -52,6 +52,12 @@ Created on demand (install only); callers that must stay read-only use
 Test-Path themselves. The chain below the profile is reparse-checked
 BEFORE creation and re-checked AFTER (another process must not be able
 to swap in a junction between the check and the write).
+
+LEGACY destination. Since the on-demand switch nothing of this project
+may live here: Pi discovers this root, so a copy under it loads in EVERY
+project on every session. It is still resolved so that install and
+uninstall can migrate a leftover copy out of it and status can prove the
+root is clear.
 #>
 function Get-SelectiveExtensionsRoot {
     param([switch]$Create)
@@ -75,6 +81,33 @@ reparse-checked on every call (destination included when it exists).
 function Get-SelectiveGlobalExtensionDir {
     param([switch]$CreateRoot)
     return (Join-Path (Get-SelectiveExtensionsRoot -Create:$CreateRoot) (Get-SelectiveGlobalExtensionName))
+}
+
+<#
+.SYNOPSIS
+The on-demand payload directory: <profile>\.pi\agent\pi-telegram-bridge.
+
+Deliberately a SIBLING of the extensions root, never a child of it. Pi
+auto-discovers <profile>\.pi\agent\extensions, so a payload under that
+root loads in every project in every session and costs system-prompt
+tokens and an always-offered tool whether or not the owner wants the
+bridge there. This directory is outside every discovery root: Pi loads
+the bridge only when a session is started explicitly with
+'pi -e <this directory>' (scripts/launch-pi-with-bridge.ps1, surfaced as
+pi-telegram.cmd). Same profile resolution and same reparse-point
+defence as the legacy root.
+#>
+function Get-SelectiveOnDemandExtensionDir {
+    param([switch]$Create)
+    $dir = Join-Path (Get-SelectiveUserProfile) '.pi\agent\pi-telegram-bridge'
+    if ($Create) {
+        Assert-SelectiveNoReparseBelow -Anchor (Get-SelectiveUserProfile) -Target $dir
+        if (-not (Test-Path -LiteralPath $dir -PathType Container)) {
+            New-Item -ItemType Directory -Path $dir -Force | Out-Null
+        }
+        Assert-SelectiveNoReparseBelow -Anchor (Get-SelectiveUserProfile) -Target $dir
+    }
+    return $dir
 }
 
 <#
@@ -294,19 +327,64 @@ function Copy-SelectiveDirectoryContents {
 
 <#
 .SYNOPSIS
+Moves a leftover copy of this extension OUT of Pi's user auto-discovery
+root and files it under the module backup root. Returns the archive path,
+or $null when there was nothing to migrate.
+
+Order matters: the live directory is archived FIRST (so the archive keeps
+a usable 'index.ts' layout a person could reinstall from), then the entry
+is defused, then the directory is moved aside inside the discovery root,
+then the moved original is filed under the same archive and only the empty
+husk is removed - non-recursive, so it succeeds only when every child was
+preserved. Nothing is ever deleted, and a failure here leaves the
+leftovers inert (dot-prefixed) and reported.
+#>
+function Remove-SelectiveLegacyDiscoveryCopy {
+    param([Parameter(Mandatory = $true)][string]$Stamp)
+    $legacy = Get-SelectiveGlobalExtensionDir
+    if (-not (Test-Path -LiteralPath $legacy)) { return $null }
+    Assert-SelectiveNoReparseBelow -Anchor (Get-SelectiveUserProfile) -Target $legacy
+    if (-not (Test-Path -LiteralPath $legacy -PathType Container)) {
+        throw "legacy discovery path exists but is not a directory: $legacy"
+    }
+    $archive = Join-Path (Get-SelectiveBackupRoot -Create) "uninstalled-$Stamp"
+    if (Test-Path -LiteralPath $archive) { throw "archive path already exists: $archive" }
+    New-Item -ItemType Directory -Path $archive -Force | Out-Null
+    Copy-SelectiveDirectoryContents -Source $legacy -Target $archive
+    Protect-SelectiveEntryFile -Directory $legacy -Suffix 'migrated'
+    $aside = Join-Path (Get-SelectiveExtensionsRoot) ".$((Get-SelectiveGlobalExtensionName)).migrated-$Stamp"
+    Move-Item -LiteralPath $legacy -Destination $aside
+    try {
+        $asideTarget = Join-Path $archive 'removed-original'
+        New-Item -ItemType Directory -Path $asideTarget -Force | Out-Null
+        Get-ChildItem -LiteralPath $aside -Force | ForEach-Object {
+            Move-Item -LiteralPath $_.FullName -Destination $asideTarget -Force
+        }
+        Remove-Item -LiteralPath $aside -Force | Out-Null
+    } catch {
+        Write-Warning ("could not fully file the migrated copy under the archive; leftovers are preserved (inert, non-discoverable) at: $aside")
+    }
+    return $archive
+}
+
+<#
+.SYNOPSIS
 Shared post-change notice printed by install and uninstall: already-running
 Pi windows must be FULLY CLOSED and REOPENED; '/reload' alone is NOT
 sufficient because the extension has multiple runtime modules and a reload
-can mix old cached modules with new ones in one process. NEW Pi windows
-auto-discover the extension and start disconnected until the owner turns
-the phone connection on and links the window with /tg.
+can mix old cached modules with new ones in one process. Nothing is
+auto-discovered any more: a new Pi window loads the bridge only when the
+owner starts it through pi-telegram.cmd, and even then the window starts
+disconnected until the phone connection is turned on and the window is
+linked with /tg.
 #>
 function Write-SelectiveReloadNotice {
     Write-Host ''
     Write-Host 'NOTE: already-running Pi windows must be FULLY CLOSED and REOPENED after this change.'
     Write-Host '/reload alone is NOT sufficient: the extension has multiple runtime modules,'
     Write-Host 'and a reload can leave old and new modules mixed in one process.'
-    Write-Host 'New Pi windows auto-discover the extension and start DISCONNECTED:'
+    Write-Host 'Nothing from this project loads by itself any more: start Pi with pi-telegram.cmd'
+    Write-Host 'in this folder when you want the bridge, and even that window starts DISCONNECTED:'
     Write-Host 'nothing connects to Telegram until you turn the phone connection on, either with "telegram on" or with the start offer at the end of an advanced setup,'
     Write-Host 'and /tg links this window once it is on.'
 }

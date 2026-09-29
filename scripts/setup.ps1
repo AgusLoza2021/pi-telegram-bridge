@@ -637,7 +637,7 @@ if ($Beginner) {
     Write-Host 'Finishing setup...'
     if ($beginnerPiMissing) {
         Write-Host 'Pi is not on this computer yet. Your private link is safe and will wait.'
-        Write-Host 'Install Pi on this PC, then open it and type /tg to connect.'
+        Write-Host 'Install Pi on this PC, then open Pi with pi-telegram.cmd in this folder and type /tg to connect.'
     }
     $componentLog = Join-Path $stateRoot 'logs\setup-components.log'
     $componentScripts = @(
@@ -664,7 +664,7 @@ if ($Beginner) {
 Write-Host ''
 Write-Host 'Optional local installation (you can also run these scripts later):'
 
-$extensionAnswer = Read-Host 'Install the global Pi extension now (globally available but INERT until /tg)? (Y/n)' 
+$extensionAnswer = Read-Host 'Install the Pi bridge now (kept outside the folders Pi loads by itself: it loads only when you start Pi with pi-telegram.cmd)? (Y/n)' 
 if ($extensionAnswer -notmatch '^[nN]') {
     $code = Invoke-SetupSubscript -ScriptName 'install-selective-extension.ps1' -ScriptStateDirectory $stateRoot
     if ($code -ne 0) {
@@ -729,5 +729,7 @@ Write-Host '    start-broker-service.ps1, stop-broker-service.ps1,'
 Write-Host '    uninstall-broker-service.ps1.'
 Write-Host '  - Extension lifecycle: scripts/status-selective-extension.ps1,'
 Write-Host '    uninstall-selective-extension.ps1.'
+Write-Host '  - Load the bridge on demand: pi-telegram.cmd (nothing of this project'
+Write-Host '    is loaded by Pi automatically; that window still starts DISCONNECTED).'
 Write-Host '  - Rollback / legacy headless: setup.ps1 -LegacyHeadless, then'
 Write-Host '    scripts/start.ps1 / status.ps1 / stop.ps1.'

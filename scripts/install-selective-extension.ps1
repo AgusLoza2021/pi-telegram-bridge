@@ -1,30 +1,44 @@
-# T05 install-selective-extension.ps1 - safe global installation of the
-# inert selective-TUI Pi extension under the current user's Pi
-# auto-discovery directory (~\.pi\agent\extensions\pi-telegram-bridge).
+# T05 install-selective-extension.ps1 - safe ON-DEMAND installation of
+# the inert selective-TUI Pi extension under the current user's Pi agent
+# directory (~\.pi\agent\pi-telegram-bridge).
 # Windows PowerShell 5.1+. SOURCE ONLY: this session must not execute
 # the installer; running it is a separate authorized local step (T07).
 #
+# Why on demand: Pi auto-discovers <profile>\.pi\agent\extensions, so a
+# payload under that root loads in EVERY project and every session and
+# costs system-prompt tokens plus an always-offered tool even when the
+# owner does not want the bridge. The destination below is a SIBLING of
+# that root, i.e. outside every discovery root: Pi loads the bridge only
+# when a session is started with 'pi -e <destination>' through
+# pi-telegram.cmd.
+#
 # Guarantees:
-# - The ONLY global destination is the exact dedicated subdirectory
-#   pi-telegram-bridge under <profile>\.pi\agent\extensions (canonical
-#   profile via .NET, reparse-checked chain). Other global extensions
-#   and Pi's settings.json are never read or written.
+# - The ONLY destination is the exact dedicated directory
+#   pi-telegram-bridge beside the extensions root (canonical profile via
+#   .NET, reparse-checked chain). Other global extensions and Pi's
+#   settings.json are never read or written, and NOTHING is ever written
+#   under the auto-discovery root except the temporary dot-prefixed
+#   sibling used while migrating a legacy copy out.
+# - Migration: if an earlier install left a copy in the auto-discovery
+#   root, it is archived under <module>\.local\backups\global-extension\
+#   and moved out BEFORE anything else is written, so one run of this
+#   command leaves nothing of this project discoverable. Archived copies
+#   are NEVER deleted.
 # - Idempotent: re-running replaces the destination. The complete prior
 #   contents are first copied to a timestamped backup under
 #   <module>\.local\backups\global-extension\; backups are NEVER deleted.
 # - Staging: all new files are written into a dot-prefixed sibling with
 #   a DEFERRED entry name (index.ts.pending), then swapped in with
-#   same-volume renames. The documented Pi discovery globs
-#   ('*.ts', '*/index.ts') can therefore never observe a half-written
-#   active extension: the entry name only exists once the directory is
-#   renamed into place.
+#   same-volume renames, so Pi can never observe a half-written payload
+#   through 'pi -e'.
 # - Files are BOM-free; deployed bytes are SHA-256 verified against the
 #   sources before the swap.
 # - Nonsecret manifest at <module>\.local\global-extension-manifest.json:
-#   source/destination/state paths, install time, source hashes and the
-#   exact prior backup path. No token, no Telegram ids, no session ids,
-#   no credentials.
-# - The installed extension stays INERT: this script starts no process,
+#   source/destination/state paths, install mode, install time, source
+#   hashes, the legacy discovery path that must stay clear and the exact
+#   prior backup path. No token, no Telegram ids, no session ids, no
+#   credentials.
+# - The installed payload stays INERT: this script starts no process,
 #   never touches the broker or the scheduled task, and the extension
 #   connects nothing until the owner turns the phone connection on with
 #   "telegram on".
@@ -63,9 +77,19 @@ if (Test-Path -LiteralPath $capPath) {
 # Canonical destination with a reparse-checked chain below the profile
 # (the destination directory itself is included when it exists, so a
 # planted junction can never be replaced through).
-$extensionsRoot = Get-SelectiveExtensionsRoot -Create
-$destination = Join-Path $extensionsRoot (Get-SelectiveGlobalExtensionName)
+#
+# Migration runs FIRST: a leftover copy inside the auto-discovery root is
+# archived and moved out before this install writes anything. If it
+# fails, nothing has been changed yet.
+$legacyArchive = Remove-SelectiveLegacyDiscoveryCopy -Stamp $stamp
+if ($null -ne $legacyArchive) {
+    Write-Host "Legacy auto-discovery copy migrated out and archived: $legacyArchive"
+}
+
+$payloadRoot = Join-Path (Get-SelectiveUserProfile) '.pi\agent'
+$destination = Get-SelectiveOnDemandExtensionDir -Create
 Assert-SelectiveNoReparseBelow -Anchor (Get-SelectiveUserProfile) -Target $destination
+Assert-SelectiveNoReparseBelow -Anchor (Get-SelectiveUserProfile) -Target $payloadRoot
 
 if (Test-Path -LiteralPath $destination) {
     if (-not (Test-Path -LiteralPath $destination -PathType Container)) {
@@ -88,7 +112,7 @@ if (Test-Path -LiteralPath $destination) {
 
 # --- Staging (dot-prefixed sibling, deferred entry name) ----------------
 
-$staging = Join-Path $extensionsRoot ".pi-telegram-bridge.staging-$stamp"
+$staging = Join-Path $payloadRoot ".pi-telegram-bridge.staging-$stamp"
 New-Item -ItemType Directory -Path $staging -Force | Out-Null
 # A pre-planted junction at the staging name must never be written through.
 Assert-SelectiveNoReparseBelow -Anchor (Get-SelectiveUserProfile) -Target $staging
@@ -116,7 +140,7 @@ foreach ($entry in Get-SelectivePayloadMap) {
         # Defuse discovery of the outgoing directory, then move it aside
         # with a same-volume rename (single atomic operation).
         Protect-SelectiveEntryFile -Directory $destination -Suffix 'replaced'
-        $replacedDir = Join-Path $extensionsRoot ".pi-telegram-bridge.replaced-$stamp"
+        $replacedDir = Join-Path $payloadRoot ".pi-telegram-bridge.replaced-$stamp"
         Move-Item -LiteralPath $destination -Destination $replacedDir
     }
     try {
@@ -178,6 +202,11 @@ $manifest = [PSCustomObject]@{
     version            = 1
     kind               = 'pi-telegram-bridge-global-extension-manifest'
     extensionName      = (Get-SelectiveGlobalExtensionName)
+    mode               = 'on-demand'
+    autoDiscovery      = $false
+    launcher           = 'pi-telegram.cmd'
+    legacyDiscoveryDir = (Get-SelectiveGlobalExtensionDir)
+    legacyArchivePath  = $legacyArchive
     moduleRoot         = $moduleRoot
     destination        = $destination
     stateDirectory     = $stateRoot
@@ -191,9 +220,12 @@ $manifest = [PSCustomObject]@{
 Write-SelectiveManifest -Manifest $manifest
 
 Write-Host ''
-Write-Host 'INSTALL OK - global extension deployed (inert until local /tg).'
+Write-Host 'INSTALL OK - bridge payload deployed OUTSIDE Pi auto-discovery.'
 Write-Host "Destination: $destination"
 Write-Host "State:       $stateRoot"
+Write-Host 'Load it:     run pi-telegram.cmd in this folder to start Pi with the bridge;'
+Write-Host '             every other Pi window has no bridge and no extra tool.'
+Write-Host '             that window still starts DISCONNECTED: use /tg when you want the phone.'
 if ($null -ne $previousBackupPath) {
     Write-Host "Prior backup: $previousBackupPath (never deleted)"
 }

@@ -84,7 +84,7 @@ The advanced flow performs these stages:
 1. **Protect the state directory.** It creates `.local/state/`, applies a user-only Windows ACL, and verifies the result before any secret exists.
 2. **Write nonsecret runtime identity.** It writes `runtime.json` with the validated instance ID and selective bridge mode. Existing configuration is backed up before replacement.
 3. **Enroll.** It reads the token with hidden input, validates the bot, refuses active webhooks, and pairs through a locally rendered QR code by default. The QR contains only the validated bot username and a fresh 128-bit nonce. Manual numeric ID entry is available as an advanced fallback. An explicit `ENROLL` confirmation is required before the atomic DPAPI credential commit.
-4. **Offer local installation.** It can install the global Pi extension and register the current-user scheduled task (always registered disabled); registration never enables it, and setup asks once at the end whether to turn the connection on, with No as the default. Unlike the beginner launcher, these choices are presented individually.
+4. **Offer local installation.** It can install the Pi bridge extension for on-demand loading (nothing is placed in the folders Pi loads by itself: only windows started with `pi-telegram.cmd`, which wraps an explicit `pi -e <payload>`, get the bridge) and register the current-user scheduled task (always registered disabled); registration never enables it, and setup asks once at the end whether to turn the connection on, with No as the default. Unlike the beginner launcher, these choices are presented individually.
 
 Abort before confirmation and the previous credentials and configuration remain unchanged.
 
@@ -140,9 +140,17 @@ scripts/install-selective-extension.ps1
 scripts/uninstall-selective-extension.ps1
 ```
 
-Installation stages a fixed four-file runtime payload, verifies hashes, rejects reparse-point escapes, writes a generated state-directory binding, and backs up any prior dedicated installation. Uninstall restores that prior installation when available and does not modify Pi settings.
+Starting Pi with the bridge is a separate, explicit step:
 
-After an installation, update, rollback or removal, every Pi window that was already running must be fully closed and reopened — `/reload` alone is not sufficient because the extension has multiple runtime modules. New windows discover the extension automatically and still start disconnected.
+```powershell
+pi-telegram.cmd            # extra arguments are forwarded to the pi CLI
+```
+
+`pi-telegram.cmd` only wraps `scripts/launch-pi-with-bridge.ps1`, which runs `pi -e <payload>` in the folder you are standing in. It never passes `--no-extensions`, so your own project extensions keep loading in that window, and it never changes the working directory, so Pi opens the project you started from.
+
+Installation stages a fixed four-file runtime payload, verifies hashes, rejects reparse-point escapes, writes a generated state-directory binding, and backs up any prior dedicated installation. The payload is deployed to `<user profile>\.pi\agent\pi-telegram-bridge` — a sibling of Pi's `extensions` directory, never inside it, so Pi never discovers the bridge on its own. Installing also migrates any copy left in the old discovery root: it is archived first and only then moved out of the way, so nothing is deleted. Uninstall restores that prior installation when available and does not modify Pi settings.
+
+After an installation, update, rollback or removal, every Pi window that was already running must be fully closed and reopened — `/reload` alone is not sufficient because the extension has multiple runtime modules. A window started through `pi-telegram.cmd` still starts disconnected, and a Pi window started any other way has no `/tg` at all.
 
 ## State, logs, and backups
 

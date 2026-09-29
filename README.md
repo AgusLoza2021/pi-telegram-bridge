@@ -7,8 +7,8 @@
 1. Download the repository as a ZIP and extract it, or clone it with `git clone https://github.com/AgusLoza2021/pi-telegram-bridge.git`.
 2. Create your own Telegram bot by messaging **@BotFather** with `/newbot`. Keep its token private.
 3. Run **`Setup Pi Telegram.cmd`** from the extracted project folder and follow the prompts to enter your token and pair your phone with the QR code.
-4. When you confirm with **ENROLL**, setup finishes on its own: it installs the helper and registers the background connection, but leaves it **OFF** — nothing starts by itself when you sign in. When you want the link, run `telegram on`; check it any time with `telegram status`, and use `telegram off` to stop it again.
-5. When you are ready to use the link, open a Command Prompt in the setup folder, run `telegram on` there, then open Pi, run `/tg`, choose **Connect**, and message your bot in a private chat.
+4. When you confirm with **ENROLL**, setup finishes on its own: it installs the helper and registers the background connection, but leaves it **OFF** — nothing starts by itself when you sign in. The helper is not placed where Pi loads things by itself either, so no Pi window has it unless you start that window with `pi-telegram.cmd` (Step 4). When you want the link, run `telegram on`; check it any time with `telegram status`, and use `telegram off` to stop it again.
+5. When you are ready to use the link, open a Command Prompt in the setup folder, run `telegram on` there, then open Pi, run `/tg`, choose **Connect**, and message your bot in a private chat — open that Pi with **`pi-telegram.cmd`** from the same folder, because Pi never loads the bridge on its own.
 
 The bridge intentionally ignores group chats. For prerequisites, screenshots, and troubleshooting, see the [complete beginner guide](#check-your-pc-first).
 
@@ -88,7 +88,7 @@ You will create your own private bot in Telegram. This takes about 2 minutes.
 4. When it asks, **paste the bot token from Step 2**. The window hides what you paste. The token stays on your PC: it is stored in encrypted form (protected for your Windows account) and is never typed, sent, or shown anywhere else — not on your phone, not in any chat, not in any log.
 5. The window shows a **QR code**. Open the camera app on your phone and point it at the code. Telegram opens your bot; tap **Start**. The code contains only the bot's name and a one-use pairing code — never the token.
 6. The window waits up to a minute for your phone. When your phone is recognized, it asks you to type **ENROLL** to confirm. Nothing is saved until you do.
-7. After you confirm, the window installs a small helper inside Pi (it stays inactive until *you* link a Pi window in Step 4) and registers the background task, but leaves the connection **OFF**: nothing starts by itself when you sign in. When you want it, open a Command Prompt in this folder and run `telegram on`. Use `telegram off` to stop it and `telegram status` to check it. You can also double-click `telegram.cmd` in File Explorer: it opens a small menu that shows the current connection state and lets you turn it on or off (typing `telegram on|off|status` in a terminal keeps working exactly the same). Once you turn it off, it stays off even after you restart Windows; start it again with `telegram on`.
+7. After you confirm, the window installs a small helper for Pi (it is kept outside the folders Pi loads by itself, so only windows you open with `pi-telegram.cmd` get it — see Step 4 — and it still stays inactive until *you* link that window) and registers the background task, but leaves the connection **OFF**: nothing starts by itself when you sign in. When you want it, open a Command Prompt in this folder and run `telegram on`. Use `telegram off` to stop it and `telegram status` to check it. You can also double-click `telegram.cmd` in File Explorer: it opens a small menu that shows the current connection state and lets you turn it on or off (typing `telegram on|off|status` in a terminal keeps working exactly the same). Once you turn it off, it stays off even after you restart Windows; start it again with `telegram on`.
 
 If anything fails along the way, your previous settings are kept safe and nothing half-finished is saved. See [Fix problems](#fix-problems).
 
@@ -96,7 +96,9 @@ If anything fails along the way, your previous settings are kept safe and nothin
 
 The bridge is installed, but every Pi window stays **disconnected until you link it** — this is deliberate.
 
-1. Open Pi in a terminal on your PC. If Pi was already open during setup, close it completely and open it again so it loads the new helper — `/reload` alone is not enough.
+Pi never loads the bridge by itself. The bridge appears only in windows you start through **`pi-telegram.cmd`**: double-click that file, or open a Command Prompt in the setup folder and type `pi-telegram`. A Pi window started any other way has no `/tg` at all.
+
+1. Start Pi with **`pi-telegram.cmd`**. It opens Pi in the folder you run it from, so run it from the project you want to work in. If a Pi window was already open during setup or an upgrade, close it completely and open it again this way so it loads the bridge — `/reload` alone is not enough.
 2. Type `/tg` and choose **Connect** in the confirmation that appears.
 3. Send a normal text message to your bot from your phone.
 
@@ -155,7 +157,8 @@ On the PC:
 
 - `/tg` opens the connection controls for that Pi window.
 - `/tg off` disconnects that Pi window.
-- Every new Pi window starts disconnected. Link only the windows you want available from your phone.
+- Only windows you started with `pi-telegram.cmd` have `/tg`: the bridge is never registered in Pi's automatic loading list.
+- Every window you open with `pi-telegram.cmd` starts disconnected. Link only the windows you want available from your phone.
 - After an install or upgrade, fully close and reopen any Pi windows that were already running; `/reload` alone is not sufficient because the helper has several runtime modules.
 - To send a picture **from your PC to your phone**, see [Send a picture to your phone](#send-a-picture-to-your-phone).
 
@@ -172,7 +175,7 @@ The rules that keep this predictable:
 - One question at a time per Pi window, and each question expires after 30 minutes. Nothing arrives on Telegram when a question expires — the tool simply times out on the PC. Only if you tap an out-of-date card does the bot answer with the fixed out-of-date toast; Pi asks again if it still needs an answer.
 - Typing text while a question is pending is **not** an answer — the buttons on the card are the only way to answer it.
 - This is for ordinary workflow choices of the current task. Permissions, approvals, security prompts and everything else Pi shows on the PC screen never become Telegram buttons.
-- If the question never appears after an upgrade, fully close and reopen Pi, then run `/tg` again — the same rule as any other upgrade, under [the Projects section](#the-projects-dashboard-your-project-library).
+- If the question never appears after an upgrade, fully close and reopen Pi — with `pi-telegram.cmd`, so that window has the bridge — and then run `/tg` again. The same rule as any other upgrade, under [the Projects section](#the-projects-dashboard-your-project-library).
 
 ## Send a picture to your phone
 
@@ -241,9 +244,9 @@ Find your symptom, then follow the matching action. A failed setup never replace
 | Setup says the token did not work | Get the current token from BotFather using `/token` or `/mybots`, then copy and paste it again. |
 | The QR code expired or will not scan | Close setup and run `Setup Pi Telegram.cmd` again for a fresh code. Raise the screen brightness and move the phone closer. |
 | The QR link opens a web page | Open Telegram directly, search for your bot username, tap **Start**, then run setup again. |
-| `/tg` does not exist in Pi | Fully close and reopen Pi, then run `/tg`. An install or upgrade needs a full restart; `/reload` alone is not sufficient. |
+| `/tg` does not exist in Pi | That Pi window was not started with the bridge, or it is still running the previous version. **Fully close and reopen Pi, then run `/tg`** — open it with `pi-telegram.cmd` in your setup folder (double-click the file, or type `pi-telegram`), because Pi never loads the bridge on its own. After an install or upgrade `pi` needs a full restart: `/reload` alone is not sufficient. |
 | `/tg` says the phone connection is unavailable | The background connection is off. Open a Command Prompt in your setup folder, run `telegram on`, then send your message again. |
-| The bot says no Pi is connected | Open Pi on the PC, type `/tg`, and choose **Connect**. |
+| The bot says no Pi is connected | Open Pi on the PC with `pi-telegram.cmd`, type `/tg`, and choose **Connect**. |
 | The bot does not answer | Make sure the PC is awake and online, then check the background connection: run `telegram status` in your setup folder, and `telegram on` if it is off. |
 | Several Pi windows are linked | Tap **Projects** and tap the row you want — the row marked `✓` is the one that gets your messages. |
 | You closed a Pi window and the bot says it "just closed or disconnected" | That window is gone, so nothing was sent to it. Tap **Projects** and pick another row (or reopen the window with `/tg` and tap **Refresh**). |

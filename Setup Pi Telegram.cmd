@@ -68,7 +68,7 @@ if "%SETUP_EXIT%"=="0" (
     echo Setup complete.
     echo The phone connection is OFF. Nothing starts by itself when you sign in.
     echo To turn it on when you want it, open a Command Prompt in this folder and type: telegram on
-    echo Open or restart Pi, type /tg, choose Connect, then send a normal Telegram message.
+    echo Open Pi with pi-telegram.cmd in this folder, type /tg, choose Connect, then send a normal Telegram message.
 ) else (
     echo Setup stopped before it could finish.
     echo Your existing link and settings were kept safe.

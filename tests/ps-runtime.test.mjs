@@ -656,7 +656,10 @@ describe('ps-runtime: launcher-only Beginner setup contract', () => {
 
   test('advanced direct setup and long aliases remain available', () => {
     assert.match(setupSource, /Optional local installation/);
-    assert.match(setupSource, /Read-Host 'Install the global Pi extension now/);
+    assert.match(setupSource, /Read-Host 'Install the Pi bridge now \(kept outside the folders Pi loads by itself/,
+      'the advanced offer must describe the on-demand payload honestly');
+    assert.match(setupSource, /it loads only when you start Pi with pi-telegram\.cmd\)\? \(Y\/n\)'/,
+      'the offer must name the launcher and keep Yes as the default');
     assert.match(setupSource, /-PrepareOnly/);
     assert.match(setupSource, /-LegacyHeadless/);
     assert.match(setupSource, /\/telegram-connect \[label\]/);
@@ -685,8 +688,15 @@ describe('ps-runtime: launcher-only Beginner setup contract', () => {
       'the summary must state the started case');
   });
 
-  test('installed-extension guidance promotes /tg while preserving advanced registration', () => {
-    assert.match(installerSource, /inert until local \/tg/);
+  test('installed-extension guidance promotes the on-demand launcher and /tg while preserving advanced registration', () => {
+    // The installer no longer leaves anything auto-discovered, so its
+    // guidance must name BOTH halves: the launcher (how a window gets the
+    // bridge) and /tg (how that window gets linked). The advanced aliases
+    // stay registered but must never be presented as the beginner path.
+    assert.match(installerSource, /run pi-telegram\.cmd in this folder to start Pi with the bridge/,
+      'the installer must name the launcher that actually loads the bridge');
+    assert.match(installerSource, /that window still starts DISCONNECTED: use \/tg when you want the phone/,
+      'the beginner path (/tg) must stay the one the installer promotes');
     assert.doesNotMatch(installerSource, /inert until local \/telegram-connect/);
     assert.match(commonSource, /registers \/tg plus the advanced/);
     assert.match(commonSource, /\/telegram-connect, \/telegram-disconnect and \/telegram-status/);
