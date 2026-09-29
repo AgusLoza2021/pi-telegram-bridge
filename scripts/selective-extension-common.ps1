@@ -311,17 +311,36 @@ function Copy-SelectiveDirectoryContents {
         [Parameter(Mandatory = $true)][string]$Source,
         [Parameter(Mandatory = $true)][string]$Target
     )
+    if (-not (Test-Path -LiteralPath $Target -PathType Container)) {
+        # Copy-Item sends a nested DIRECTORY to a missing destination under
+        # the destination's own name, which flattens the tree while leaving
+        # the file count and the byte total untouched. Creating the target
+        # first keeps every child exactly where it was.
+        New-Item -ItemType Directory -Path $Target -Force | Out-Null
+    }
     Get-ChildItem -LiteralPath $Source -Force | ForEach-Object {
         Copy-Item -LiteralPath $_.FullName -Destination $Target -Recurse -Force
     }
-    $sourceStats = Get-ChildItem -LiteralPath $Source -Recurse -Force -File |
-        Measure-Object -Property Length -Sum
-    $targetStats = Get-ChildItem -LiteralPath $Target -Recurse -Force -File |
-        Measure-Object -Property Length -Sum
-    if ([int64]$sourceStats.Count -ne [int64]$targetStats.Count -or
-        [int64]$sourceStats.Sum -ne [int64]$targetStats.Sum) {
+    # The verification below compares relative paths as well as volume: a
+    # count-plus-bytes check alone accepts a flattened copy. Counts are
+    # accumulated by hand on purpose: Measure-Object emits nothing
+    # for an empty pipeline, and reading .Count or .Sum off that nothing is a
+    # strict-mode error (PropertyNotFoundStrict), which turned a legitimate
+    # empty source into a hard failure. @() keeps the counts defined at zero.
+    $sourceFiles = @(Get-ChildItem -LiteralPath $Source -Recurse -Force -File)
+    $targetFiles = @(Get-ChildItem -LiteralPath $Target -Recurse -Force -File)
+    [int64]$sourceBytes = 0
+    foreach ($file in $sourceFiles) { $sourceBytes += $file.Length }
+    [int64]$targetBytes = 0
+    foreach ($file in $targetFiles) { $targetBytes += $file.Length }
+    $sourceRel = @($sourceFiles | ForEach-Object { $_.FullName.Substring($Source.Length).TrimStart('\') } | Sort-Object)
+    $targetRel = @($targetFiles | ForEach-Object { $_.FullName.Substring($Target.Length).TrimStart('\') } | Sort-Object)
+    $moved = @(Compare-Object -ReferenceObject $sourceRel -DifferenceObject $targetRel)
+    if ([int64]$sourceFiles.Count -ne [int64]$targetFiles.Count -or
+        $sourceBytes -ne $targetBytes -or
+        $moved.Count -gt 0) {
         throw ("verified copy failed: source has {0} files/{1} bytes, copy has {2} files/{3} bytes" -f `
-            $sourceStats.Count, $sourceStats.Sum, $targetStats.Count, $targetStats.Sum)
+            $sourceFiles.Count, $sourceBytes, $targetFiles.Count, $targetBytes)
     }
 }
 

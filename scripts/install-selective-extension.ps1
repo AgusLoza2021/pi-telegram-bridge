@@ -91,17 +91,24 @@ $destination = Get-SelectiveOnDemandExtensionDir -Create
 Assert-SelectiveNoReparseBelow -Anchor (Get-SelectiveUserProfile) -Target $destination
 Assert-SelectiveNoReparseBelow -Anchor (Get-SelectiveUserProfile) -Target $payloadRoot
 
+$destinationHasContent = $false
 if (Test-Path -LiteralPath $destination) {
     if (-not (Test-Path -LiteralPath $destination -PathType Container)) {
         throw "destination exists but is not a directory: $destination"
     }
+    # An empty destination is not an installation: it is the sibling this
+    # script created a line above, or the remains of a run that failed
+    # before the swap. Backing it up would announce a backup holding
+    # nothing, so the backup is skipped and the empty directory is dealt
+    # with at the swap below.
+    $destinationHasContent = (@(Get-ChildItem -LiteralPath $destination -Force).Count -gt 0)
 }
 
 # --- Backup of the current installation (never deleted) -----------------
 
 $previousBackupPath = $null
 $replacedDir = $null
-if (Test-Path -LiteralPath $destination) {
+if ($destinationHasContent) {
     $backupRoot = Get-SelectiveBackupRoot -Create
     $backupPath = Join-Path $backupRoot $stamp
     New-Item -ItemType Directory -Path $backupPath -Force | Out-Null
@@ -169,21 +176,32 @@ foreach ($entry in Get-SelectivePayloadMap) {
 # --- Disposition of the moved-aside previous installation ---------------
 
 if ($null -ne $replacedDir -and (Test-Path -LiteralPath $replacedDir)) {
-    try {
-        # File it under the timestamped backup (cross-volume move). If
-        # this fails, the dot-prefixed sibling is left in place and
-        # reported - it is inert and non-discoverable, never deleted.
-        $replacedTarget = Join-Path $previousBackupPath 'replaced-original'
-        New-Item -ItemType Directory -Path $replacedTarget -Force | Out-Null
-        Get-ChildItem -LiteralPath $replacedDir -Force | ForEach-Object {
-            Move-Item -LiteralPath $_.FullName -Destination $replacedTarget -Force
+    if ($null -ne $previousBackupPath) {
+        try {
+            # File it under the timestamped backup (cross-volume move). If
+            # this fails, the dot-prefixed sibling is left in place and
+            # reported - it is inert and non-discoverable, never deleted.
+            $replacedTarget = Join-Path $previousBackupPath 'replaced-original'
+            New-Item -ItemType Directory -Path $replacedTarget -Force | Out-Null
+            Get-ChildItem -LiteralPath $replacedDir -Force | ForEach-Object {
+                Move-Item -LiteralPath $_.FullName -Destination $replacedTarget -Force
+            }
+            # Husk removal only: non-recursive, so it succeeds only when every
+            # child was moved under the backup; otherwise it fails and the
+            # leftovers are reported, never destroyed.
+            Remove-Item -LiteralPath $replacedDir -Force | Out-Null
+        } catch {
+            Write-Warning ("could not fully file the replaced installation under the backup; leftovers are preserved (inert, non-discoverable) at: $replacedDir")
         }
-        # Husk removal only: non-recursive, so it succeeds only when every
-        # child was moved under the backup; otherwise it fails and the
-        # leftovers are reported, never destroyed.
-        Remove-Item -LiteralPath $replacedDir -Force | Out-Null
-    } catch {
-        Write-Warning ("could not fully file the replaced installation under the backup; leftovers are preserved (inert, non-discoverable) at: $replacedDir")
+    } else {
+        # No backup was taken, so the moved-aside directory was empty by the
+        # check above. Remove the empty husk only: Remove-Item without
+        # -Recurse refuses a directory with content, so a race that added a
+        # child can only leave the directory in place, never destroy it.
+        Remove-Item -LiteralPath $replacedDir -Force -ErrorAction SilentlyContinue | Out-Null
+        if (Test-Path -LiteralPath $replacedDir) {
+            Write-Warning ("empty moved-aside destination kept (inert, non-discoverable) at: $replacedDir")
+        }
     }
 }
 

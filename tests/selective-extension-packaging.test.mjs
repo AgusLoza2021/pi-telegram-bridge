@@ -21,8 +21,9 @@
 
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync, existsSync } from 'node:fs';
+import { readFileSync, readdirSync, existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { spawn } from 'node:child_process';
+import { tmpdir } from 'node:os';
 import { join, posix, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -436,6 +437,64 @@ describe('on-demand load: nothing of this project may stay in Pi auto-discovery'
         dirname(extensionsRoot).toLowerCase(),
         'the payload must be a sibling of the extensions root',
       );
+    });
+    function runPowerShellCommand(script) {
+      return new Promise((resolvePromise) => {
+        const ps = spawn(
+          'powershell.exe',
+          ['-NoProfile', '-NonInteractive', '-Command', script],
+          { windowsHide: true },
+        );
+        let out = '';
+        ps.stdout.on('data', (c) => { out += c.toString(); });
+        ps.stderr.on('data', (c) => { out += c.toString(); });
+        ps.on('close', (code) => resolvePromise({ code, out }));
+        ps.on('error', () => resolvePromise({ code: -1, out: 'spawn failed' }));
+      });
+    }
+
+    test('the verified copy helper accepts an EMPTY source directory', async () => {
+      // Regression, reproduced on this machine: the installer backs up the
+      // previous installation before the swap, and -Create leaves an empty
+      // destination behind on a first install. Measure-Object emits nothing
+      // for an empty pipeline, so the old verification read .Count/.Sum off
+      // $null and died under Set-StrictMode -Version 2.0
+      // (PropertyNotFoundStrict), aborting a first install right after the
+      // legacy discovery copy had already been migrated out.
+      const root = mkdtempSync(join(tmpdir(), 'ptb-copy-'));
+      try {
+        const emptySource = join(root, 'empty-source');
+        const emptyTarget = join(root, 'empty-target');
+        const dataSource = join(root, 'data-source');
+        const dataTarget = join(root, 'data-target');
+        mkdirSync(emptySource);
+        mkdirSync(emptyTarget);
+        mkdirSync(join(dataSource, 'nested'), { recursive: true });
+        writeFileSync(join(dataSource, 'entry.ts'), 'export const a = 1;\n');
+        writeFileSync(join(dataSource, 'nested', 'child.mjs'), 'export const b = 2;\n');
+        const quote = (value) => value.replace(/'/g, "''");
+        const { code, out } = await runPowerShellCommand(
+          'Set-StrictMode -Version 2.0; ' +
+            `. '${quote(COMMON_PS1)}'; ` +
+            `Copy-SelectiveDirectoryContents -Source '${quote(emptySource)}' -Target '${quote(emptyTarget)}'; ` +
+            `Copy-SelectiveDirectoryContents -Source '${quote(dataSource)}' -Target '${quote(dataTarget)}'; ` +
+            "'COPY-OK'",
+        );
+        assert.equal(code, 0, `the copy helper failed: ${out}`);
+        assert.match(out, /COPY-OK/, `unexpected output: ${out}`);
+        assert.equal(
+          readdirSync(emptyTarget).length,
+          0,
+          'nothing may be invented for an empty source',
+        );
+        assert.equal(readFileSync(join(dataTarget, 'entry.ts'), 'utf8'), 'export const a = 1;\n');
+        assert.equal(
+          readFileSync(join(dataTarget, 'nested', 'child.mjs'), 'utf8'),
+          'export const b = 2;\n',
+        );
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
     });
   });
 
