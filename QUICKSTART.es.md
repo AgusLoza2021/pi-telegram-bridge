@@ -56,7 +56,7 @@ Una ruta simple como `C:\pi-telegram-bridge` funciona bien.
 4. Cuando te lo pida, **pega el token del Paso 2**. La ventana oculta lo que pegas. El token queda en tu PC, guardado de forma cifrada (protegido para tu cuenta de Windows), y nunca se escribe ni se muestra en ningún otro lado.
 5. La ventana muestra un **código QR**. Abre la cámara del teléfono, apúntala al código; Telegram abre tu bot y tocas **Start**. El código contiene solo el nombre del bot y un código de emparejamiento de un solo uso — nunca el token.
 6. La ventana espera hasta un minuto. Cuando reconoce tu teléfono, te pide escribir **ENROLL** para confirmar. Nada se guarda hasta que lo hagas.
-7. Después de confirmar, la ventana instala un auxiliar dentro de Pi (queda inactivo hasta que tú vincules una ventana en el Paso 4) y configura la conexión de fondo, pero **la deja apagada**: no arranca nada al iniciar sesión. Cuando la quieras usar, abrí un Símbolo del sistema en esta carpeta y escribí `telegram on`. A partir de ahí la manejás vos: `telegram off` la apaga y `telegram status` te muestra cómo está. También podés hacer doble clic en `telegram.cmd` en el Explorador: abre un menú que te muestra cómo está la conexión y te deja prenderla o apagarla (escribir `telegram on|off|status` en el Símbolo del sistema sigue funcionando exactamente igual). Si la apagás, queda apagada incluso si reiniciás Windows; la prendés de nuevo con `telegram on`.
+7. Después de confirmar, la ventana instala un auxiliar para Pi (queda fuera de las carpetas que Pi carga solo, así que únicamente lo reciben las ventanas que abras con `pi-telegram.cmd` — ver el Paso 4 — y además ese auxiliar sigue inactivo hasta que tú vincules la ventana) y configura la conexión de fondo, pero **la deja apagada**: no arranca nada al iniciar sesión. Cuando la quieras usar, abrí un Símbolo del sistema en esta carpeta y escribí `telegram on`. A partir de ahí la manejás vos: `telegram off` la apaga y `telegram status` te muestra cómo está. También podés hacer doble clic en `telegram.cmd` en el Explorador: abre un menú que te muestra cómo está la conexión y te deja prenderla o apagarla (escribir `telegram on|off|status` en el Símbolo del sistema sigue funcionando exactamente igual). Si la apagás, queda apagada incluso si reiniciás Windows; la prendés de nuevo con `telegram on`.
 
 Si algo falla, tu configuración anterior queda intacta y no se guarda nada a medias. Mira la sección "Los fallos más comunes" más abajo.
 
@@ -64,7 +64,9 @@ Si algo falla, tu configuración anterior queda intacta y no se guarda nada a me
 
 Cada ventana de Pi queda **desconectada hasta que tú la vincules** — esto es intencional.
 
-1. Abre Pi en una terminal de tu PC. Si Pi ya estaba abierto durante la configuración, ciérralo por completo y vuelve a abrirlo para que cargue el auxiliar nuevo; con `/reload` solo no alcanza.
+Pi nunca carga el puente por su cuenta. El puente aparece solo en las ventanas que arrancas con **`pi-telegram.cmd`**: haz doble clic en ese archivo, o abre un Símbolo del sistema en la carpeta y escribe `pi-telegram`. Una ventana de Pi abierta de cualquier otra forma no tiene `/tg`.
+
+1. Abre Pi con **`pi-telegram.cmd`**. Pi se abre en la carpeta desde la que lo ejecutas, así que ejecútalo desde el proyecto en el que quieres trabajar. Si ya tenías una ventana de Pi abierta durante la configuración o una actualización, ciérralo por completo y vuelve a abrirlo con `pi-telegram.cmd` para que cargue el puente; con `/reload` solo no alcanza.
 2. Escribe `/tg` y elige **Connect** en la confirmación que aparece.
 3. Envía un mensaje de texto normal a tu bot desde el teléfono.
 
@@ -128,7 +130,7 @@ Reglas simples:
 - Solo hay **una pregunta a la vez por ventana de Pi**, y cada pregunta vence a los **30 minutos**. Cuando vence no llega ningún mensaje de Telegram: la herramienta simplemente agota su tiempo en la PC. Solo si tocas una tarjeta vencida responde el bot con el aviso fijo de pregunta desactualizada; Pi vuelve a preguntar si todavía lo necesita.
 - **Escribir texto no es una respuesta.** Mientras una pregunta está pendiente, la única forma de responderla es con los botones de la propia tarjeta.
 - Esto sirve solo para decisiones normales de la tarea en curso. Los permisos, aprobaciones y avisos de seguridad que Pi muestra en la pantalla de la PC nunca se convierten en botones de Telegram.
-- Si actualizaste el puente y la pregunta no aparece, cierra Pi por completo y vuelve a abrirlo, y después escribe `/tg` de nuevo. Con `/reload` solo no alcanza: hace falta cerrar y abrir Pi después de instalar o actualizar.
+- Si actualizaste el puente y la pregunta no aparece, cierra Pi por completo y vuelve a abrirlo con `pi-telegram.cmd` (así esa ventana sí tiene el puente), y después escribe `/tg` de nuevo. Con `/reload` solo no alcanza: hace falta cerrar y abrir Pi después de instalar o actualizar.
 
 En la PC, esta función es la herramienta interna `telegram_ask_user_choice` de la extensión. No necesitas hacer nada con ella: aparece sola cuando Pi pregunta. Los comandos siguen siendo parte de la capa avanzada.
 
@@ -186,7 +188,8 @@ Si el audio no se puede transcribir (falta una herramienta, archivo demasiado gr
 | `'node' is not recognized` al verificar la versión | Node.js no está instalado. Instálalo desde [https://nodejs.org](https://nodejs.org) y, después, cierra y vuelve a abrir el Símbolo del sistema para que Windows reconozca el programa nuevo. |
 | Hiciste doble clic en el archivo de configuración **desde dentro del ZIP** | Windows lo ejecuta desde una carpeta temporal que no tiene el resto de los archivos del proyecto, y la configuración puede avisarte de que falta algo que en realidad sí tienes. Cierra esa ventana, extrae el ZIP correctamente (clic derecho → **Extraer todo...**) y ejecuta `Setup Pi Telegram.cmd` desde la carpeta extraída. |
 | El código QR expiró o no se puede escanear | Cierra la configuración y ejecuta `Setup Pi Telegram.cmd` de nuevo para obtener un código nuevo. Sube el brillo de la pantalla y acerca el teléfono. |
-| El bot dice que no hay Pi conectado (`no Pi window is connected`) | Abre Pi en la PC, escribe `/tg` y elige **Connect**. |
+| El bot dice que no hay Pi conectado (`no Pi window is connected`) | Abrí Pi en la PC con `pi-telegram.cmd`, escribí `/tg` y elegí **Connect**. |
+| Dice que `/tg` no existe en Pi | Esa ventana de Pi no se abrió con el puente: cerrala y abrí Pi con `pi-telegram.cmd` en la carpeta del proyecto (doble clic en el archivo, o `pi-telegram` en el Símbolo del sistema). Después de instalar o actualizar también hace falta cerrar y abrir la ventana por completo: con `/reload` solo no alcanza. |
 | Tenés varias ventanas de Pi vinculadas | Tocá **Projects** y elegí la fila que corresponda: la fila con `✓` es la que recibe tus mensajes. |
 | Al enviar una foto imprime `FAILED: ...` | Cada código nombra una sola causa. `path_escape`: el archivo está fuera de la carpeta del proyecto — esta comprobación va primero, así que la ves incluso si el archivo además no existe o tiene mal el nombre; agrega `--root "C:\la\carpeta"` si la imagen está en otro lado. `not_found` o `not_a_file`: no hay nada legible en esa ruta. `bad_extension`: no es `.png`, `.jpg`, `.jpeg` ni `.webp`. `too_large`: supera los 10 MB. `bad_root`: la carpeta que pasaste en `--root` no existe. |
 | El bot responde "I couldn't transcribe that audio" | Verificá que existan los tres archivos: `.local/tools/whisper/whisper-cli.exe`, `.local/tools/whisper/models/ggml-small.bin` y `.local/tools/ffmpeg/ffmpeg.exe`. Un audio de más de 20 MB o de más de 5 minutos se rechaza por diseño. Si acabás de instalar las herramientas no hace falta reiniciar nada — la próxima nota de voz las usa. |

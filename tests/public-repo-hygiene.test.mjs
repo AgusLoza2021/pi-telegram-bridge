@@ -14,7 +14,7 @@ function publicTextFiles(directory = ROOT) {
     // Mirrors the "not shipped" entries in .gitignore. Local workflow notes are
     // not part of the public text candidate, so a path inside them must never be
     // able to fail this guard.
-    if (['.git', '.local', '.atl', 'node_modules', 'odd'].includes(entry)) continue;
+    if (['.git', '.local', '.atl', '.codegraph', 'node_modules', 'odd'].includes(entry)) continue;
     const absolute = join(directory, entry);
     if (statSync(absolute).isDirectory()) {
       files.push(...publicTextFiles(absolute));
@@ -49,6 +49,11 @@ describe('public repository hygiene', () => {
     assert.match(read('README.md'), /\[SECURITY\.md\]\(SECURITY\.md\)/);
     assert.match(read('README.md'), /\[CONTRIBUTING\.md\]\(CONTRIBUTING\.md\)/);
     assert.match(read('.gitignore'), /^\.atl\/$/m, 'Pi-local runtime metadata must stay untracked');
+    assert.match(
+      read('.gitignore'),
+      /^\.codegraph\/$/m,
+      'the local CodeGraph index must stay untracked, so a machine-local cache can never enter the public text candidate',
+    );
   });
 
   test('security policy names the protected data and private reporting route', () => {
@@ -398,12 +403,16 @@ describe('public repository hygiene', () => {
       'the Spanish row must keep the restart behavior');
   });
 
-  test('the README quick-start step 5 turns the connection on before sending the reader to /tg', () => {
+  test('the README quick-start step 5 turns the connection on before sending the reader to /tg, and names the launcher that loads the bridge', () => {
     const readme = read('README.md');
     const step5 = readme.split('\n').find((line) => /^5\. /.test(line));
     assert.ok(step5, 'the README quick-start must keep a step 5');
     assert.match(step5, /run `telegram on` there, then open Pi, run `\/tg`/,
       'step 5 must sequence `telegram on` before opening Pi and /tg');
+    // Pi no longer discovers the extension: a reader who opens Pi the old
+    // way gets a window without /tg, so step 5 must name the launcher.
+    assert.match(step5, /`pi-telegram\.cmd`/,
+      'step 5 must name the on-demand launcher, or the following /tg step cannot work');
     assert.doesNotMatch(readme, /^5\. Open Pi, run `\/tg`, choose \*\*Connect\*\*/m,
       'the old bare step 5 (which never turned the connection on) must not survive');
   });

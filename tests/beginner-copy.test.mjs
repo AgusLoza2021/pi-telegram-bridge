@@ -625,7 +625,7 @@ const ADVANCED_DOC_SOURCE = readFileSync(join(MODULE_ROOT, 'docs', 'ADVANCED.md'
 /** MSG-S12: a missing Pi is a warning with the next action, never a blocker. */
 const PI_MISSING_LINES = [
   'Pi is not on this computer yet. Your private link is safe and will wait.',
-  'Install Pi on this PC, then open it and type /tg to connect.',
+  'Install Pi on this PC, then open Pi with pi-telegram.cmd in this folder and type /tg to connect.',
 ];
 
 /** MSG-E5/MSG-E6: the state root cannot be kept local-only there. */

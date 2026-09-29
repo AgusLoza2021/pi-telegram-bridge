@@ -127,20 +127,21 @@ The broker exposes nonsecret health through `broker-meta.json`: instance identit
 | Durable store | `src/store.mjs` | SQLite schema, session leases, typed command claims, event acknowledgements, and transport invariants. |
 | TUI client | `src/tui-bridge-client.mjs` | Credential-free Pi-side transport client, heartbeats, command claims, and bounded event writes. |
 | Pi extension | `extension/selective-tui-extension.ts` | Local opt-in commands, official Pi API dispatch, state reporting, and finalized-text forwarding. |
-| Extension installer | `scripts/install-selective-extension.ps1` and common helpers | Fixed-payload staging, hash verification, reparse protection, dated backup, and reversible installation. |
+| Extension installer | `scripts/install-selective-extension.ps1` and common helpers | Fixed-payload staging, hash verification, reparse protection, dated backup, and reversible installation. The payload lands outside Pi's auto-discovery root and also migrates any leftover discovery copy by archiving it first. |
+| On-demand launcher | `pi-telegram.cmd` and `scripts/launch-pi-with-bridge.ps1` | Starts Pi with the payload loaded through an explicit `-e`, forwards every argument, keeps the caller's working directory, and never suppresses other extensions. |
 | Broker task lifecycle | `scripts/telegram.ps1` (the on/off/status switch) plus `scripts/*-broker-service.ps1` and common helpers | Current-user scheduled task registration (disabled by default), the on/off enable bit, persisted safety settings, status, start, graceful stop, backup, and uninstall. |
 | Legacy runtime | `src/runtime-host.mjs`, `src/runtime-worker.mjs`, `src/telegram-worker.mjs` | Explicit fallback host/worker workflow; not used by the default selective broker. |
 
 ## Installed extension payload
 
-The global Pi extension contains only four runtime files:
+The bridge extension payload contains only four runtime files, and it is deployed to `<user profile>\.pi\agent\pi-telegram-bridge` — a sibling of Pi's `extensions` directory, never inside it, so Pi never discovers it on its own:
 
 - `extension/selective-tui-extension.ts`
 - `src/tui-bridge-client.mjs`
 - `src/beginner-copy.mjs`
 - `src/store.mjs`
 
-A generated `index.ts` binds that installation to the selected local state directory. Installation verifies the payload hashes and rejects path, symlink, and junction escapes. It does not alter Pi's `settings.json` or unrelated extensions.
+A generated `index.ts` binds that installation to the selected local state directory. Installation verifies the payload hashes and rejects path, symlink, and junction escapes. It does not alter Pi's `settings.json` or unrelated extensions. Loading is always explicit: `pi-telegram.cmd` runs `pi -e <payload>`, and a Pi window started any other way simply has no bridge.
 
 ## Scheduled task model
 

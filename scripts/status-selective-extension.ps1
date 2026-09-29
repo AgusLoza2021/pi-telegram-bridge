@@ -1,10 +1,15 @@
 # T05 status-selective-extension.ps1 - read-only, credential-free status
-# of the globally installed selective-TUI Pi extension. Windows
-# PowerShell 5.1+.
+# of the installed selective-TUI Pi extension. Windows PowerShell 5.1+.
 #
-# Reports ONLY: whether the extension is installed, whether the install
+# The extension is ON DEMAND: the payload lives beside Pi's
+# auto-discovery root, so it loads only when a session is started with
+# 'pi -e <destination>' (pi-telegram.cmd).
+#
+# Reports ONLY: whether the payload is installed, whether the install
 # manifest is present, whether the recorded source hashes are current
-# or stale, the destination path and the install time. Nothing is
+# or stale, the destination path, the install time, and whether Pi's
+# auto-discovery root is CLEAR of this project (a leftover copy there
+# would silently load the bridge in every project again). Nothing is
 # created, modified or deleted; no credential material is read.
 #
 # -Json emits the same information as a JSON object.
@@ -19,7 +24,11 @@ $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'selective-extension-common.ps1')
 
 $manifest = Read-SelectiveManifest
-$destination = Join-Path (Get-SelectiveExtensionsRoot) (Get-SelectiveGlobalExtensionName)
+$destination = Get-SelectiveOnDemandExtensionDir
+# Pi's auto-discovery root must stay clear of this project; a copy left
+# there is the one defect that silently re-enables loading everywhere.
+$legacyDiscoveryDir = Get-SelectiveGlobalExtensionDir
+$legacyDiscoveryCopy = (Test-Path -LiteralPath $legacyDiscoveryDir -PathType Container)
 # Read-only reparse check: never report an extension as installed when
 # the chain below the profile was swapped for a junction.
 Assert-SelectiveNoReparseBelow -Anchor (Get-SelectiveUserProfile) -Target $destination
@@ -60,12 +69,16 @@ if ($null -ne $manifest) {
 }
 
 $report = [PSCustomObject]@{
-    extensionName   = (Get-SelectiveGlobalExtensionName)
-    installed       = $installed
-    manifestPresent = ($null -ne $manifest)
-    destination     = $destination
-    installedAt     = $installedAt
-    sources         = $sourceStates
+    extensionName       = (Get-SelectiveGlobalExtensionName)
+    installed           = $installed
+    manifestPresent     = ($null -ne $manifest)
+    installedAt         = $installedAt
+    mode                = 'on-demand'
+    launcher            = 'pi-telegram.cmd'
+    destination         = $destination
+    autoDiscoveryDir    = $legacyDiscoveryDir
+    autoDiscoveryClean  = (-not $legacyDiscoveryCopy)
+    sources             = $sourceStates
 }
 
 if ($Json) {
@@ -77,8 +90,16 @@ if ($Json) {
 
 Write-Host "Extension:            $($report.extensionName)"
 Write-Host "Installed:            $(if ($report.installed) { 'Yes' } else { 'No' })"
+Write-Host "Led by:               on demand - $($report.launcher) loads it for one window"
 Write-Host "Install manifest:     $(if ($report.manifestPresent) { 'Present' } else { 'Absent' })"
 Write-Host "Destination:          $($report.destination)"
+if ($report.autoDiscoveryClean) {
+    Write-Host "Auto-discovery:       clear (nothing of this project in $legacyDiscoveryDir)"
+} else {
+    Write-Host "Auto-discovery:       DEFECT - a copy still sits in Pi's auto-discovery root:"
+    Write-Host "                      $legacyDiscoveryDir"
+    Write-Host '                      It loads the bridge in EVERY project. Re-run scripts\install-selective-extension.ps1 to migrate it out.'
+}
 Write-Host "Installed at:         $(if ($report.installedAt) { $report.installedAt } else { 'n/a' })"
 if ($sourceStates.Count -gt 0) {
     Write-Host 'Source files:'

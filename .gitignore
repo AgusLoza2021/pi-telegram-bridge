@@ -27,5 +27,8 @@ Thumbs.db
 # Local Pi runtime state
 .atl/
 
+# Local CodeGraph index (per-machine analysis cache, never shipped)
+.codegraph/
+
 # Local workflow state (feature task tracking, not shipped)
 odd/

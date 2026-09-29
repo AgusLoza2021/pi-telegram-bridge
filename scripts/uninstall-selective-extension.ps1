@@ -1,13 +1,16 @@
 # T05 uninstall-selective-extension.ps1 - idempotent, reversible removal
-# of the globally installed selective-TUI Pi extension. Windows
-# PowerShell 5.1+. SOURCE ONLY: this session must not execute it.
+# of the installed selective-TUI Pi extension. Windows PowerShell 5.1+.
+# SOURCE ONLY: this session must not execute it.
 #
 # Semantics (per the T05 contract):
-# - The currently installed dedicated directory
-#   <profile>\.pi\agent\extensions\pi-telegram-bridge is archived to a
-#   timestamped backup under <module>\.local\backups\global-extension\
-#   (complete verified copy; NEVER deleted) and moved out of the
-#   auto-discovery root.
+# - The installed dedicated directory
+#   <profile>\.pi\agent\pi-telegram-bridge (the on-demand payload, a
+#   sibling of Pi's auto-discovery root) is archived to a timestamped
+#   backup under <module>\.local\backups\global-extension\ (complete
+#   verified copy; NEVER deleted) and moved out of its location.
+# - Any leftover copy inside Pi's auto-discovery root is migrated out the
+#   same way, so after any run of this script nothing of this project can
+#   be auto-loaded by any Pi window.
 # - Rollback/reversal: if the install manifest records a prior backup
 #   (previousBackupPath) and it still exists, that prior version is
 #   restored into the destination from a verified staging copy. The
@@ -30,14 +33,21 @@ $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'selective-extension-common.ps1')
 
 $manifest = Read-SelectiveManifest
-$destination = Join-Path (Get-SelectiveExtensionsRoot) (Get-SelectiveGlobalExtensionName)
+$destination = Get-SelectiveOnDemandExtensionDir
 # Reparse-checked chain below the profile before anything is moved: a
 # planted junction must never be archived through or replaced by.
 Assert-SelectiveNoReparseBelow -Anchor (Get-SelectiveUserProfile) -Target $destination
+$payloadRoot = Join-Path (Get-SelectiveUserProfile) '.pi\agent'
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 
 if (-not (Test-Path -LiteralPath $destination)) {
-    Write-Host 'UNINSTALL OK - the dedicated global extension directory is already absent.'
+    Write-Host 'UNINSTALL OK - the dedicated extension directory is already absent.'
+    # A copy inside Pi's auto-discovery root is still a defect even when
+    # the on-demand payload was never installed: migrate it out too.
+    $earlyMigration = Remove-SelectiveLegacyDiscoveryCopy -Stamp $stamp
+    if ($null -ne $earlyMigration) {
+        Write-Host "A leftover auto-discovery copy was archived and moved out: $earlyMigration"
+    }
     if ($null -ne $manifest) {
         $previous = Get-SelectiveManifestField -Manifest $manifest -Name 'previousBackupPath'
         if (-not [string]::IsNullOrEmpty($previous)) {
@@ -63,10 +73,16 @@ $archivePath = Join-Path $backupRoot "uninstalled-$stamp"
 New-Item -ItemType Directory -Path $archivePath -Force | Out-Null
 Copy-SelectiveDirectoryContents -Source $destination -Target $archivePath
 
-$extensionsRoot = Get-SelectiveExtensionsRoot
-$asideDir = Join-Path $extensionsRoot ".pi-telegram-bridge.removing-$stamp"
+$asideDir = Join-Path $payloadRoot ".pi-telegram-bridge.removing-$stamp"
 Move-Item -LiteralPath $destination -Destination $asideDir
 Write-Host "Current installation archived to: $archivePath"
+
+# A copy left in Pi's auto-discovery root is migrated out in the same run
+# (archived under the same backup root, never deleted).
+$legacyArchive = Remove-SelectiveLegacyDiscoveryCopy -Stamp $stamp
+if ($null -ne $legacyArchive) {
+    Write-Host "Leftover auto-discovery copy archived and moved out: $legacyArchive"
+}
 
 # File the moved-aside original under the archive (cross-volume move).
 # Non-recursive husk removal only; any failure preserves the leftover
@@ -91,7 +107,7 @@ if ($null -ne $manifest) {
 
 $restoredFrom = $null
 if (-not [string]::IsNullOrEmpty($previousBackupPath) -and (Test-Path -LiteralPath $previousBackupPath -PathType Container)) {
-    $staging = Join-Path $extensionsRoot ".pi-telegram-bridge.restore-$stamp"
+    $staging = Join-Path $payloadRoot ".pi-telegram-bridge.restore-$stamp"
     New-Item -ItemType Directory -Path $staging -Force | Out-Null
     Assert-SelectiveNoReparseBelow -Anchor (Get-SelectiveUserProfile) -Target $staging
     $restoreOk = $false
@@ -148,6 +164,8 @@ $updated = [PSCustomObject]@{
     version                 = 1
     kind                    = 'pi-telegram-bridge-global-extension-manifest'
     extensionName           = (Get-SelectiveGlobalExtensionName)
+    mode                    = 'on-demand'
+    autoDiscovery           = $false
     moduleRoot              = (Get-BridgeModuleRoot)
     destination             = $destination
     stateDirectory          = (Get-SelectiveManifestField -Manifest $prevManifest -Name 'stateDirectory')
@@ -164,7 +182,7 @@ $updated = [PSCustomObject]@{
 Write-SelectiveManifest -Manifest $updated
 
 Write-Host ''
-Write-Host 'UNINSTALL OK - global extension removed from auto-discovery.'
+Write-Host 'UNINSTALL OK - bridge payload removed and auto-discovery cleared.'
 if ($null -ne $restoredFrom) {
     Write-Host "Rolled back to the prior installation from: $restoredFrom"
 } else {

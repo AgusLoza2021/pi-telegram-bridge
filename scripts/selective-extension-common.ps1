@@ -52,6 +52,12 @@ Created on demand (install only); callers that must stay read-only use
 Test-Path themselves. The chain below the profile is reparse-checked
 BEFORE creation and re-checked AFTER (another process must not be able
 to swap in a junction between the check and the write).
+
+LEGACY destination. Since the on-demand switch nothing of this project
+may live here: Pi discovers this root, so a copy under it loads in EVERY
+project on every session. It is still resolved so that install and
+uninstall can migrate a leftover copy out of it and status can prove the
+root is clear.
 #>
 function Get-SelectiveExtensionsRoot {
     param([switch]$Create)
@@ -75,6 +81,33 @@ reparse-checked on every call (destination included when it exists).
 function Get-SelectiveGlobalExtensionDir {
     param([switch]$CreateRoot)
     return (Join-Path (Get-SelectiveExtensionsRoot -Create:$CreateRoot) (Get-SelectiveGlobalExtensionName))
+}
+
+<#
+.SYNOPSIS
+The on-demand payload directory: <profile>\.pi\agent\pi-telegram-bridge.
+
+Deliberately a SIBLING of the extensions root, never a child of it. Pi
+auto-discovers <profile>\.pi\agent\extensions, so a payload under that
+root loads in every project in every session and costs system-prompt
+tokens and an always-offered tool whether or not the owner wants the
+bridge there. This directory is outside every discovery root: Pi loads
+the bridge only when a session is started explicitly with
+'pi -e <this directory>' (scripts/launch-pi-with-bridge.ps1, surfaced as
+pi-telegram.cmd). Same profile resolution and same reparse-point
+defence as the legacy root.
+#>
+function Get-SelectiveOnDemandExtensionDir {
+    param([switch]$Create)
+    $dir = Join-Path (Get-SelectiveUserProfile) '.pi\agent\pi-telegram-bridge'
+    if ($Create) {
+        Assert-SelectiveNoReparseBelow -Anchor (Get-SelectiveUserProfile) -Target $dir
+        if (-not (Test-Path -LiteralPath $dir -PathType Container)) {
+            New-Item -ItemType Directory -Path $dir -Force | Out-Null
+        }
+        Assert-SelectiveNoReparseBelow -Anchor (Get-SelectiveUserProfile) -Target $dir
+    }
+    return $dir
 }
 
 <#
@@ -270,26 +303,107 @@ function Protect-SelectiveEntryFile {
 .SYNOPSIS
 Complete, verifying copy of a directory's contents (including hidden
 files) into an existing target directory. Throws when the copy does
-not match the source (file count and total bytes) so a caller never
-trusts a partial backup.
+not match the source (file count, total bytes and relative paths) so a
+caller never trusts a partial or reshaped backup.
 #>
 function Copy-SelectiveDirectoryContents {
     param(
         [Parameter(Mandatory = $true)][string]$Source,
         [Parameter(Mandatory = $true)][string]$Target
     )
+    if (-not (Test-Path -LiteralPath $Target -PathType Container)) {
+        # Copy-Item sends a nested DIRECTORY to a missing destination under
+        # the destination's own name, which flattens the tree while leaving
+        # the file count and the byte total untouched. Creating the target
+        # first keeps every child exactly where it was.
+        New-Item -ItemType Directory -Path $Target -Force | Out-Null
+    }
     Get-ChildItem -LiteralPath $Source -Force | ForEach-Object {
-        Copy-Item -LiteralPath $_.FullName -Destination $Target -Recurse -Force
+        # Every destination is spelled out as <target>\<child> on purpose.
+        # Copy-Item decides between "create this name" and "copy inside
+        # this name" from whether the destination exists, which is the trap
+        # described above; naming each child removes that decision from the
+        # copy entirely.
+        Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $Target $_.Name) -Recurse -Force
     }
-    $sourceStats = Get-ChildItem -LiteralPath $Source -Recurse -Force -File |
-        Measure-Object -Property Length -Sum
-    $targetStats = Get-ChildItem -LiteralPath $Target -Recurse -Force -File |
-        Measure-Object -Property Length -Sum
-    if ([int64]$sourceStats.Count -ne [int64]$targetStats.Count -or
-        [int64]$sourceStats.Sum -ne [int64]$targetStats.Sum) {
-        throw ("verified copy failed: source has {0} files/{1} bytes, copy has {2} files/{3} bytes" -f `
-            $sourceStats.Count, $sourceStats.Sum, $targetStats.Count, $targetStats.Sum)
+    # The verification below compares relative paths as well as volume: a
+    # count-plus-bytes check alone accepts a flattened copy. Counts are
+    # accumulated by hand on purpose: Measure-Object emits nothing
+    # for an empty pipeline, and reading .Count or .Sum off that nothing is a
+    # strict-mode error (PropertyNotFoundStrict), which turned a legitimate
+    # empty source into a hard failure. @() keeps the counts defined at zero.
+    $sourceFiles = @(Get-ChildItem -LiteralPath $Source -Recurse -Force -File)
+    $targetFiles = @(Get-ChildItem -LiteralPath $Target -Recurse -Force -File)
+    [int64]$sourceBytes = 0
+    foreach ($file in $sourceFiles) { $sourceBytes += $file.Length }
+    [int64]$targetBytes = 0
+    foreach ($file in $targetFiles) { $targetBytes += $file.Length }
+    # The relative paths are measured against the roots the provider
+    # reports, never against the caller's spelling. Get-ChildItem always
+    # returns the canonical form, so a short (8.3), dotted or otherwise
+    # non-canonical argument is a different length, and subtracting the
+    # given length slices the path in the wrong place. Both sides then
+    # differ while the file count and the byte total still match, which
+    # is what made this verification fail on a machine that spelled its
+    # temporary directory differently.
+    $sourceRoot = (Get-Item -LiteralPath $Source -Force -ErrorAction Stop).FullName.TrimEnd('\')
+    $targetRoot = (Get-Item -LiteralPath $Target -Force -ErrorAction Stop).FullName.TrimEnd('\')
+    $sourceRel = @($sourceFiles | ForEach-Object { $_.FullName.Substring($sourceRoot.Length).TrimStart('\') } | Sort-Object)
+    $targetRel = @($targetFiles | ForEach-Object { $_.FullName.Substring($targetRoot.Length).TrimStart('\') } | Sort-Object)
+    $moved = @(Compare-Object -ReferenceObject $sourceRel -DifferenceObject $targetRel)
+    if ([int64]$sourceFiles.Count -ne [int64]$targetFiles.Count -or
+        $sourceBytes -ne $targetBytes -or
+        $moved.Count -gt 0) {
+        # A volume-only message hid the reason once. Name the roots and the
+        # differing entries so a failure explains itself from the log alone.
+        $movedText = @($moved | ForEach-Object { '{0}{1}' -f $_.SideIndicator, $_.InputObject }) -join ', '
+        $message = "verified copy failed: source has {0} files/{1} bytes, copy has {2} files/{3} bytes; " +
+            "source root '{4}', copy root '{5}', differing entries: {6}"
+        throw ($message -f `
+            $sourceFiles.Count, $sourceBytes, $targetFiles.Count, $targetBytes, $sourceRoot, $targetRoot, $movedText)
     }
+}
+
+<#
+.SYNOPSIS
+Moves a leftover copy of this extension OUT of Pi's user auto-discovery
+root and files it under the module backup root. Returns the archive path,
+or $null when there was nothing to migrate.
+
+Order matters: the live directory is archived FIRST (so the archive keeps
+a usable 'index.ts' layout a person could reinstall from), then the entry
+is defused, then the directory is moved aside inside the discovery root,
+then the moved original is filed under the same archive and only the empty
+husk is removed - non-recursive, so it succeeds only when every child was
+preserved. Nothing is ever deleted, and a failure here leaves the
+leftovers inert (dot-prefixed) and reported.
+#>
+function Remove-SelectiveLegacyDiscoveryCopy {
+    param([Parameter(Mandatory = $true)][string]$Stamp)
+    $legacy = Get-SelectiveGlobalExtensionDir
+    if (-not (Test-Path -LiteralPath $legacy)) { return $null }
+    Assert-SelectiveNoReparseBelow -Anchor (Get-SelectiveUserProfile) -Target $legacy
+    if (-not (Test-Path -LiteralPath $legacy -PathType Container)) {
+        throw "legacy discovery path exists but is not a directory: $legacy"
+    }
+    $archive = Join-Path (Get-SelectiveBackupRoot -Create) "uninstalled-$Stamp"
+    if (Test-Path -LiteralPath $archive) { throw "archive path already exists: $archive" }
+    New-Item -ItemType Directory -Path $archive -Force | Out-Null
+    Copy-SelectiveDirectoryContents -Source $legacy -Target $archive
+    Protect-SelectiveEntryFile -Directory $legacy -Suffix 'migrated'
+    $aside = Join-Path (Get-SelectiveExtensionsRoot) ".$((Get-SelectiveGlobalExtensionName)).migrated-$Stamp"
+    Move-Item -LiteralPath $legacy -Destination $aside
+    try {
+        $asideTarget = Join-Path $archive 'removed-original'
+        New-Item -ItemType Directory -Path $asideTarget -Force | Out-Null
+        Get-ChildItem -LiteralPath $aside -Force | ForEach-Object {
+            Move-Item -LiteralPath $_.FullName -Destination $asideTarget -Force
+        }
+        Remove-Item -LiteralPath $aside -Force | Out-Null
+    } catch {
+        Write-Warning ("could not fully file the migrated copy under the archive; leftovers are preserved (inert, non-discoverable) at: $aside")
+    }
+    return $archive
 }
 
 <#
@@ -297,16 +411,19 @@ function Copy-SelectiveDirectoryContents {
 Shared post-change notice printed by install and uninstall: already-running
 Pi windows must be FULLY CLOSED and REOPENED; '/reload' alone is NOT
 sufficient because the extension has multiple runtime modules and a reload
-can mix old cached modules with new ones in one process. NEW Pi windows
-auto-discover the extension and start disconnected until the owner turns
-the phone connection on and links the window with /tg.
+can mix old cached modules with new ones in one process. Nothing is
+auto-discovered any more: a new Pi window loads the bridge only when the
+owner starts it through pi-telegram.cmd, and even then the window starts
+disconnected until the phone connection is turned on and the window is
+linked with /tg.
 #>
 function Write-SelectiveReloadNotice {
     Write-Host ''
     Write-Host 'NOTE: already-running Pi windows must be FULLY CLOSED and REOPENED after this change.'
     Write-Host '/reload alone is NOT sufficient: the extension has multiple runtime modules,'
     Write-Host 'and a reload can leave old and new modules mixed in one process.'
-    Write-Host 'New Pi windows auto-discover the extension and start DISCONNECTED:'
+    Write-Host 'Nothing from this project loads by itself any more: start Pi with pi-telegram.cmd'
+    Write-Host 'in this folder when you want the bridge, and even that window starts DISCONNECTED:'
     Write-Host 'nothing connects to Telegram until you turn the phone connection on, either with "telegram on" or with the start offer at the end of an advanced setup,'
     Write-Host 'and /tg links this window once it is on.'
 }
