@@ -38,21 +38,42 @@ function resolveHostTypebox() {
 }
 
 const TYPEBOX_ENTRY = resolveHostTypebox();
-if (!TYPEBOX_ENTRY) {
-  throw new Error('host typebox package not found: the selective extension requires it');
-}
-registerHooks({
-  resolve(specifier, context, nextResolve) {
-    if (specifier === 'typebox') return { url: TYPEBOX_ENTRY, shortCircuit: true };
-    return nextResolve(specifier, context);
-  },
-});
 
+// false -> a host copy exists and the suite below runs.
+// string -> the suite skips, and the string is the reason printed in the log.
+//
+// The value is `false` and never `null`: Node's test runner skips a test for
+// ANY `skip` value that is not exactly `false`, so a `null` reason would skip
+// every test below while the suite still read green. tests/privileged.mjs
+// documents the same gate contract for the ACL and DPAPI environment probes.
+//
+// A hosted runner has no Pi installation, so neither candidate above exists
+// there: this file used to throw at module load, which turned "this machine
+// cannot check that" into a failure of the whole node run.
+const TYPEBOX_SKIP_REASON = TYPEBOX_ENTRY
+  ? false
+  : 'the host typebox package is absent: no repo-local copy and no Pi installation';
+
+if (TYPEBOX_ENTRY) {
+  registerHooks({
+    resolve(specifier, context, nextResolve) {
+      if (specifier === 'typebox') return { url: TYPEBOX_ENTRY, shortCircuit: true };
+      return nextResolve(specifier, context);
+    },
+  });
+}
+
+// The extension source cannot be imported without the host package, so the
+// import happens only when a copy exists. Every use of the bindings below sits
+// inside a describe callback, so the empty stand-in is never dereferenced.
+const extensionModule = TYPEBOX_ENTRY
+  ? await import('../extension/selective-tui-extension.ts')
+  : {};
 const {
   SelectiveTuiBridgeExtension,
   createSelectiveTuiExtension,
   readGitBranch,
-} = await import('../extension/selective-tui-extension.ts');
+} = extensionModule;
 
 const TEST_RUNS = fileURLToPath(new URL('../.local/test-runs/', import.meta.url));
 mkdirSync(TEST_RUNS, { recursive: true });
@@ -221,7 +242,7 @@ function seedLiveSession(fx, label) {
   return { trackingId: result.trackingId, connectionId: result.connectionId };
 }
 
-describe('/tg registration and argument completion', () => {
+describe('/tg registration and argument completion', { skip: TYPEBOX_SKIP_REASON }, () => {
   test('tg is registered with off completion; advanced commands stay registered; no tools', async () => {
     const fx = makeFixture();
     try {
@@ -245,7 +266,7 @@ describe('/tg registration and argument completion', () => {
   });
 });
 
-describe('/tg fails closed outside the interactive TUI', () => {
+describe('/tg fails closed outside the interactive TUI', { skip: TYPEBOX_SKIP_REASON }, () => {
   test('non-TUI context: local error notification, no dialog, no connection', async () => {
     const fx = makeFixture();
     try {
@@ -262,7 +283,7 @@ describe('/tg fails closed outside the interactive TUI', () => {
   });
 });
 
-describe('/tg with incomplete setup (MSG-C8)', () => {
+describe('/tg with incomplete setup (MSG-C8)', { skip: TYPEBOX_SKIP_REASON }, () => {
   test('exact friendly copy, no leaked path, no dialog, no store creation', async () => {
     const fx = makeFixture({ credentials: false });
     try {
@@ -277,7 +298,7 @@ describe('/tg with incomplete setup (MSG-C8)', () => {
   });
 });
 
-describe('/tg connect flow', () => {
+describe('/tg connect flow', { skip: TYPEBOX_SKIP_REASON }, () => {
   test('confirmation dialog with literal options; Cancel is a no-op that creates nothing', async () => {
     const fx = makeFixture({ selectAnswer: 'Cancel' });
     try {
@@ -344,7 +365,7 @@ describe('/tg connect flow', () => {
   });
 });
 
-describe('/tg broker availability copy', () => {
+describe('/tg broker availability copy', { skip: TYPEBOX_SKIP_REASON }, () => {
   for (const brokerState of [
     'missing-meta',
     'missing-runtime',
@@ -394,7 +415,7 @@ describe('/tg broker availability copy', () => {
   });
 });
 
-describe('/tg automatic labels (sanitization, bounds, collisions)', () => {
+describe('/tg automatic labels (sanitization, bounds, collisions)', { skip: TYPEBOX_SKIP_REASON }, () => {
   test('label comes from the cwd folder name, whitespace preserved', async () => {
     const fx = makeFixture({ cwd: 'C:/work/my app', selectAnswer: 'Connect' });
     try {
@@ -570,7 +591,7 @@ describe('/tg automatic labels (sanitization, bounds, collisions)', () => {
   });
 });
 
-describe('/tg off unlink flow', () => {
+describe('/tg off unlink flow', { skip: TYPEBOX_SKIP_REASON }, () => {
   test('idle: Unlink/Cancel dialog; Cancel keeps the link', async () => {
     const fx = makeFixture({ selectAnswer: 'Connect' });
     try {
@@ -652,7 +673,7 @@ describe('/tg off unlink flow', () => {
   });
 });
 
-describe('/tg invalid arguments', () => {
+describe('/tg invalid arguments', { skip: TYPEBOX_SKIP_REASON }, () => {
   test('any other argument shows the beginner usage and connects nothing', async () => {
     for (const args of ['now', 'off extra', 'connect', 'demo-project']) {
       const fx = makeFixture({ selectAnswer: 'Connect' });
@@ -678,7 +699,7 @@ describe('/tg invalid arguments', () => {
   });
 });
 
-describe('advanced /telegram-* commands preserved', () => {
+describe('advanced /telegram-* commands preserved', { skip: TYPEBOX_SKIP_REASON }, () => {
   test('custom label override, status format, double-connect guard and disconnect', async () => {
     const fx = makeFixture();
     try {
@@ -727,7 +748,7 @@ describe('advanced /telegram-* commands preserved', () => {
   });
 });
 
-describe('process-local lifecycle: no auto-connect, opt-in continuity', () => {
+describe('process-local lifecycle: no auto-connect, opt-in continuity', { skip: TYPEBOX_SKIP_REASON }, () => {
   test('a fresh extension lifecycle never connects by itself', async () => {
     const fx = makeFixture();
     try {
@@ -783,7 +804,7 @@ describe('process-local lifecycle: no auto-connect, opt-in continuity', () => {
   });
 });
 
-describe('no model involvement and factory wiring', () => {
+describe('no model involvement and factory wiring', { skip: TYPEBOX_SKIP_REASON }, () => {
   test('a full /tg cycle sends no user messages and registers no tools', async () => {
     const fx = makeFixture({ selectAnswer: 'Connect' });
     try {
@@ -827,7 +848,7 @@ function writeGitRepo(root, head = 'ref: refs/heads/main\n') {
   writeFileSync(join(root, '.git', 'HEAD'), head);
 }
 
-describe('extension git branch detection (readGitBranch)', () => {
+describe('extension git branch detection (readGitBranch)', { skip: TYPEBOX_SKIP_REASON }, () => {
   test('normal repo: a .git directory with a ref HEAD parses to a sanitized branch', () => {
     const root = mkdtempSync(join(TEST_RUNS, 'branch-normal-'));
     writeGitRepo(root, 'ref: refs/heads/main\n');
@@ -964,7 +985,7 @@ describe('extension git branch detection (readGitBranch)', () => {
   });
 });
 
-describe('/tg connect stores git branch metadata (T2)', () => {
+describe('/tg connect stores git branch metadata (T2)', { skip: TYPEBOX_SKIP_REASON }, () => {
   test('beginner /tg connect stores the branch in the live session and project history', async () => {
     const repoRoot = mkdtempSync(join(TEST_RUNS, 'branch-repo-'));
     writeGitRepo(repoRoot, 'ref: refs/heads/feature/ci\n');
@@ -1032,7 +1053,7 @@ describe('/tg connect stores git branch metadata (T2)', () => {
   });
 });
 
-describe('readGitBranch correction round (F1/F2/F3)', () => {
+describe('readGitBranch correction round (F1/F2/F3)', { skip: TYPEBOX_SKIP_REASON }, () => {
   test('F1: a nonexistent cwd returns null without any ancestor walk', () => {
     const root = mkdtempSync(join(TEST_RUNS, 'branch-f1-'));
     writeGitRepo(root, 'ref: refs/heads/main\n');
@@ -1314,7 +1335,7 @@ async function makePendingFixture({ params = choiceParams(), injections, selectA
   };
 }
 
-describe('telegram_ask_user_choice registration, schema and metadata (T3B)', () => {
+describe('telegram_ask_user_choice registration, schema and metadata (T3B)', { skip: TYPEBOX_SKIP_REASON }, () => {
   test('exactly one distinct tool is registered and ask_user_choice is never overridden', async () => {
     const fx = makeFixture();
     try {
@@ -1389,7 +1410,7 @@ describe('telegram_ask_user_choice registration, schema and metadata (T3B)', () 
   });
 });
 
-describe('telegram_ask_user_choice refusals return fixed local JSON', () => {
+describe('telegram_ask_user_choice refusals return fixed local JSON', { skip: TYPEBOX_SKIP_REASON }, () => {
   test('not linked: fixed refused JSON, no store created, nothing published', async () => {
     const fx = makeFixture();
     try {
@@ -1594,7 +1615,7 @@ describe('telegram_ask_user_choice refusals return fixed local JSON', () => {
   });
 });
 
-describe('telegram_ask_user_choice selection lifecycle', () => {
+describe('telegram_ask_user_choice selection lifecycle', { skip: TYPEBOX_SKIP_REASON }, () => {
   test('selected: exact request published (no value), waiting state, exact local value/index back', async () => {
     const FIXED_NOW = 1_700_000_000_000;
     const inj = makeChoiceInjections({ now: () => FIXED_NOW });
@@ -1699,7 +1720,7 @@ describe('telegram_ask_user_choice selection lifecycle', () => {
   });
 });
 
-describe('telegram_ask_user_choice abort paths', () => {
+describe('telegram_ask_user_choice abort paths', { skip: TYPEBOX_SKIP_REASON }, () => {
   test('already-aborted signal: fixed JSON without publishing anything', async () => {
     const fx = makeFixture({ selectAnswer: 'Connect' });
     try {
@@ -1783,7 +1804,7 @@ describe('telegram_ask_user_choice abort paths', () => {
   });
 });
 
-describe('telegram_ask_user_choice interruption paths', () => {
+describe('telegram_ask_user_choice interruption paths', { skip: TYPEBOX_SKIP_REASON }, () => {
   for (const reason of ['quit', 'reload', 'new', 'resume', 'fork']) {
     test(`session_shutdown (${reason}) settles the blocked tool as interrupted`, async () => {
       const pending = await makePendingFixture();
@@ -1852,7 +1873,7 @@ describe('telegram_ask_user_choice interruption paths', () => {
   });
 });
 
-describe('silent choice dispatch: exact binding, no events, no fabricated answers', () => {
+describe('silent choice dispatch: exact binding, no events, no fabricated answers', { skip: TYPEBOX_SKIP_REASON }, () => {
   test('mismatched requestId is silently failed and never settles the real pending tool', async () => {
     const pending = await makePendingFixture();
     try {
@@ -2020,7 +2041,7 @@ describe('silent choice dispatch: exact binding, no events, no fabricated answer
 // fixed compact `restart_required` JSON BEFORE any credential scan,
 // sanitization, helper call or publish — no event, no pending state, no
 // timer, no leaked ids/paths/raw errors.
-describe('telegram_ask_user_choice mixed-runtime guard (restart_required)', () => {
+describe('telegram_ask_user_choice mixed-runtime guard (restart_required)', { skip: TYPEBOX_SKIP_REASON }, () => {
   /** Calls the tool and resolves false if it is still pending after 250ms
    *  (pre-guard behavior: publish + block) so RED fails fast, never hangs. */
   async function callRefusingFast(fx, params) {
