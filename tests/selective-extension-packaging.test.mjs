@@ -496,6 +496,50 @@ describe('on-demand load: nothing of this project may stay in Pi auto-discovery'
         rmSync(root, { recursive: true, force: true });
       }
     });
+
+    test('the verified copy helper verifies a source and a target spelled the long way', async () => {
+      // Regression, reproduced on the CI runner and then on this machine:
+      // the helper measured relative paths by subtracting the length of the
+      // argument it was given, but Get-ChildItem returns the canonical path.
+      // Any spelling that is not canonical -- the short 8.3 directory name a
+      // hosted runner hands to its temporary directory, or a dotted path like
+      // this one -- is a different length, so the subtraction sliced in the
+      // wrong place and a healthy copy was reported as a mismatch.
+      //
+      // The two spellings deliberately carry a DIFFERENT amount of excess.
+      // Equal excess corrupts both sides in the same way, which a defective
+      // implementation accepts in silence: that is exactly how a first
+      // version of this test passed against the defect it was written for.
+      const root = mkdtempSync(join(tmpdir(), 'ptb-dotted-'));
+      try {
+        const source = join(root, 'data-source');
+        const target = join(root, 'data-target');
+        mkdirSync(join(source, 'nested'), { recursive: true });
+        // The intermediate directory exists so the dotted paths resolve on
+        // every Windows version instead of relying on lexical collapsing.
+        mkdirSync(join(root, 'hop'));
+        writeFileSync(join(source, 'entry.ts'), 'export const a = 1;\n');
+        writeFileSync(join(source, 'nested', 'child.mjs'), 'export const b = 2;\n');
+        const dotted = (name, hops) => join(root) + '\\hop\\..'.repeat(hops) + '\\' + name;
+        const quote = (value) => value.replace(/'/g, "''");
+        const { code, out } = await runPowerShellCommand(
+          'Set-StrictMode -Version 2.0; ' +
+            `. '${quote(COMMON_PS1)}'; ` +
+            `Copy-SelectiveDirectoryContents -Source '${quote(dotted('data-source', 1))}' ` +
+            `-Target '${quote(dotted('data-target', 2))}'; ` +
+            "'COPY-OK'",
+        );
+        assert.equal(code, 0, `the copy helper failed: ${out}`);
+        assert.match(out, /COPY-OK/, `unexpected output: ${out}`);
+        assert.equal(readFileSync(join(target, 'entry.ts'), 'utf8'), 'export const a = 1;\n');
+        assert.equal(
+          readFileSync(join(target, 'nested', 'child.mjs'), 'utf8'),
+          'export const b = 2;\n',
+        );
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
   });
 
   test('the resolver only writes when -Create is passed', () => {

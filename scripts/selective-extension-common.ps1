@@ -303,8 +303,8 @@ function Protect-SelectiveEntryFile {
 .SYNOPSIS
 Complete, verifying copy of a directory's contents (including hidden
 files) into an existing target directory. Throws when the copy does
-not match the source (file count and total bytes) so a caller never
-trusts a partial backup.
+not match the source (file count, total bytes and relative paths) so a
+caller never trusts a partial or reshaped backup.
 #>
 function Copy-SelectiveDirectoryContents {
     param(
@@ -319,7 +319,12 @@ function Copy-SelectiveDirectoryContents {
         New-Item -ItemType Directory -Path $Target -Force | Out-Null
     }
     Get-ChildItem -LiteralPath $Source -Force | ForEach-Object {
-        Copy-Item -LiteralPath $_.FullName -Destination $Target -Recurse -Force
+        # Every destination is spelled out as <target>\<child> on purpose.
+        # Copy-Item decides between "create this name" and "copy inside
+        # this name" from whether the destination exists, which is the trap
+        # described above; naming each child removes that decision from the
+        # copy entirely.
+        Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $Target $_.Name) -Recurse -Force
     }
     # The verification below compares relative paths as well as volume: a
     # count-plus-bytes check alone accepts a flattened copy. Counts are
@@ -333,14 +338,29 @@ function Copy-SelectiveDirectoryContents {
     foreach ($file in $sourceFiles) { $sourceBytes += $file.Length }
     [int64]$targetBytes = 0
     foreach ($file in $targetFiles) { $targetBytes += $file.Length }
-    $sourceRel = @($sourceFiles | ForEach-Object { $_.FullName.Substring($Source.Length).TrimStart('\') } | Sort-Object)
-    $targetRel = @($targetFiles | ForEach-Object { $_.FullName.Substring($Target.Length).TrimStart('\') } | Sort-Object)
+    # The relative paths are measured against the roots the provider
+    # reports, never against the caller's spelling. Get-ChildItem always
+    # returns the canonical form, so a short (8.3), dotted or otherwise
+    # non-canonical argument is a different length, and subtracting the
+    # given length slices the path in the wrong place. Both sides then
+    # differ while the file count and the byte total still match, which
+    # is what made this verification fail on a machine that spelled its
+    # temporary directory differently.
+    $sourceRoot = (Get-Item -LiteralPath $Source -Force -ErrorAction Stop).FullName.TrimEnd('\')
+    $targetRoot = (Get-Item -LiteralPath $Target -Force -ErrorAction Stop).FullName.TrimEnd('\')
+    $sourceRel = @($sourceFiles | ForEach-Object { $_.FullName.Substring($sourceRoot.Length).TrimStart('\') } | Sort-Object)
+    $targetRel = @($targetFiles | ForEach-Object { $_.FullName.Substring($targetRoot.Length).TrimStart('\') } | Sort-Object)
     $moved = @(Compare-Object -ReferenceObject $sourceRel -DifferenceObject $targetRel)
     if ([int64]$sourceFiles.Count -ne [int64]$targetFiles.Count -or
         $sourceBytes -ne $targetBytes -or
         $moved.Count -gt 0) {
-        throw ("verified copy failed: source has {0} files/{1} bytes, copy has {2} files/{3} bytes" -f `
-            $sourceFiles.Count, $sourceBytes, $targetFiles.Count, $targetBytes)
+        # A volume-only message hid the reason once. Name the roots and the
+        # differing entries so a failure explains itself from the log alone.
+        $movedText = @($moved | ForEach-Object { '{0}{1}' -f $_.SideIndicator, $_.InputObject }) -join ', '
+        $message = "verified copy failed: source has {0} files/{1} bytes, copy has {2} files/{3} bytes; " +
+            "source root '{4}', copy root '{5}', differing entries: {6}"
+        throw ($message -f `
+            $sourceFiles.Count, $sourceBytes, $targetFiles.Count, $targetBytes, $sourceRoot, $targetRoot, $movedText)
     }
 }
 
